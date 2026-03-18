@@ -79,12 +79,59 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
 
-    # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
-    return traverse_util.unflatten_dict(
-        {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
-    )
+    flat_expected = traverse_util.flatten_dict(params_shape)
+    flat_loaded = traverse_util.flatten_dict(loaded_params)
+
+    matched = {}
+    skipped = 0
+    for key_path, value in flat_loaded.items():
+        if key_path not in flat_expected:
+            skipped += 1
+            continue
+
+        expected = flat_expected[key_path]
+        if isinstance(expected, jax.ShapeDtypeStruct):
+            if tuple(value.shape) != tuple(expected.shape):
+                raise ValueError(
+                    f"Checkpoint shape mismatch at {'/'.join(key_path)}: "
+                    f"expected {expected.shape}, got {value.shape}."
+                )
+            if np.dtype(value.dtype) != np.dtype(expected.dtype):
+                raise ValueError(
+                    f"Checkpoint dtype mismatch at {'/'.join(key_path)}: "
+                    f"expected {expected.dtype}, got {value.dtype}."
+                )
+
+        # Skip ShapeDtypeStruct leaves; we only merge real loaded arrays.
+        if not isinstance(value, jax.ShapeDtypeStruct):
+            matched[key_path] = value
+
+    if not matched:
+        raise ValueError(
+            "Loaded checkpoint has no parameters that match the current model. "
+            "Check that `config.model` and `weight_loader` point to compatible architectures."
+        )
+
+    if skipped > 0:
+        logging.warning(
+            "Skipping %d checkpoint params that are not present in the current model (partial load).",
+            skipped,
+        )
+
+    return traverse_util.unflatten_dict(matched)
+
+
+def _to_wandb_image_uint8(image: np.ndarray) -> np.ndarray:
+    image = np.asarray(image)
+    if image.dtype == np.uint8:
+        return image
+
+    if np.issubdtype(image.dtype, np.floating):
+        if image.size > 0 and np.nanmin(image) >= 0.0 and np.nanmax(image) <= 1.0:
+            image = image * 255.0
+
+    return np.clip(image, 0, 255).astype(np.uint8)
 
 
 @at.typecheck
