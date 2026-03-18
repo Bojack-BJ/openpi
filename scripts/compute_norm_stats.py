@@ -4,6 +4,12 @@ This script is used to compute the normalization statistics for a given config. 
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
 """
+import os
+
+# Reduce TensorFlow/XLA startup log noise (especially with multiprocessing workers).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
 
 import numpy as np
 import tqdm

@@ -1,8 +1,14 @@
 import dataclasses
 import functools
 import logging
+import os
 import platform
 from typing import Any
+
+# Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
 
 import etils.epath as epath
 import flax.nnx as nnx
