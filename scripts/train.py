@@ -77,7 +77,7 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
-    """Loads and validates the weights. Returns a loaded subset of the weights."""
+    """Loads and validates overlapping weights. Returns a subset to merge into initialized params."""
     loaded_params = loader.load(params_shape)
 
     flat_expected = traverse_util.flatten_dict(params_shape)
