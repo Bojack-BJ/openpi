@@ -1,0 +1,38 @@
+# 忽略编译生成的文件
+*.o
+*.obj
+*.exe
+*.out
+*.class
+
+# 忽略临时文件
+*.log
+*.tmp
+*.swp
+*.bak
+
+# 忽略Python缓存
+__pycache__/
+*.pyc
+
+# 忽略Node.js依赖
+node_modules/
+
+# 忽略虚拟环境
+venv/
+.env/
+
+# 忽略操作系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略Git自身文件
+.git/
+
+# 忽略用户自定义文件夹
+build/
+dist/
+
+/assets/
+/checkpoints/
+/wandb/
