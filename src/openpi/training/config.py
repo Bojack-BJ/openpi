@@ -1603,11 +1603,11 @@ _CONFIGS = [
         ),
         
     TrainConfig(
-        name="qwen",
+        name="qwen_test",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(),
         data=FastUMIdualData14DRPYConfig(
-            repo_id="fastumi/qwen_test",
+            repo_id="fastumi/test_demo",
             base_config=DataConfig(
                 # local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,
