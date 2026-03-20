@@ -29,6 +29,8 @@
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py --raw-dir <raw_dir> --repo-id <repo_id> --task <task_name>
 
 运行示例：
+        export HF_LEROBOT_HOME=/root/Users/dataset/lerobot_home
+        
         # 示例一：单臂数据，使用 merge 轨迹，生成 image 模式数据集
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
             --raw-dir /data/fastumi/task_20260121H011 \
@@ -42,16 +44,16 @@
 
         # 示例二：双臂数据，使用 next-step action，并将结果复制到指定目录
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
-            --raw-dir /root/code/FastUMI_data/20260112H003 \
-            --repo-id fastumi/qwen_test \
-            --task "Bimanual task" \
+            --raw-dir /root/Users/dataset/task_20260310H072Aa/good \
+            --repo-id fastumi/Waste_sorting_a \
+            --task "Sort the recyclable waste and hazardous waste into the corresponding bins" \
             --fps 30 \
             --traj-source merge \
             --mode image \
-            --next \
-            --tmp-dir /lumos-vePFS/tmp/fastumi_tmp \
-            --output-dir /lumos-vePFS/suda/openpi_data/qwen_test
             --workers 48 \
+            --next \
+            # --output-dir /root/Users/dataset/lerobot_home/fastumi/fruit_classification \
+            # --tmp-dir /lumos-vePFS/tmp/fastumi_tmp \
 
 参数说明：
         --raw-dir
@@ -200,18 +202,26 @@ SOURCE_CAMERA_FPS = 60
 STATE_NAMES_8 = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_width"]
 
 STEP1_CFG_NON_NEXT = {
-    "base_x": 0.05,
-    "base_y": 0.01,
-    "base_z": 0.09,
-    "base_euler_deg": [0, 0, 0.0],
+    "base_x": 0.250,
+    "base_y": -0.2,
+    "base_z": 0.145,
+    "base_euler_deg": [180, -90, 0.0],
     "max_gripper": 84.0,
 }
 
 STEP1_CFG_NEXT = {
-    "base_x": 0.07,
-    "base_y": 0.02,
-    "base_z": 0.11,
-    "base_euler_deg": [0, 0, 0.0],
+    "base_x": 0.270,
+    "base_y": 0.2,
+    "base_z": 0.145,
+    "base_euler_deg": [180, -90, 0.0],
+    "max_gripper": 84.0,
+}
+
+STEP1_CFG_XARM_0 = {
+    "base_x": 0.250,
+    "base_y": 0.2,
+    "base_z": 0.145,
+    "base_euler_deg": [180, -90, 0.0],
     "max_gripper": 84.0,
 }
 
