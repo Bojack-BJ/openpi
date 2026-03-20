@@ -10,6 +10,9 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
 os.environ.setdefault("GLOG_minloglevel", "3")
 
+# Avoid probing unsupported backends (e.g., rocm/tpu) and reduce startup noise.
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+
 import etils.epath as epath
 import flax.nnx as nnx
 from flax.training import common_utils
