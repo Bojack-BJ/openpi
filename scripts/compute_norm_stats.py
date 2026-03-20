@@ -95,7 +95,12 @@ def create_rlds_dataloader(
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
-
+    
+    if data_config.rlds_data_dir is not None:
+        print(f"Using RLDS data path: {data_config.rlds_data_dir}")
+    else:
+        print(f"Using dataset repo_id: {data_config.repo_id}")
+        
     if data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
