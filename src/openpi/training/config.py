@@ -1603,18 +1603,60 @@ _CONFIGS = [
         ),
         
     TrainConfig(
-        name="qwen_test",
+        name="fruit_classification_Aa",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(),
         data=FastUMIdualData14DRPYConfig(
-            repo_id="fastumi/test_demo",
+            repo_id="fastumi/fruit_classification_Aa",
             base_config=DataConfig(
                 # local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
-        num_train_steps=60_000,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
+        name="Waste_sorting_Aa",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/Waste_sorting_Aa",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
+        name="toy_block_placement_Aa",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/toy_block_placement_Aa",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
         # The freeze filter defines which parameters should be frozen during training.
         # We have a convenience function in the model config that returns the default freeze filter
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
