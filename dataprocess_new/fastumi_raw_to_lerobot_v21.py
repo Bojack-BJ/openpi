@@ -201,29 +201,73 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 SOURCE_CAMERA_FPS = 60
 STATE_NAMES_8 = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_width"]
 
-STEP1_CFG_NON_NEXT = {
-    "base_x": 0.250,
-    "base_y": -0.2,
-    "base_z": 0.145,
-    "base_euler_deg": [180, -90, 0.0],
-    "max_gripper": 84.0,
-}
-
-STEP1_CFG_NEXT = {
-    "base_x": 0.270,
-    "base_y": 0.2,
-    "base_z": 0.145,
-    "base_euler_deg": [180, -90, 0.0],
-    "max_gripper": 84.0,
-}
-
-STEP1_CFG_XARM_0 = {
+STEP1_CFG = {
     "base_x": 0.250,
     "base_y": 0.2,
     "base_z": 0.145,
     "base_euler_deg": [180, -90, 0.0],
-    "max_gripper": 84.0,
+    "max_gripper": 88.0, # 84 for acone/fasttouch, 88 for robotiq
 }
+
+# Xarm6
+STEP1_CFG_DUAL = {
+    "base_x_0": 0.250,
+    "base_y_0": 0.2,
+    "base_z_0": 0.145,
+    "base_euler_deg_0": [180, -90, 0.0],
+    "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+    "base_x_1": 0.250,
+    "base_y_1": -0.2,
+    "base_z_1": 0.145,
+    "base_euler_deg_1": [180, -90, 0.0],
+    "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+}
+
+# # fasttouch
+# STEP1_CFG_DUAL = {
+#     "base_x_0": 0.3,
+#     "base_y_0": 0.0,
+#     "base_z_0": 0.16,
+#     "base_euler_deg_0": [0.0, 0.0, 0.0],
+#     "max_gripper_0": 84.0, # 84 for acone/fasttouch, 88 for robotiq
+#     "base_x_1": 0.3,
+#     "base_y_1": -0.0,
+#     "base_z_1": 0.16,
+#     "base_euler_deg_1": [0.0, 0.0, 0.0],
+#     "max_gripper_1": 84.0, # 84 for acone/fasttouch, 88 for robotiq
+# }
+
+
+def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """Create per-arm step1 configs from explicit dual-arm keys.
+
+        Expected keys:
+            base_x_0, base_y_0, base_z_0, base_euler_deg_0, max_gripper_0
+            base_x_1, base_y_1, base_z_1, base_euler_deg_1, max_gripper_1
+        """
+        required = [
+            "base_x_0", "base_y_0", "base_z_0", "base_euler_deg_0", "max_gripper_0",
+            "base_x_1", "base_y_1", "base_z_1", "base_euler_deg_1", "max_gripper_1",
+        ]
+        missing = [k for k in required if k not in step1_cfg_dual]
+        if missing:
+            raise ValueError(f"Dual Step1 config missing keys: {missing}")
+
+        cfg0 = {
+            "base_x": float(step1_cfg_dual["base_x_0"]),
+            "base_y": float(step1_cfg_dual["base_y_0"]),
+            "base_z": float(step1_cfg_dual["base_z_0"]),
+            "base_euler_deg": step1_cfg_dual["base_euler_deg_0"],
+            "max_gripper": float(step1_cfg_dual["max_gripper_0"]),
+        }
+        cfg1 = {
+            "base_x": float(step1_cfg_dual["base_x_1"]),
+            "base_y": float(step1_cfg_dual["base_y_1"]),
+            "base_z": float(step1_cfg_dual["base_z_1"]),
+            "base_euler_deg": step1_cfg_dual["base_euler_deg_1"],
+            "max_gripper": float(step1_cfg_dual["max_gripper_1"]),
+        }
+        return cfg0, cfg1
 
 
 def find_all_sessions(raw_root: Path) -> List[Path]:
@@ -618,7 +662,8 @@ def _extract_dual_to_npz(
     fps: int,
     traj_source: str,
     use_next: bool,
-    step1_cfg: Dict[str, float],
+    step1_cfg_robot0: Dict[str, float],
+    step1_cfg_robot1: Dict[str, float],
 ) -> Tuple[bool, str]:
     left_path = str(left_path)
     right_path = str(right_path)
@@ -671,8 +716,10 @@ def _extract_dual_to_npz(
         if frames_l is None or frames_r is None:
             return False, "video_read_failed"
 
-        T_base = build_T_base_to_local(step1_cfg)
-        max_g = float(step1_cfg["max_gripper"])
+        T_base_0 = build_T_base_to_local(step1_cfg_robot0)
+        T_base_1 = build_T_base_to_local(step1_cfg_robot1)
+        max_g_0 = float(step1_cfg_robot0["max_gripper"])
+        max_g_1 = float(step1_cfg_robot1["max_gripper"])
 
         T = min(len(frames_l), len(frames_r), len(t_master))
         if T <= 0:
@@ -686,8 +733,8 @@ def _extract_dual_to_npz(
         for k in range(T):
             imgs_l[k] = resize_rgb_no_crop(frames_l[k], out_hw=224)
             imgs_r[k] = resize_rgb_no_crop(frames_r[k], out_hw=224)
-            s0[k] = normalize_state_from_raw(l_pose_np[k], float(l_clamp_np[k]), T_base, max_g)
-            s1[k] = normalize_state_from_raw(r_pose_np[k], float(r_clamp_np[k]), T_base, max_g)
+            s0[k] = normalize_state_from_raw(l_pose_np[k], float(l_clamp_np[k]), T_base_0, max_g_0)
+            s1[k] = normalize_state_from_raw(r_pose_np[k], float(r_clamp_np[k]), T_base_1, max_g_1)
 
         states = np.concatenate([s0, s1], axis=1).astype(np.float32)  # (T,16)
         actions = build_actions_from_states(states, use_next)
@@ -804,7 +851,9 @@ def main():
         raise RuntimeError(f"No valid sessions found under: {raw_dir}")
 
     bimanual = (layout == "dual")
-    step1_cfg = STEP1_CFG_NEXT if use_next else STEP1_CFG_NON_NEXT
+    step1_cfg = STEP1_CFG
+    step1_cfg_dual = STEP1_CFG_DUAL
+    step1_cfg_robot0, step1_cfg_robot1 = make_dual_step1_cfgs(step1_cfg_dual)
 
     # tmp dir
     if args.tmp_dir is None:
@@ -862,7 +911,8 @@ def main():
                 fps=fps,
                 traj_source=traj_source,
                 use_next=use_next,
-                step1_cfg=step1_cfg,
+                step1_cfg_robot0=step1_cfg_robot0,
+                step1_cfg_robot1=step1_cfg_robot1,
             )
         return fut, npz_path
 
