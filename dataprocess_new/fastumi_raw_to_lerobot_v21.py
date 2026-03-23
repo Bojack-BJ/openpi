@@ -209,33 +209,33 @@ STEP1_CFG = {
     "max_gripper": 88.0, # 84 for acone/fasttouch, 88 for robotiq
 }
 
-# Xarm6
-STEP1_CFG_DUAL = {
-    "base_x_0": 0.250,
-    "base_y_0": 0.2,
-    "base_z_0": 0.145,
-    "base_euler_deg_0": [180, -90, 0.0],
-    "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
-    "base_x_1": 0.250,
-    "base_y_1": -0.2,
-    "base_z_1": 0.145,
-    "base_euler_deg_1": [180, -90, 0.0],
-    "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
-}
-
-# # fasttouch
+# # Xarm6
 # STEP1_CFG_DUAL = {
-#     "base_x_0": 0.3,
-#     "base_y_0": 0.0,
-#     "base_z_0": 0.16,
-#     "base_euler_deg_0": [0.0, 0.0, 0.0],
-#     "max_gripper_0": 84.0, # 84 for acone/fasttouch, 88 for robotiq
-#     "base_x_1": 0.3,
-#     "base_y_1": -0.0,
-#     "base_z_1": 0.16,
-#     "base_euler_deg_1": [0.0, 0.0, 0.0],
-#     "max_gripper_1": 84.0, # 84 for acone/fasttouch, 88 for robotiq
+#     "base_x_0": 0.250,
+#     "base_y_0": 0.2,
+#     "base_z_0": 0.145,
+#     "base_euler_deg_0": [180, -90, 0.0],
+#     "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+#     "base_x_1": 0.250,
+#     "base_y_1": -0.2,
+#     "base_z_1": 0.145,
+#     "base_euler_deg_1": [180, -90, 0.0],
+#     "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
 # }
+
+# fasttouch
+STEP1_CFG_DUAL = {
+    "base_x_0": 0.3,
+    "base_y_0": 0.0,
+    "base_z_0": 0.16,
+    "base_euler_deg_0": [0.0, 0.0, 0.0],
+    "max_gripper_0": 84.0, # 84 for acone/fasttouch, 88 for robotiq
+    "base_x_1": 0.3,
+    "base_y_1": -0.0,
+    "base_z_1": 0.16,
+    "base_euler_deg_1": [0.0, 0.0, 0.0],
+    "max_gripper_1": 84.0, # 84 for acone/fasttouch, 88 for robotiq
+}
 
 
 def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:

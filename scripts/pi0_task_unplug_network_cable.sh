@@ -4,14 +4,14 @@ export CUDA_VISIBLE_DEVICE=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
-REPO=fastumi/fruit_classification_Aa
+REPO=fastumi/Unplug_and_plug_the_network_cable
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=fruit_classification_Aa
+cfg=unplug_network_cable
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp=${exp:-$cfg}   # override via env; default equals cfg
+exp=${exp:-$cfg}   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
 export HF_DATASETS_CACHE="/root/.cache/"
@@ -27,3 +27,4 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py "$cfg" \
   --exp-name "$exp" \
   --overwrite
+
