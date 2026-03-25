@@ -226,7 +226,12 @@ class Attention(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
-        attentions = einops.rearrange(probs, "B K G T S -> B (K G) T S") if return_attentions else None
+        if return_attentions:
+            self.sow(
+                "intermediates",
+                "attentions",
+                einops.rearrange(probs, "B K G T S -> B (K G) T S"),
+            )
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -247,7 +252,7 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
-        return out, (k, v), attentions
+        return out, (k, v)
 
 
 @at.typecheck
@@ -315,7 +320,7 @@ class Block(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        post_attn, kv_cache, attentions = attn(
+        post_attn, kv_cache = attn(
             pre_attn,
             positions,
             attn_mask,
@@ -346,7 +351,7 @@ class Block(nn.Module):
         xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, out, gates, strict=True)]
         xs = sharding.activation_sharding_constraint(xs)
 
-        return xs, kv_cache, attentions
+        return xs, kv_cache
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -422,7 +427,7 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache, attentions = self.layers(
+        embedded, kv_cache = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -438,6 +443,7 @@ class Module(nn.Module):
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ]
         if return_attentions:
+            attentions = self.layers.get_variable("intermediates", "attentions")
             return embedded, kv_cache, {"attentions": attentions}
         return embedded, kv_cache
 
