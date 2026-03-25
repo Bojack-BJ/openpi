@@ -4,7 +4,7 @@ export CUDA_VISIBLE_DEVICE=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
-REPO=fastumi/toy_block_placement_Aa
+REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
 cfg=toy_block_placement_Aa

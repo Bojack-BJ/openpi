@@ -4,7 +4,7 @@ export CUDA_VISIBLE_DEVICE=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
-REPO=fastumi/Unplug_and_plug_the_network_cable
+REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
 cfg=unplug_network_cable
@@ -19,10 +19,11 @@ export WANDB_MODE=offline
 
 cd /root/Users/lixiaotong/openpi
 
-python scripts/compute_norm_stats.py --config-name "$exp"
+# python scripts/compute_norm_stats.py --config-name "$cfg"
   
 # XLA_PYTHON_CLIENT_PREALLOCATE=false \
 # XLA_PYTHON_CLIENT_ALLOCATOR=platform \
+XLA_FLAGS="--xla_gpu_enable_command_buffer=" \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py "$cfg" \
   --exp-name "$exp" \
