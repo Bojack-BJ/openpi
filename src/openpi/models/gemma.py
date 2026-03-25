@@ -357,7 +357,7 @@ class Block(nn.Module):
                 dtype=post_attn[0].dtype if post_attn[0] is not None else jnp.float32,
             )
 
-        return (xs, kv_cache), attentions
+        return xs, (kv_cache, attentions)
 
 
 KVCache: TypeAlias = tuple[at.Float[at.Array, "l b _t _k _h"], at.Float[at.Array, "l b _t _v _h"]]
@@ -433,7 +433,7 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        (embedded, kv_cache), attentions = self.layers(
+        embedded, (kv_cache, attentions) = self.layers(
             embedded,
             kv_cache,
             positions,
