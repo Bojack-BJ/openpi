@@ -53,7 +53,58 @@ class VisualIntermediateRecorder:
             Image.fromarray(heatmap).save(step_dir / f"{image_name}_{self._feature_name}.png")
             Image.fromarray(overlay).save(step_dir / f"{image_name}_{self._feature_name}_overlay.png")
 
+        if not is_pytorch and hasattr(model, "get_text_to_image_attention_maps"):
+            self._record_text_to_image_attention(model, observation, step_dir)
+
         self._step += 1
+
+    def _record_text_to_image_attention(
+        self,
+        model: _model.BaseModel,
+        observation: _model.Observation,
+        step_dir: pathlib.Path,
+    ) -> None:
+        if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
+            return
+
+        token_mask = self._to_numpy(observation.tokenized_prompt_mask[0]).astype(bool)
+        num_valid_text_tokens = int(token_mask.sum())
+        if num_valid_text_tokens <= 0:
+            return
+
+        text_token_index = num_valid_text_tokens - 1
+        debug = model.get_text_to_image_attention_maps(
+            observation,
+            text_token_index=text_token_index,
+            layer=-1,
+        )
+
+        np.save(
+            step_dir / "text_to_image_attentions.npy",
+            self._to_numpy(debug["attentions"]).astype(np.float32),
+        )
+        np.save(
+            step_dir / "text_to_image_cross_attention.npy",
+            self._to_numpy(debug["cross_attention"]).astype(np.float32),
+        )
+
+        metadata = {
+            "text_token_index": int(debug["text_token_index"]),
+            "absolute_text_index": int(debug["absolute_text_index"]),
+            "num_image_tokens": int(sum(end - start for start, end in debug["image_token_layout"].values())),
+            "image_token_layout": debug["image_token_layout"],
+        }
+        (step_dir / "text_to_image_attention_meta.txt").write_text(f"{metadata}\n", encoding="utf-8")
+
+        for image_name, upsampled_map in debug["maps_resized"].items():
+            image = self._to_uint8_image(self._to_numpy(observation.images[image_name][0]))
+            attention_map = self._to_numpy(upsampled_map)
+            heatmap = self._scalar_map_to_heatmap(attention_map)
+            overlay = self._overlay_heatmap(image, heatmap)
+
+            np.save(step_dir / f"{image_name}_text_to_image_attention.npy", attention_map.astype(np.float32))
+            Image.fromarray(heatmap).save(step_dir / f"{image_name}_text_to_image_attention.png")
+            Image.fromarray(overlay).save(step_dir / f"{image_name}_text_to_image_attention_overlay.png")
 
     def _extract_feature_map(
         self,
@@ -89,6 +140,9 @@ class VisualIntermediateRecorder:
 
     def _feature_map_to_heatmap(self, feature_map: np.ndarray) -> np.ndarray:
         intensity = np.linalg.norm(feature_map, axis=-1)
+        return self._scalar_map_to_heatmap(intensity)
+
+    def _scalar_map_to_heatmap(self, intensity: np.ndarray) -> np.ndarray:
         intensity -= intensity.min()
         max_value = intensity.max()
         if max_value > 0:

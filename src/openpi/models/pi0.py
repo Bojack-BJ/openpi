@@ -136,6 +136,86 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask
 
+    def get_prefix_attention_debug(self, observation: _model.Observation) -> dict[str, at.Array | dict[str, tuple[int, int]]]:
+        """Returns prefix attentions and token layout for image/text cross-attention inspection."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+
+        image_token_layout = {}
+        image_token_count = 0
+        for name in observation.images:
+            image_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
+            next_count = image_token_count + image_tokens.shape[1]
+            image_token_layout[name] = (image_token_count, next_count)
+            image_token_count = next_count
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+
+        outputs = self.PaliGemma.llm(
+            [prefix_tokens, None],
+            mask=prefix_attn_mask,
+            positions=positions,
+            return_attentions=True,
+        )
+        _, _, aux = outputs
+
+        text_token_count = 0 if observation.tokenized_prompt is None else observation.tokenized_prompt.shape[1]
+        return {
+            "attentions": aux["attentions"],
+            "image_token_layout": image_token_layout,
+            "num_image_tokens": image_token_count,
+            "num_text_tokens": text_token_count,
+            "prefix_shape": prefix_tokens.shape,
+        }
+
+    def get_text_to_image_attention_maps(
+        self,
+        observation: _model.Observation,
+        *,
+        text_token_index: int,
+        layer: int = -1,
+    ) -> dict[str, at.Array | dict[str, at.Array] | dict[str, tuple[int, int]]]:
+        """Returns averaged text-to-image attention maps for each image stream."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        debug = self.get_prefix_attention_debug(observation)
+
+        attentions = debug["attentions"]
+        num_image_tokens = int(debug["num_image_tokens"])
+        num_text_tokens = int(debug["num_text_tokens"])
+        if text_token_index < 0 or text_token_index >= num_text_tokens:
+            raise ValueError(f"text_token_index {text_token_index} is out of range for {num_text_tokens} text tokens.")
+
+        absolute_text_index = num_image_tokens + text_token_index
+        cross_attention = attentions[layer, 0, :, absolute_text_index, :num_image_tokens].mean(axis=0)
+
+        maps_2d = {}
+        maps_resized = {}
+        for image_name, (start, end) in debug["image_token_layout"].items():
+            image_attention = cross_attention[start:end]
+            grid_size = int(round(image_attention.shape[0] ** 0.5))
+            if grid_size * grid_size != image_attention.shape[0]:
+                raise ValueError(f"Image token count for {image_name} is not a square grid: {image_attention.shape[0]}")
+
+            map_2d = image_attention.reshape(grid_size, grid_size)
+            image_height, image_width = observation.images[image_name].shape[1:3]
+            maps_2d[image_name] = map_2d
+            maps_resized[image_name] = jax.image.resize(
+                map_2d,
+                (image_height, image_width),
+                method="bilinear",
+            )
+
+        return {
+            "attentions": attentions,
+            "cross_attention": cross_attention,
+            "text_token_index": text_token_index,
+            "absolute_text_index": absolute_text_index,
+            "image_token_layout": debug["image_token_layout"],
+            "maps_2d": maps_2d,
+            "maps_resized": maps_resized,
+        }
+
     @at.typecheck
     def embed_suffix(
         self, obs: _model.Observation, noisy_actions: _model.Actions, timestep: at.Float[at.Array, " b"]

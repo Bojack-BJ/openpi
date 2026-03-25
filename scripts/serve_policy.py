@@ -70,7 +70,8 @@ class Args:
     port: int = 8000
     # Record the policy's behavior for debugging.
     record: bool = False
-    # Save visual encoder feature maps for each inference step under exp_intermediate/.
+    # Save visual encoder feature maps and JAX text-to-image attention maps for each inference step under
+    # exp_intermediate/.
     save_intermediate: bool = False
     # JAX checkpoints: selects a key from the SigLIP intermediate dict, e.g. "pre_logits_2d" or "encoded".
     # PyTorch checkpoints: currently ignored and the projected image-token features are used.
