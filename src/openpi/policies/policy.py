@@ -143,6 +143,7 @@ class VisualIntermediateRecorder:
         return self._scalar_map_to_heatmap(intensity)
 
     def _scalar_map_to_heatmap(self, intensity: np.ndarray) -> np.ndarray:
+        intensity = np.array(intensity, dtype=np.float32, copy=True)
         intensity -= intensity.min()
         max_value = intensity.max()
         if max_value > 0:
