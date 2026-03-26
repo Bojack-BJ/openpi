@@ -1,5 +1,6 @@
 import dataclasses
 from typing import TYPE_CHECKING
+from typing import Literal
 
 import flax.nnx as nnx
 import jax
@@ -15,9 +16,14 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
 
+VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
+
+
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
+    vlm_backend: VLMBackend = "paligemma"
+    vlm_hf_model_id: str | None = None
     paligemma_variant: _gemma.Variant = "gemma_2b"
     action_expert_variant: _gemma.Variant = "gemma_300m"
 
@@ -37,6 +43,10 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.vlm_backend not in ("paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"):
+            raise ValueError(f"Unsupported vlm_backend: {self.vlm_backend}")
+        if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl") and self.vlm_hf_model_id is None:
+            object.__setattr__(self, "vlm_hf_model_id", "Qwen/Qwen2.5-VL-7B-Instruct")
 
     @property
     @override

@@ -16,10 +16,12 @@ class PaliGemmaWithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        hf_model_id: str | None = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
         super().__init__()
+        self.hf_model_id = hf_model_id
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -59,6 +61,20 @@ class PaliGemmaWithExpertModel(nn.Module):
         self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
+
+    def set_gradient_checkpointing_enabled(self, enabled: bool):
+        self.paligemma.language_model.gradient_checkpointing = enabled
+        self.paligemma.vision_tower.gradient_checkpointing = enabled
+        self.gemma_expert.model.gradient_checkpointing = enabled
+
+    def prefix_q_proj_dtype(self):
+        return self.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+
+    def set_prefix_attention_implementation(self, implementation: str):
+        self.paligemma.language_model.config._attn_implementation = implementation  # noqa: SLF001
+
+    def set_suffix_attention_implementation(self, implementation: str):
+        self.gemma_expert.model.config._attn_implementation = implementation  # noqa: SLF001
 
     def to_bfloat16_for_selected_params(self, precision: Literal["bfloat16", "float32"] = "bfloat16"):
         if precision == "bfloat16":
