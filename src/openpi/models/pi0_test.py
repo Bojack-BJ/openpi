@@ -18,7 +18,7 @@ def test_pi0_full_finetune():
 
 
 def test_pi0_gemma_lora():
-    config = _pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora")
+    config = _pi0_config.Pi0Config(vlm_backbone_variant="gemma_2b_lora")
     state = _get_frozen_state(config)
     assert len(state) == 9
     assert all("lora" not in p for p in state)
@@ -38,7 +38,7 @@ def test_pi0_action_expert_lora():
 
 
 def test_pi0_all_lora():
-    config = _pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
+    config = _pi0_config.Pi0Config(vlm_backbone_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
     state = _get_frozen_state(config)
     # sum of gemma_lora and action_expert_lora's frozen params.
     assert len(state) == 17

@@ -159,7 +159,7 @@ Status update:
 - current supported configuration is:
   - `vlm_backend="qwen2_5_vl"` or `vlm_backend="qwen2_vl"`
   - `vlm_hf_model_id="Qwen/Qwen2.5-VL-7B-Instruct"`
-  - `paligemma_variant="qwen2_5_7b"`
+  - `vlm_backbone_variant="qwen2_5_7b"`
   - `action_expert_variant="qwen2_5_7b"`
 - current limitations:
   - only the prompt tokenizer path has been migrated; FAST/action-tokenizer paths are still PaliGemma-specific

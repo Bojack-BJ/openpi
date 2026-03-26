@@ -8,7 +8,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
-import openpi.models.gemma as _gemma
+import openpi.models.vlm_backbone_config as _vlm_backbone_config
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
 
@@ -22,10 +22,12 @@ VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
+    # Backend selection currently affects the PyTorch implementation and prompt-tokenizer routing.
+    # TODO: teach the JAX Pi0 path to dispatch on vlm_backend instead of always building the Gemma/SigLIP stack.
     vlm_backend: VLMBackend = "paligemma"
     vlm_hf_model_id: str | None = None
-    paligemma_variant: _gemma.Variant = "gemma_2b"
-    action_expert_variant: _gemma.Variant = "gemma_300m"
+    vlm_backbone_variant: _vlm_backbone_config.Variant = "gemma_2b"
+    action_expert_variant: _vlm_backbone_config.Variant = "gemma_300m"
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -90,11 +92,11 @@ class Pi0Config(_model.BaseModelConfig):
         """Returns the freeze filter based on the model config."""
         filters = []
         has_lora = False
-        gemma_params_filter = nnx_utils.PathRegex(".*llm.*")
+        vlm_backbone_params_filter = nnx_utils.PathRegex(".*llm.*")
         action_expert_params_filter = nnx_utils.PathRegex(".*llm.*_1.*")
-        if "lora" in self.paligemma_variant:
+        if "lora" in self.vlm_backbone_variant:
             filters.append(
-                gemma_params_filter,
+                vlm_backbone_params_filter,
             )
             if "lora" not in self.action_expert_variant:
                 # If only freeze gemma params, exclude action expert params.

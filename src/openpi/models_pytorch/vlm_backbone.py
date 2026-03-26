@@ -32,6 +32,9 @@ def create_vlm_with_expert_model(
             hf_model_id=hf_model_id,
         )
 
+    # TODO: add an InternVL3 adapter that implements the same model-facing contract as the
+    # PaliGemma/Qwen backends: prompt tokenization, image embedding, joint prefix/suffix attention,
+    # and checkpoint loading.
     raise NotImplementedError(
         f"`vlm_backend={vlm_backend}` is not implemented yet. "
         "The current codebase can now route through a generic VLM backend factory, "

@@ -73,6 +73,12 @@ class PaligemmaTokenizer:
 
 
 class Qwen2VLTokenizer:
+    """Minimal prompt tokenizer for the OpenPI-style Qwen adapter.
+
+    This only tokenizes the text side of the prompt. Images are still embedded separately
+    inside the model and are not serialized through Qwen's official multimodal processor.
+    """
+
     def __init__(self, max_len: int = 48, model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
         self._max_len = max_len
         self._model_id = model_id
@@ -91,6 +97,8 @@ class Qwen2VLTokenizer:
         user_text = _build_pi_prompt_text(prompt, state)
 
         if hasattr(self._tokenizer, "apply_chat_template"):
+            # TODO: switch to the full Qwen multimodal processor path when the model adapter
+            # consumes official image placeholders / multimodal position ids end-to-end.
             rendered = self._tokenizer.apply_chat_template(
                 [{"role": "user", "content": user_text}],
                 tokenize=False,
@@ -127,6 +135,8 @@ class FASTTokenizer:
 
         # Instantiate FAST tokenizer
         self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        # TODO: add a backend-aware action tokenizer path for Qwen/other VLM vocabularies. FAST is
+        # still mapped into the PaliGemma token space today.
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(

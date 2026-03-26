@@ -26,7 +26,7 @@ def test_pi0_model():
 
 def test_pi0_lora_model():
     key = jax.random.key(0)
-    config = pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora")
+    config = pi0_config.Pi0Config(vlm_backbone_variant="gemma_2b_lora")
     model = config.create(key)
 
     batch_size = 2
@@ -56,7 +56,7 @@ def test_pi0_fast_model():
 
 def test_pi0_fast_lora_model():
     key = jax.random.key(0)
-    config = pi0_fast.Pi0FASTConfig(paligemma_variant="gemma_2b_lora")
+    config = pi0_fast.Pi0FASTConfig(vlm_backbone_variant="gemma_2b_lora")
     model = config.create(key)
 
     batch_size = 2

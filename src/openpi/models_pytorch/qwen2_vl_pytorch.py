@@ -22,6 +22,13 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Qwen2_5_VLWithExpertModel(nn.Module):
+    """Qwen2.5-VL adapter that preserves OpenPI's existing prefix/suffix contract.
+
+    Images and prompt tokens are embedded separately, then mixed through the same shared
+    prefix/suffix self-attention pattern used by the PaliGemma path. This is intentionally
+    not a drop-in reproduction of the official Qwen multimodal input stack.
+    """
+
     def __init__(
         self,
         vlm_config,
@@ -32,11 +39,15 @@ class Qwen2_5_VLWithExpertModel(nn.Module):
     ):
         if use_adarms is None:
             use_adarms = [False, False]
+        # TODO: support pi05 by adding a Qwen-compatible conditional norm path for the suffix expert.
         if any(use_adarms):
             raise NotImplementedError("Qwen2.5-VL backbone does not support pi05/AdaRMS expert conditioning yet.")
         super().__init__()
         self.hf_model_id = hf_model_id
 
+        # The current adapter reuses native Qwen blocks and directly copies the text-tower weights
+        # into the action expert, so it currently requires the full prefix/expert text geometry to
+        # match. A future shared-attention bridge could relax the hidden-size constraint.
         if vlm_config.width != action_expert_config.width:
             raise ValueError(
                 f"Qwen2.5-VL requires matching hidden sizes for prefix and expert: "
@@ -70,7 +81,7 @@ class Qwen2_5_VLWithExpertModel(nn.Module):
             ):
                 raise ValueError(
                     "The loaded Qwen2.5-VL checkpoint does not match the configured expert geometry. "
-                    "Use `paligemma_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"` "
+                    "Use `vlm_backbone_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"` "
                     "with `Qwen/Qwen2.5-VL-7B-Instruct`."
                 )
             action_expert_config_hf = CONFIG_MAPPING["qwen2"](
@@ -154,6 +165,8 @@ class Qwen2_5_VLWithExpertModel(nn.Module):
                 param.data = param.data.to(dtype=torch.float32)
 
     def _normalize_images_for_qwen(self, image: torch.Tensor) -> torch.Tensor:
+        # OpenPI images arrive in the same normalized range used by the PaliGemma path. Convert them
+        # back to [0, 1] and re-normalize with Qwen's image statistics before calling the visual tower.
         image = (image + 1.0) / 2.0
         image = torch.clamp(image, 0.0, 1.0)
         mean = torch.tensor(QWEN_IMAGE_MEAN, dtype=image.dtype, device=image.device)[None, :, None, None]
@@ -170,6 +183,8 @@ class Qwen2_5_VLWithExpertModel(nn.Module):
     def embed_image(self, image: torch.Tensor):
         image = self._normalize_images_for_qwen(image)
         image_grid_thw = self._image_grid_thw(image)
+        # TODO: move to the full Qwen processor/input path when we support image placeholders and
+        # multimodal position ids end-to-end instead of OpenPI's separate prefix embeddings.
         image_features = self.qwen_vl.get_image_features(pixel_values=image, image_grid_thw=image_grid_thw)
         if isinstance(image_features, torch.Tensor):
             return image_features
@@ -215,6 +230,9 @@ class Qwen2_5_VLWithExpertModel(nn.Module):
             prefix_output = None
             prefix_past_key_values = None
         else:
+            # Joint mode mirrors the existing OpenPI path: each branch computes its own q/k/v, the
+            # sequence dimension is concatenated for one shared attention pass, then each slice runs
+            # through its own residual/norm/MLP stack.
             models = [self.qwen_vl.model, self.qwen_expert.model]
             num_layers = len(self.qwen_vl.model.layers)
 
