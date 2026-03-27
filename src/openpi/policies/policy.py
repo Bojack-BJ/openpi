@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import json
 import logging
 import pathlib
 import time
@@ -11,11 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
 from PIL import Image
+import sentencepiece
 import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.shared import download
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -23,14 +26,39 @@ BasePolicy: TypeAlias = _base_policy.BasePolicy
 _BILINEAR_RESAMPLING = getattr(Image, "Resampling", Image).BILINEAR
 
 
+class _PaligemmaTokenDecoder:
+    def __init__(self):
+        self._tokenizer = None
+
+    def decode_token(self, token_id: int) -> dict[str, str | int]:
+        if self._tokenizer is None:
+            path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+            with path.open("rb") as f:
+                self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
+
+        return {
+            "token_id": token_id,
+            "piece": self._tokenizer.id_to_piece(token_id),
+            "text": self._tokenizer.decode([token_id]),
+        }
+
+
 class VisualIntermediateRecorder:
     """Saves visual encoder feature maps during inference."""
 
-    def __init__(self, output_dir: str | pathlib.Path, *, feature_name: str = "pre_logits_2d"):
+    def __init__(
+        self,
+        output_dir: str | pathlib.Path,
+        *,
+        feature_name: str = "pre_logits_2d",
+        attention_top_k: int = 3,
+    ):
         self._output_dir = pathlib.Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._feature_name = feature_name
+        self._attention_top_k = attention_top_k
         self._step = 0
+        self._token_decoder = _PaligemmaTokenDecoder()
 
     def record(
         self,
@@ -38,6 +66,7 @@ class VisualIntermediateRecorder:
         observation: _model.Observation,
         *,
         is_pytorch: bool,
+        noise: jax.Array | torch.Tensor | None = None,
     ) -> None:
         step_dir = self._output_dir / f"step{self._step}"
         step_dir.mkdir(parents=True, exist_ok=True)
@@ -53,8 +82,10 @@ class VisualIntermediateRecorder:
             Image.fromarray(heatmap).save(step_dir / f"{image_name}_{self._feature_name}.png")
             Image.fromarray(overlay).save(step_dir / f"{image_name}_{self._feature_name}_overlay.png")
 
-        if not is_pytorch and hasattr(model, "get_text_to_image_attention_maps"):
+        if not is_pytorch and hasattr(model, "get_topk_text_to_image_attention_maps"):
             self._record_text_to_image_attention(model, observation, step_dir)
+        if not is_pytorch and noise is not None and hasattr(model, "get_action_to_image_attention_maps"):
+            self._record_action_to_image_attention(model, observation, noise, step_dir)
 
         self._step += 1
 
@@ -67,15 +98,9 @@ class VisualIntermediateRecorder:
         if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
             return
 
-        token_mask = self._to_numpy(observation.tokenized_prompt_mask[0]).astype(bool)
-        num_valid_text_tokens = int(token_mask.sum())
-        if num_valid_text_tokens <= 0:
-            return
-
-        text_token_index = num_valid_text_tokens - 1
-        debug = model.get_text_to_image_attention_maps(
+        debug = model.get_topk_text_to_image_attention_maps(
             observation,
-            text_token_index=text_token_index,
+            top_k=self._attention_top_k,
             layer=-1,
         )
 
@@ -84,17 +109,89 @@ class VisualIntermediateRecorder:
             self._to_numpy(debug["attentions"]).astype(np.float32),
         )
         np.save(
-            step_dir / "text_to_image_cross_attention.npy",
+            step_dir / "text_to_image_token_scores.npy",
+            self._to_numpy(debug["token_scores"]).astype(np.float32),
+        )
+
+        topk_tokens_meta = []
+        for token_debug in debug["topk_tokens"]:
+            rank = int(token_debug["rank"])
+            token_meta = self._token_decoder.decode_token(int(token_debug["token_id"]))
+            token_meta.update(
+                {
+                    "rank": rank,
+                    "score": float(token_debug["score"]),
+                    "text_token_index": int(token_debug["text_token_index"]),
+                    "absolute_text_index": int(token_debug["absolute_text_index"]),
+                }
+            )
+            topk_tokens_meta.append(token_meta)
+
+            np.save(
+                step_dir / f"text_token_rank{rank:02d}_cross_attention.npy",
+                self._to_numpy(token_debug["cross_attention"]).astype(np.float32),
+            )
+
+            for image_name, upsampled_map in token_debug["maps_resized"].items():
+                image = self._to_uint8_image(self._to_numpy(observation.images[image_name][0]))
+                attention_map = self._to_numpy(upsampled_map)
+                heatmap = self._scalar_map_to_heatmap(attention_map)
+                overlay = self._overlay_heatmap(image, heatmap)
+
+                base_name = f"{image_name}_text_to_image_attention_rank{rank:02d}"
+                np.save(step_dir / f"{base_name}.npy", attention_map.astype(np.float32))
+                Image.fromarray(heatmap).save(step_dir / f"{base_name}.png")
+                Image.fromarray(overlay).save(step_dir / f"{base_name}_overlay.png")
+
+        metadata = {
+            "top_k_requested": self._attention_top_k,
+            "top_k_selected": len(topk_tokens_meta),
+            "num_image_tokens": int(sum(end - start for start, end in debug["image_token_layout"].values())),
+            "image_token_layout": {name: [int(start), int(end)] for name, (start, end) in debug["image_token_layout"].items()},
+            "tokens": topk_tokens_meta,
+        }
+        (step_dir / "text_to_image_topk_tokens.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _record_action_to_image_attention(
+        self,
+        model: _model.BaseModel,
+        observation: _model.Observation,
+        noise: jax.Array | torch.Tensor,
+        step_dir: pathlib.Path,
+    ) -> None:
+        if isinstance(noise, torch.Tensor):
+            return
+
+        timestep = jnp.ones((observation.state.shape[0],), dtype=noise.dtype)
+        debug = model.get_action_to_image_attention_maps(
+            observation,
+            noisy_actions=noise,
+            timestep=timestep,
+            layer=-1,
+        )
+
+        np.save(
+            step_dir / "action_to_image_attention_slice.npy",
+            self._to_numpy(debug["action_to_image_attentions"]).astype(np.float32),
+        )
+        np.save(
+            step_dir / "action_to_image_cross_attention.npy",
             self._to_numpy(debug["cross_attention"]).astype(np.float32),
         )
 
         metadata = {
-            "text_token_index": int(debug["text_token_index"]),
-            "absolute_text_index": int(debug["absolute_text_index"]),
+            "timestep": float(self._to_numpy(timestep)[0]),
+            "absolute_action_indices": [int(x) for x in self._to_numpy(debug["absolute_action_indices"]).tolist()],
             "num_image_tokens": int(sum(end - start for start, end in debug["image_token_layout"].values())),
-            "image_token_layout": debug["image_token_layout"],
+            "image_token_layout": {name: [int(start), int(end)] for name, (start, end) in debug["image_token_layout"].items()},
         }
-        (step_dir / "text_to_image_attention_meta.txt").write_text(f"{metadata}\n", encoding="utf-8")
+        (step_dir / "action_to_image_attention_meta.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
         for image_name, upsampled_map in debug["maps_resized"].items():
             image = self._to_uint8_image(self._to_numpy(observation.images[image_name][0]))
@@ -102,9 +199,10 @@ class VisualIntermediateRecorder:
             heatmap = self._scalar_map_to_heatmap(attention_map)
             overlay = self._overlay_heatmap(image, heatmap)
 
-            np.save(step_dir / f"{image_name}_text_to_image_attention.npy", attention_map.astype(np.float32))
-            Image.fromarray(heatmap).save(step_dir / f"{image_name}_text_to_image_attention.png")
-            Image.fromarray(overlay).save(step_dir / f"{image_name}_text_to_image_attention_overlay.png")
+            base_name = f"{image_name}_action_to_image_attention"
+            np.save(step_dir / f"{base_name}.npy", attention_map.astype(np.float32))
+            Image.fromarray(heatmap).save(step_dir / f"{base_name}.png")
+            Image.fromarray(overlay).save(step_dir / f"{base_name}_overlay.png")
 
     def _extract_feature_map(
         self,
@@ -243,11 +341,17 @@ class Policy(BasePolicy):
             sample_kwargs["noise"] = noise
 
         observation = _model.Observation.from_dict(inputs)
+        if self._intermediate_recorder is not None and not self._is_pytorch_model and "noise" not in sample_kwargs:
+            sample_kwargs["noise"] = jax.random.normal(
+                sample_rng_or_pytorch_device,
+                (observation.state.shape[0], self._model.action_horizon, self._model.action_dim),
+            )
         if self._intermediate_recorder is not None:
             self._intermediate_recorder.record(
                 self._model,
                 observation,
                 is_pytorch=self._is_pytorch_model,
+                noise=sample_kwargs.get("noise"),
             )
         start_time = time.monotonic()
         outputs = {

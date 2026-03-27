@@ -76,6 +76,8 @@ class Args:
     # JAX checkpoints: selects a key from the SigLIP intermediate dict, e.g. "pre_logits_2d" or "encoded".
     # PyTorch checkpoints: currently ignored and the projected image-token features are used.
     intermediate_feature_name: str = "pre_logits_2d"
+    # Number of text tokens with the largest text-to-image attention mass to visualize for JAX checkpoints.
+    intermediate_text_top_k: int = 3
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
@@ -144,6 +146,7 @@ def create_policy(args: Args) -> _policy.Policy:
         intermediate_recorder = _policy.VisualIntermediateRecorder(
             create_intermediate_dir(args),
             feature_name=args.intermediate_feature_name,
+            attention_top_k=args.intermediate_text_top_k,
         )
 
     match args.policy:
