@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import numpy as np
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -140,13 +141,7 @@ class Pi0(_model.BaseModel):
         """Returns prefix attentions and token layout for image/text cross-attention inspection."""
         observation = _model.preprocess_observation(None, observation, train=False)
 
-        image_token_layout = {}
-        image_token_count = 0
-        for name in observation.images:
-            image_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
-            next_count = image_token_count + image_tokens.shape[1]
-            image_token_layout[name] = (image_token_count, next_count)
-            image_token_count = next_count
+        image_token_layout, image_token_count = self._get_image_token_layout(observation)
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
@@ -169,6 +164,40 @@ class Pi0(_model.BaseModel):
             "prefix_shape": prefix_tokens.shape,
         }
 
+    def _get_image_token_layout(self, observation: _model.Observation) -> tuple[dict[str, tuple[int, int]], int]:
+        image_token_layout = {}
+        image_token_count = 0
+        for name in observation.images:
+            image_tokens, _ = self.PaliGemma.img(observation.images[name], train=False)
+            next_count = image_token_count + image_tokens.shape[1]
+            image_token_layout[name] = (image_token_count, next_count)
+            image_token_count = next_count
+        return image_token_layout, image_token_count
+
+    def _image_attention_to_maps(
+        self,
+        observation: _model.Observation,
+        image_token_layout: dict[str, tuple[int, int]],
+        image_attention: at.Array,
+    ) -> tuple[dict[str, at.Array], dict[str, at.Array]]:
+        maps_2d = {}
+        maps_resized = {}
+        for image_name, (start, end) in image_token_layout.items():
+            per_image_attention = image_attention[start:end]
+            grid_size = int(round(per_image_attention.shape[0] ** 0.5))
+            if grid_size * grid_size != per_image_attention.shape[0]:
+                raise ValueError(f"Image token count for {image_name} is not a square grid: {per_image_attention.shape[0]}")
+
+            map_2d = per_image_attention.reshape(grid_size, grid_size)
+            image_height, image_width = observation.images[image_name].shape[1:3]
+            maps_2d[image_name] = map_2d
+            maps_resized[image_name] = jax.image.resize(
+                map_2d,
+                (image_height, image_width),
+                method="bilinear",
+            )
+        return maps_2d, maps_resized
+
     def get_text_to_image_attention_maps(
         self,
         observation: _model.Observation,
@@ -189,22 +218,11 @@ class Pi0(_model.BaseModel):
         absolute_text_index = num_image_tokens + text_token_index
         cross_attention = attentions[layer, 0, :, absolute_text_index, :num_image_tokens].mean(axis=0)
 
-        maps_2d = {}
-        maps_resized = {}
-        for image_name, (start, end) in debug["image_token_layout"].items():
-            image_attention = cross_attention[start:end]
-            grid_size = int(round(image_attention.shape[0] ** 0.5))
-            if grid_size * grid_size != image_attention.shape[0]:
-                raise ValueError(f"Image token count for {image_name} is not a square grid: {image_attention.shape[0]}")
-
-            map_2d = image_attention.reshape(grid_size, grid_size)
-            image_height, image_width = observation.images[image_name].shape[1:3]
-            maps_2d[image_name] = map_2d
-            maps_resized[image_name] = jax.image.resize(
-                map_2d,
-                (image_height, image_width),
-                method="bilinear",
-            )
+        maps_2d, maps_resized = self._image_attention_to_maps(
+            observation,
+            debug["image_token_layout"],
+            cross_attention,
+        )
 
         return {
             "attentions": attentions,
@@ -212,6 +230,121 @@ class Pi0(_model.BaseModel):
             "text_token_index": text_token_index,
             "absolute_text_index": absolute_text_index,
             "image_token_layout": debug["image_token_layout"],
+            "maps_2d": maps_2d,
+            "maps_resized": maps_resized,
+        }
+
+    def get_topk_text_to_image_attention_maps(
+        self,
+        observation: _model.Observation,
+        *,
+        top_k: int,
+        layer: int = -1,
+    ) -> dict[str, at.Array | list[dict[str, at.Array | int | float]] | dict[str, tuple[int, int]]]:
+        """Returns per-token text-to-image attention maps for the top-k visually grounded text tokens."""
+        if top_k <= 0:
+            raise ValueError(f"top_k must be positive, got {top_k}.")
+
+        observation = _model.preprocess_observation(None, observation, train=False)
+        if observation.tokenized_prompt is None or observation.tokenized_prompt_mask is None:
+            raise ValueError("Tokenized prompt is required for text-to-image attention visualization.")
+
+        debug = self.get_prefix_attention_debug(observation)
+        attentions = debug["attentions"]
+        num_image_tokens = int(debug["num_image_tokens"])
+
+        token_mask = np.asarray(observation.tokenized_prompt_mask[0]).astype(bool)
+        valid_text_token_indices = np.flatnonzero(token_mask)
+        if valid_text_token_indices.size == 0:
+            raise ValueError("No valid text tokens found for text-to-image attention visualization.")
+
+        absolute_text_indices = jnp.asarray(valid_text_token_indices + num_image_tokens)
+        layer_attentions = attentions[layer, 0]
+        text_to_image_attentions = jnp.take(layer_attentions, absolute_text_indices, axis=1)[:, :, :num_image_tokens]
+        token_scores = jnp.sum(text_to_image_attentions, axis=-1).mean(axis=0)
+
+        actual_top_k = min(top_k, valid_text_token_indices.size)
+        topk_relative_indices = jnp.argsort(-token_scores)[:actual_top_k]
+        prompt_token_ids = np.asarray(observation.tokenized_prompt[0])
+
+        topk_tokens = []
+        for rank, relative_index in enumerate(np.asarray(topk_relative_indices)):
+            relative_index = int(relative_index)
+            text_token_index = int(valid_text_token_indices[relative_index])
+            absolute_text_index = int(text_token_index + num_image_tokens)
+            cross_attention = text_to_image_attentions[:, relative_index, :].mean(axis=0)
+            maps_2d, maps_resized = self._image_attention_to_maps(
+                observation,
+                debug["image_token_layout"],
+                cross_attention,
+            )
+            topk_tokens.append(
+                {
+                    "rank": rank,
+                    "score": float(token_scores[relative_index]),
+                    "token_id": int(prompt_token_ids[text_token_index]),
+                    "text_token_index": text_token_index,
+                    "absolute_text_index": absolute_text_index,
+                    "cross_attention": cross_attention,
+                    "maps_2d": maps_2d,
+                    "maps_resized": maps_resized,
+                }
+            )
+
+        return {
+            "attentions": attentions,
+            "token_scores": token_scores,
+            "valid_text_token_indices": jnp.asarray(valid_text_token_indices),
+            "image_token_layout": debug["image_token_layout"],
+            "topk_tokens": topk_tokens,
+        }
+
+    def get_action_to_image_attention_maps(
+        self,
+        observation: _model.Observation,
+        *,
+        noisy_actions: _model.Actions,
+        timestep: at.Float[at.Array, " b"],
+        layer: int = -1,
+    ) -> dict[str, at.Array | dict[str, at.Array] | dict[str, tuple[int, int]]]:
+        """Returns averaged action-to-image attention maps over all action tokens."""
+        observation = _model.preprocess_observation(None, observation, train=False)
+        image_token_layout, num_image_tokens = self._get_image_token_layout(observation)
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, noisy_actions, timestep)
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        outputs = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, adarms_cond],
+            return_attentions=True,
+        )
+        _, _, aux = outputs
+        attentions = aux["attentions"]
+
+        prefix_len = prefix_tokens.shape[1]
+        action_absolute_indices = jnp.arange(prefix_len + suffix_tokens.shape[1] - self.action_horizon, prefix_len + suffix_tokens.shape[1])
+        layer_attentions = attentions[layer, 0]
+        action_to_image_attentions = jnp.take(layer_attentions, action_absolute_indices, axis=1)[:, :, :num_image_tokens]
+        cross_attention = action_to_image_attentions.mean(axis=(0, 1))
+        maps_2d, maps_resized = self._image_attention_to_maps(
+            observation,
+            image_token_layout,
+            cross_attention,
+        )
+
+        return {
+            "attentions": attentions,
+            "action_to_image_attentions": action_to_image_attentions,
+            "cross_attention": cross_attention,
+            "absolute_action_indices": action_absolute_indices,
+            "image_token_layout": image_token_layout,
             "maps_2d": maps_2d,
             "maps_resized": maps_resized,
         }
