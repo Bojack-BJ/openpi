@@ -9,6 +9,8 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen2 import modeling_qwen2
 
+from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
+
 
 QWEN2_5_VL_VOCAB_SIZE = 152_064
 QWEN_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -21,7 +23,7 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.repeat_interleave(n_rep, dim=1)
 
 
-class Qwen2_5_VLWithExpertModel(nn.Module):
+class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
     """Qwen2.5-VL adapter that preserves OpenPI's existing prefix/suffix contract.
 
     Images and prompt tokens are embedded separately, then mixed through the same shared

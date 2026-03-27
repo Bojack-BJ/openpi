@@ -8,8 +8,10 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
 
-class PaliGemmaWithExpertModel(nn.Module):
+
+class PaliGemmaWithExpertModel(VLMWithExpertModel):
     def __init__(
         self,
         vlm_config,
