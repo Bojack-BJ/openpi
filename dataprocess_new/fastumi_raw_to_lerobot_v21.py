@@ -43,11 +43,11 @@
             --max-inflight 16
 
         # 示例二：双臂数据，使用 next-step action，并将结果复制到指定目录
-        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
-            --raw-dir /root/Users/dataset/task_20260310H072Aa/good \
-            --repo-id fastumi/Waste_sorting_a \
-            --task "Sort the recyclable waste and hazardous waste into the corresponding bins" \
-            --fps 30 \
+        python /root/Users/lixiaotong/openpi/dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir /root/Users/dataset/pi0_tasks_lixiaotong/task_20260309K055Aa_Make_a_sandwich \
+            --repo-id fastumi/task_20260309K055Aa_Make_a_sandwich \
+            --task "Make a sandwich first pick up a piece of bread and place it in a basket with left arm and then pick up steak and green vegetable and stack them on the bread in sequence with right arm and finally pick up another piece of bread and put it on top" \
+            --fps 20 \
             --traj-source merge \
             --mode image \
             --workers 48 \

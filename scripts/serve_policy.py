@@ -77,7 +77,7 @@ class Args:
     # PyTorch checkpoints: currently ignored and the projected image-token features are used.
     intermediate_feature_name: str = "pre_logits_2d"
     # Number of text tokens with the largest text-to-image attention mass to visualize for JAX checkpoints.
-    intermediate_text_top_k: int = 3
+    intermediate_text_top_k: int = 10
 
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
