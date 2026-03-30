@@ -14,7 +14,7 @@ cfg=fruit_classification_Aa
 exp=${exp:-$cfg}   # override via env; default equals cfg
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
-export HF_DATASETS_CACHE="/root/.cache/"
+export HF_DATASETS_CACHE="/root/Users/.cache/"
 export WANDB_MODE=offline
 
 cd /root/Users/lixiaotong/openpi

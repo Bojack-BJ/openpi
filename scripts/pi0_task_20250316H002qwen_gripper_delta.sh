@@ -14,7 +14,7 @@ cfg=qwen_test
 exp=${exp:-$cfg}   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
-export HF_DATASETS_CACHE="/root/.cache/"
+export HF_DATASETS_CACHE="/root/Users/.cache/"
 export WANDB_MODE=offline
 
 cd /root/Users/lixiaotong/openpi
