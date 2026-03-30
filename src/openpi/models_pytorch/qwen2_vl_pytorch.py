@@ -26,6 +26,21 @@ def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.repeat_interleave(n_rep, dim=1)
 
 
+def _get_layer_past_key_value(past_key_values, layer_idx: int):
+    if past_key_values is None:
+        return None, None
+
+    if hasattr(past_key_values, "key_cache") and hasattr(past_key_values, "value_cache"):
+        return past_key_values.key_cache[layer_idx], past_key_values.value_cache[layer_idx]
+
+    if hasattr(past_key_values, "__getitem__"):
+        layer_past = past_key_values[layer_idx]
+        if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 2:
+            return layer_past[0], layer_past[1]
+
+    raise TypeError(f"Unsupported Qwen past_key_values type: {type(past_key_values)!r}")
+
+
 class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
     """Qwen2.5-VL adapter that preserves OpenPI's existing prefix/suffix contract.
 
@@ -285,6 +300,8 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
         metadata = {
             "image_grid_thw": torch.stack(image_grid_thws, dim=1) if image_grid_thws else None,
+            "image_token_counts": tuple(img_emb.shape[1] for img_emb in embs[:-1]),
+            "language_token_length": lang_emb.shape[1],
             "image_processor_modes": tuple(image_processor_modes),
             # Preserve original prompt text so the backend can later switch from text-only token ids
             # to Qwen's official multimodal chat-template construction without changing PI0Pytorch again.
@@ -301,6 +318,177 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             att_masks=att_masks,
             metadata=metadata,
         )
+
+    def _get_image_token_counts(self, prefix_batch: PrefixBatch) -> tuple[int, ...]:
+        counts = prefix_batch.metadata.get("image_token_counts")
+        if counts is None:
+            return ()
+        return tuple(int(count) for count in counts)
+
+    def _get_language_token_length(self, prefix_batch: PrefixBatch) -> int:
+        return int(prefix_batch.metadata.get("language_token_length", 0))
+
+    def _compute_llm_grid(self, grid_thw: torch.Tensor, token_count: int) -> tuple[int, int, int]:
+        grid_t = int(grid_thw[0].item())
+        grid_h = int(grid_thw[1].item())
+        grid_w = int(grid_thw[2].item())
+        merge_size = int(getattr(self.qwen_vl.config.vision_config, "spatial_merge_size", 1))
+
+        llm_t = max(grid_t, 1)
+        llm_h = max(grid_h // merge_size, 1)
+        llm_w = max(grid_w // merge_size, 1)
+        if llm_t * llm_h * llm_w == token_count:
+            return llm_t, llm_h, llm_w
+
+        if grid_t * grid_h * grid_w == token_count:
+            return max(grid_t, 1), max(grid_h, 1), max(grid_w, 1)
+
+        return 1, 1, token_count
+
+    def _make_image_position_ids(
+        self,
+        grid_thw: torch.Tensor,
+        token_count: int,
+        offset: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        llm_t, llm_h, llm_w = self._compute_llm_grid(grid_thw, token_count)
+        if llm_t * llm_h * llm_w != token_count:
+            flat_pos = torch.arange(token_count, device=device, dtype=torch.long) + offset
+            return flat_pos[None, :].expand(3, -1)
+
+        time_ids = torch.arange(llm_t, device=device, dtype=torch.long)[:, None, None].expand(llm_t, llm_h, llm_w)
+        height_ids = torch.arange(llm_h, device=device, dtype=torch.long)[None, :, None].expand(llm_t, llm_h, llm_w)
+        width_ids = torch.arange(llm_w, device=device, dtype=torch.long)[None, None, :].expand(llm_t, llm_h, llm_w)
+        return torch.stack(
+            [
+                time_ids.reshape(-1) + offset,
+                height_ids.reshape(-1) + offset,
+                width_ids.reshape(-1) + offset,
+            ],
+            dim=0,
+        )
+
+    def _make_text_position_ids(
+        self,
+        valid_token_count: int,
+        offset: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        flat_pos = torch.arange(valid_token_count, device=device, dtype=torch.long) + offset
+        return flat_pos[None, :].expand(3, -1)
+
+    def _build_prefix_position_metadata(self, prefix_batch: PrefixBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # This mirrors Qwen's multimodal idea (image tokens get grid-aware 3-axis positions and
+        # text/suffix tokens continue from the resulting offset), but it is still an OpenPI-side
+        # construction because prefix tokens are not yet serialized through Qwen's official
+        # chat-template/image-placeholder path.
+        image_grid_thw = prefix_batch.metadata.get("image_grid_thw")
+        if image_grid_thw is None:
+            raise ValueError("Qwen prefix metadata is missing `image_grid_thw`.")
+
+        image_token_counts = self._get_image_token_counts(prefix_batch)
+        language_token_length = self._get_language_token_length(prefix_batch)
+        batch_size, total_prefix_len = prefix_batch.pad_masks.shape
+        device = prefix_batch.pad_masks.device
+
+        position_ids = torch.ones(3, batch_size, total_prefix_len, dtype=torch.long, device=device)
+        continuation_offsets = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        rope_deltas = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+
+        for batch_idx in range(batch_size):
+            cursor = 0
+            next_offset = 0
+
+            for image_idx, token_count in enumerate(image_token_counts):
+                token_slice = slice(cursor, cursor + token_count)
+                image_pad_mask = prefix_batch.pad_masks[batch_idx, token_slice]
+                if torch.any(image_pad_mask):
+                    image_positions = self._make_image_position_ids(
+                        image_grid_thw[batch_idx, image_idx],
+                        token_count,
+                        next_offset,
+                        device=device,
+                    )
+                    position_ids[:, batch_idx, token_slice] = image_positions
+                    next_offset = int(image_positions.max().item()) + 1
+                cursor += token_count
+
+            text_slice = slice(cursor, cursor + language_token_length)
+            text_pad_mask = prefix_batch.pad_masks[batch_idx, text_slice]
+            valid_text_tokens = int(text_pad_mask.sum().item())
+            if valid_text_tokens > 0:
+                text_positions = self._make_text_position_ids(valid_text_tokens, next_offset, device=device)
+                position_ids[:, batch_idx, cursor : cursor + valid_text_tokens] = text_positions
+                next_offset += valid_text_tokens
+
+            continuation_offsets[batch_idx, 0] = next_offset
+            rope_deltas[batch_idx, 0] = next_offset - int(prefix_batch.pad_masks[batch_idx].sum().item())
+
+        return position_ids, continuation_offsets, rope_deltas
+
+    def _build_continuation_position_ids(
+        self,
+        continuation_offsets: torch.Tensor,
+        suffix_pad_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, suffix_len = suffix_pad_masks.shape
+        device = suffix_pad_masks.device
+        position_ids = torch.ones(3, batch_size, suffix_len, dtype=torch.long, device=device)
+
+        for batch_idx in range(batch_size):
+            valid_suffix_tokens = int(suffix_pad_masks[batch_idx].sum().item())
+            if valid_suffix_tokens == 0:
+                continue
+            suffix_positions = self._make_text_position_ids(
+                valid_suffix_tokens,
+                int(continuation_offsets[batch_idx, 0].item()),
+                device=device,
+            )
+            position_ids[:, batch_idx, :valid_suffix_tokens] = suffix_positions
+
+        return position_ids
+
+    def build_prefix_prefill_context(self, prefix_batch: PrefixBatch) -> AttentionContext:
+        prefill_context = super().build_prefix_prefill_context(prefix_batch)
+        position_ids, continuation_offsets, rope_deltas = self._build_prefix_position_metadata(prefix_batch)
+        prefill_context.forward_kwargs["position_ids"] = position_ids
+        prefill_context.metadata["prefix_position_ids"] = position_ids
+        prefill_context.metadata["continuation_offsets"] = continuation_offsets
+        prefill_context.metadata["rope_deltas"] = rope_deltas
+        return prefill_context
+
+    def build_joint_attention_context(
+        self,
+        prefix_batch: PrefixBatch,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> AttentionContext:
+        joint_context = super().build_joint_attention_context(prefix_batch, suffix_pad_masks, suffix_att_masks)
+        prefix_position_ids, continuation_offsets, rope_deltas = self._build_prefix_position_metadata(prefix_batch)
+        suffix_position_ids = self._build_continuation_position_ids(continuation_offsets, suffix_pad_masks)
+        joint_context.forward_kwargs["position_ids"] = torch.cat([prefix_position_ids, suffix_position_ids], dim=2)
+        joint_context.metadata["continuation_offsets"] = continuation_offsets
+        joint_context.metadata["rope_deltas"] = rope_deltas
+        return joint_context
+
+    def build_suffix_decode_context(
+        self,
+        prefix_cache,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> AttentionContext:
+        decode_context = super().build_suffix_decode_context(prefix_cache, suffix_pad_masks, suffix_att_masks)
+        continuation_offsets = prefix_cache.metadata.get("continuation_offsets")
+        if continuation_offsets is None:
+            raise ValueError("Qwen prefix cache is missing `continuation_offsets`.")
+        rope_deltas = prefix_cache.metadata.get("rope_deltas")
+        suffix_position_ids = self._build_continuation_position_ids(continuation_offsets, suffix_pad_masks)
+        decode_context.forward_kwargs["position_ids"] = suffix_position_ids
+        decode_context.metadata["rope_deltas"] = rope_deltas
+        return decode_context
 
     def build_prefix_cache_metadata(
         self,
@@ -343,14 +531,61 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.qwen_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-            )
-            suffix_output = suffix_output.last_hidden_state
+            hidden_states = inputs_embeds[1]
+            num_layers = len(self.qwen_expert.model.layers)
+
+            for layer_idx in range(num_layers):
+                layer = self.qwen_expert.model.layers[layer_idx]
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+
+                batch_size, seq_len, _ = hidden_states.shape
+                head_dim = layer.self_attn.head_dim
+                num_heads = layer.self_attn.q_proj.out_features // head_dim
+                num_kv_heads = layer.self_attn.k_proj.out_features // head_dim
+
+                query_states = layer.self_attn.q_proj(hidden_states).view(batch_size, seq_len, num_heads, head_dim)
+                key_states = layer.self_attn.k_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
+                value_states = layer.self_attn.v_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
+
+                query_states = query_states.transpose(1, 2)
+                key_states = key_states.transpose(1, 2)
+                value_states = value_states.transpose(1, 2)
+
+                dummy_hidden_states = torch.zeros(
+                    batch_size,
+                    seq_len,
+                    query_states.shape[-1] * query_states.shape[1],
+                    device=query_states.device,
+                    dtype=query_states.dtype,
+                )
+                cos, sin = self.qwen_vl.model.rotary_emb(dummy_hidden_states, position_ids)
+                query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+                past_key_states, past_value_states = _get_layer_past_key_value(past_key_values, layer_idx)
+                if past_key_states is not None and past_value_states is not None:
+                    key_states = torch.cat([past_key_states, key_states], dim=2)
+                    value_states = torch.cat([past_value_states, value_states], dim=2)
+
+                key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
+                value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
+
+                attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(
+                    query_states.shape[-1]
+                )
+                attn_weights = attn_weights + attention_mask
+                attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                attn_output = torch.matmul(attn_weights, value_states)
+                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+
+                out_emb = layer.self_attn.o_proj(attn_output)
+                hidden_states = residual + out_emb
+                residual = hidden_states
+                hidden_states = layer.post_attention_layernorm(hidden_states)
+                hidden_states = layer.mlp(hidden_states)
+                hidden_states = residual + hidden_states
+
+            suffix_output = self.qwen_expert.model.norm(hidden_states)
             prefix_output = None
             prefix_past_key_values = None
         else:
