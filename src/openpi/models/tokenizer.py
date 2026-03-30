@@ -75,10 +75,10 @@ class PaligemmaTokenizer:
 class Qwen2VLTokenizer:
     """Minimal prompt tokenizer for the OpenPI-style Qwen adapter.
 
-    This only tokenizes the text side of the prompt. The PyTorch Qwen backend can already
-    route image preprocessing through the official processor, but prefix construction still
-    embeds images and text separately and does not yet serialize the whole prompt through
-    Qwen's official multimodal chat-template path.
+    This remains a text-only fallback/token-budget helper. The PyTorch Qwen backend now
+    prefers to keep the raw prompt and assemble text tokens inside the backend before
+    concatenating them into the OpenPI prefix, while still avoiding Qwen's full official
+    multimodal chat-template path.
     """
 
     def __init__(self, max_len: int = 48, model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
@@ -99,8 +99,8 @@ class Qwen2VLTokenizer:
         user_text = _build_pi_prompt_text(prompt, state)
 
         if hasattr(self._tokenizer, "apply_chat_template"):
-            # TODO: switch to the full Qwen multimodal processor path when the model adapter
-            # consumes official image placeholders / multimodal position ids end-to-end.
+            # TODO: if we later need a more faithful Qwen multimodal input path, move prompt
+            # assembly fully into the backend-specific processor/template logic.
             rendered = self._tokenizer.apply_chat_template(
                 [{"role": "user", "content": user_text}],
                 tokenize=False,

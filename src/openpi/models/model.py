@@ -65,7 +65,7 @@ IMAGE_RESOLUTION = (224, 224)
 #     },
 #     "state": float32[*b, s],  # Low-dimensional robot state
 #     "raw_prompt": optional original prompt string(s), only preserved on paths that need
-#         backend-owned multimodal processor construction
+#         backend-owned prompt assembly
 #     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
 #     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
 #     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
@@ -96,7 +96,7 @@ class Observation(Generic[ArrayT]):
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
 
-    # Optional original prompt preserved for backend-owned processor paths. This is intentionally
+    # Optional original prompt preserved for backend-owned prompt assembly. This is intentionally
     # left untyped because only the PyTorch/Qwen path consumes it today.
     raw_prompt: object | None = None
 

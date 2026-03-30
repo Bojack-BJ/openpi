@@ -294,6 +294,8 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PromptTokenizer
     discrete_state_input: bool = False
+    # Preserve the original prompt alongside tokenized text so backends such as Qwen can
+    # optionally rebuild their own prompt tokens without changing the data pipeline.
     preserve_raw_prompt: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:

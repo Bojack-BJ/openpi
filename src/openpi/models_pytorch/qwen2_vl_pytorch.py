@@ -10,7 +10,6 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen2 import modeling_qwen2
 
-from openpi.models_pytorch.vlm_backbone_base import AttentionContext
 from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
 from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
 
@@ -46,9 +45,10 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
     Images and prompt tokens are embedded separately, then mixed through the same shared
     prefix/suffix self-attention pattern used by the PaliGemma path. Image preprocessing
-    can already route through the official Qwen processor, but the joint-attention path
-    still uses OpenPI's 1D prefix/suffix positions rather than Qwen's full multimodal
-    position semantics.
+    can already route through the official Qwen processor. For VLA-focused training we keep
+    the simpler OpenPI contract: concatenate image and text embeddings into the prefix and
+    use ordinary 1D prefix/suffix positions. This intentionally does not reproduce Qwen's
+    full multimodal placeholder/template or position semantics yet.
     """
 
     def __init__(
@@ -68,6 +68,11 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         self.hf_model_id = hf_model_id
         self.qwen_processor = (
             AutoProcessor.from_pretrained(hf_model_id, trust_remote_code=True) if hf_model_id is not None else None
+        )
+        self.qwen_tokenizer = (
+            self.qwen_processor.tokenizer
+            if self.qwen_processor is not None and hasattr(self.qwen_processor, "tokenizer")
+            else self.qwen_processor
         )
 
         # The current adapter reuses native Qwen blocks and directly copies the text-tower weights
@@ -253,6 +258,88 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             return image_features[0]
         raise TypeError(f"Unexpected image feature output type: {type(image_features)!r}")
 
+    @staticmethod
+    def _normalize_raw_prompts(raw_prompts, batch_size: int) -> list[str] | None:
+        if raw_prompts is None:
+            return None
+
+        if isinstance(raw_prompts, str):
+            prompts = [raw_prompts] * batch_size
+        elif isinstance(raw_prompts, (list, tuple)):
+            prompts = list(raw_prompts)
+        elif hasattr(raw_prompts, "shape") and getattr(raw_prompts, "ndim", 0) > 0:
+            prompts = list(raw_prompts.tolist())
+        elif hasattr(raw_prompts, "tolist"):
+            prompts = raw_prompts.tolist()
+            if not isinstance(prompts, list):
+                prompts = [prompts] * batch_size
+        else:
+            prompts = [raw_prompts] * batch_size
+
+        normalized = []
+        for prompt in prompts:
+            if isinstance(prompt, bytes):
+                prompt = prompt.decode("utf-8")
+            elif not isinstance(prompt, str) and hasattr(prompt, "item"):
+                prompt = prompt.item()
+            if not isinstance(prompt, str):
+                prompt = str(prompt)
+            normalized.append(prompt)
+
+        if len(normalized) == 1 and batch_size > 1:
+            normalized *= batch_size
+        if len(normalized) != batch_size:
+            raise ValueError(f"Expected {batch_size} raw prompts, got {len(normalized)}.")
+        return normalized
+
+    def _tokenize_raw_prompts(
+        self,
+        raw_prompts,
+        *,
+        batch_size: int,
+        max_len: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if raw_prompts is None or self.qwen_tokenizer is None:
+            return None
+
+        prompts = self._normalize_raw_prompts(raw_prompts, batch_size=batch_size)
+        if prompts is None:
+            return None
+
+        cleaned_prompts = [prompt.strip().replace("_", " ").replace("\n", " ") for prompt in prompts]
+        rendered_prompts = []
+        for prompt in cleaned_prompts:
+            if hasattr(self.qwen_tokenizer, "apply_chat_template"):
+                # TODO: if we later adopt backend-specific multimodal templates, build the full
+                # image-aware chat content here instead of this text-only fallback.
+                rendered_prompts.append(
+                    self.qwen_tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                )
+            else:
+                rendered_prompts.append(f"{prompt}\n")
+
+        pad_token_id = getattr(self.qwen_tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            raise ValueError("Qwen tokenizer must define `pad_token_id` for backend-owned prompt assembly.")
+
+        tokenized = self.qwen_tokenizer(
+            rendered_prompts,
+            add_special_tokens=False,
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
+        return (
+            tokenized["input_ids"].to(device=device, dtype=torch.long),
+            tokenized["attention_mask"].to(device=device, dtype=torch.bool),
+        )
+
     def build_prefix_batch(
         self,
         images,
@@ -283,6 +370,18 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             image_grid_thws.append(image_grid_thw)
             image_processor_modes.append(processor_mode)
 
+        prompt_token_source = "tokenized_prompt"
+        if raw_prompts is not None:
+            backend_tokens = self._tokenize_raw_prompts(
+                raw_prompts,
+                batch_size=lang_tokens.shape[0],
+                max_len=lang_tokens.shape[1],
+                device=lang_tokens.device,
+            )
+            if backend_tokens is not None:
+                lang_tokens, lang_masks = backend_tokens
+                prompt_token_source = "backend_raw_prompt"
+
         def embed_language(lang_tokens):
             lang_emb = self.embed_language_tokens(lang_tokens)
             lang_emb_dim = lang_emb.shape[-1]
@@ -300,16 +399,11 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
         metadata = {
             "image_grid_thw": torch.stack(image_grid_thws, dim=1) if image_grid_thws else None,
-            "image_token_counts": tuple(img_emb.shape[1] for img_emb in embs[:-1]),
-            "language_token_length": lang_emb.shape[1],
             "image_processor_modes": tuple(image_processor_modes),
-            # Preserve original prompt text so the backend can later switch from text-only token ids
-            # to Qwen's official multimodal chat-template construction without changing PI0Pytorch again.
+            "prompt_token_source": prompt_token_source,
+            # Preserve original prompt text so future backend-specific multimodal templates can
+            # replace this simple text-only prompt assembly without changing PI0Pytorch again.
             "raw_prompts": raw_prompts,
-            # TODO: populate multimodal token types and RoPE deltas once the joint-attention path
-            # consumes official Qwen multimodal position metadata instead of only 1D position_ids.
-            "mm_token_type_ids": None,
-            "rope_deltas": None,
         }
 
         return PrefixBatch(
@@ -318,189 +412,6 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             att_masks=att_masks,
             metadata=metadata,
         )
-
-    def _get_image_token_counts(self, prefix_batch: PrefixBatch) -> tuple[int, ...]:
-        counts = prefix_batch.metadata.get("image_token_counts")
-        if counts is None:
-            return ()
-        return tuple(int(count) for count in counts)
-
-    def _get_language_token_length(self, prefix_batch: PrefixBatch) -> int:
-        return int(prefix_batch.metadata.get("language_token_length", 0))
-
-    def _compute_llm_grid(self, grid_thw: torch.Tensor, token_count: int) -> tuple[int, int, int]:
-        grid_t = int(grid_thw[0].item())
-        grid_h = int(grid_thw[1].item())
-        grid_w = int(grid_thw[2].item())
-        merge_size = int(getattr(self.qwen_vl.config.vision_config, "spatial_merge_size", 1))
-
-        llm_t = max(grid_t, 1)
-        llm_h = max(grid_h // merge_size, 1)
-        llm_w = max(grid_w // merge_size, 1)
-        if llm_t * llm_h * llm_w == token_count:
-            return llm_t, llm_h, llm_w
-
-        if grid_t * grid_h * grid_w == token_count:
-            return max(grid_t, 1), max(grid_h, 1), max(grid_w, 1)
-
-        return 1, 1, token_count
-
-    def _make_image_position_ids(
-        self,
-        grid_thw: torch.Tensor,
-        token_count: int,
-        offset: int,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        llm_t, llm_h, llm_w = self._compute_llm_grid(grid_thw, token_count)
-        if llm_t * llm_h * llm_w != token_count:
-            flat_pos = torch.arange(token_count, device=device, dtype=torch.long) + offset
-            return flat_pos[None, :].expand(3, -1)
-
-        time_ids = torch.arange(llm_t, device=device, dtype=torch.long)[:, None, None].expand(llm_t, llm_h, llm_w)
-        height_ids = torch.arange(llm_h, device=device, dtype=torch.long)[None, :, None].expand(llm_t, llm_h, llm_w)
-        width_ids = torch.arange(llm_w, device=device, dtype=torch.long)[None, None, :].expand(llm_t, llm_h, llm_w)
-        return torch.stack(
-            [
-                time_ids.reshape(-1) + offset,
-                height_ids.reshape(-1) + offset,
-                width_ids.reshape(-1) + offset,
-            ],
-            dim=0,
-        )
-
-    def _make_text_position_ids(
-        self,
-        valid_token_count: int,
-        offset: int,
-        *,
-        device: torch.device,
-    ) -> torch.Tensor:
-        flat_pos = torch.arange(valid_token_count, device=device, dtype=torch.long) + offset
-        return flat_pos[None, :].expand(3, -1)
-
-    def _build_prefix_position_metadata(self, prefix_batch: PrefixBatch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # This mirrors Qwen's multimodal idea (image tokens get grid-aware 3-axis positions and
-        # text/suffix tokens continue from the resulting offset), but it is still an OpenPI-side
-        # construction because prefix tokens are not yet serialized through Qwen's official
-        # chat-template/image-placeholder path.
-        image_grid_thw = prefix_batch.metadata.get("image_grid_thw")
-        if image_grid_thw is None:
-            raise ValueError("Qwen prefix metadata is missing `image_grid_thw`.")
-
-        image_token_counts = self._get_image_token_counts(prefix_batch)
-        language_token_length = self._get_language_token_length(prefix_batch)
-        batch_size, total_prefix_len = prefix_batch.pad_masks.shape
-        device = prefix_batch.pad_masks.device
-
-        position_ids = torch.ones(3, batch_size, total_prefix_len, dtype=torch.long, device=device)
-        continuation_offsets = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-        rope_deltas = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
-
-        for batch_idx in range(batch_size):
-            cursor = 0
-            next_offset = 0
-
-            for image_idx, token_count in enumerate(image_token_counts):
-                token_slice = slice(cursor, cursor + token_count)
-                image_pad_mask = prefix_batch.pad_masks[batch_idx, token_slice]
-                if torch.any(image_pad_mask):
-                    image_positions = self._make_image_position_ids(
-                        image_grid_thw[batch_idx, image_idx],
-                        token_count,
-                        next_offset,
-                        device=device,
-                    )
-                    position_ids[:, batch_idx, token_slice] = image_positions
-                    next_offset = int(image_positions.max().item()) + 1
-                cursor += token_count
-
-            text_slice = slice(cursor, cursor + language_token_length)
-            text_pad_mask = prefix_batch.pad_masks[batch_idx, text_slice]
-            valid_text_tokens = int(text_pad_mask.sum().item())
-            if valid_text_tokens > 0:
-                text_positions = self._make_text_position_ids(valid_text_tokens, next_offset, device=device)
-                position_ids[:, batch_idx, cursor : cursor + valid_text_tokens] = text_positions
-                next_offset += valid_text_tokens
-
-            continuation_offsets[batch_idx, 0] = next_offset
-            rope_deltas[batch_idx, 0] = next_offset - int(prefix_batch.pad_masks[batch_idx].sum().item())
-
-        return position_ids, continuation_offsets, rope_deltas
-
-    def _build_continuation_position_ids(
-        self,
-        continuation_offsets: torch.Tensor,
-        suffix_pad_masks: torch.Tensor,
-    ) -> torch.Tensor:
-        batch_size, suffix_len = suffix_pad_masks.shape
-        device = suffix_pad_masks.device
-        position_ids = torch.ones(3, batch_size, suffix_len, dtype=torch.long, device=device)
-
-        for batch_idx in range(batch_size):
-            valid_suffix_tokens = int(suffix_pad_masks[batch_idx].sum().item())
-            if valid_suffix_tokens == 0:
-                continue
-            suffix_positions = self._make_text_position_ids(
-                valid_suffix_tokens,
-                int(continuation_offsets[batch_idx, 0].item()),
-                device=device,
-            )
-            position_ids[:, batch_idx, :valid_suffix_tokens] = suffix_positions
-
-        return position_ids
-
-    def build_prefix_prefill_context(self, prefix_batch: PrefixBatch) -> AttentionContext:
-        prefill_context = super().build_prefix_prefill_context(prefix_batch)
-        position_ids, continuation_offsets, rope_deltas = self._build_prefix_position_metadata(prefix_batch)
-        prefill_context.forward_kwargs["position_ids"] = position_ids
-        prefill_context.metadata["prefix_position_ids"] = position_ids
-        prefill_context.metadata["continuation_offsets"] = continuation_offsets
-        prefill_context.metadata["rope_deltas"] = rope_deltas
-        return prefill_context
-
-    def build_joint_attention_context(
-        self,
-        prefix_batch: PrefixBatch,
-        suffix_pad_masks: torch.Tensor,
-        suffix_att_masks: torch.Tensor,
-    ) -> AttentionContext:
-        joint_context = super().build_joint_attention_context(prefix_batch, suffix_pad_masks, suffix_att_masks)
-        prefix_position_ids, continuation_offsets, rope_deltas = self._build_prefix_position_metadata(prefix_batch)
-        suffix_position_ids = self._build_continuation_position_ids(continuation_offsets, suffix_pad_masks)
-        joint_context.forward_kwargs["position_ids"] = torch.cat([prefix_position_ids, suffix_position_ids], dim=2)
-        joint_context.metadata["continuation_offsets"] = continuation_offsets
-        joint_context.metadata["rope_deltas"] = rope_deltas
-        return joint_context
-
-    def build_suffix_decode_context(
-        self,
-        prefix_cache,
-        suffix_pad_masks: torch.Tensor,
-        suffix_att_masks: torch.Tensor,
-    ) -> AttentionContext:
-        decode_context = super().build_suffix_decode_context(prefix_cache, suffix_pad_masks, suffix_att_masks)
-        continuation_offsets = prefix_cache.metadata.get("continuation_offsets")
-        if continuation_offsets is None:
-            raise ValueError("Qwen prefix cache is missing `continuation_offsets`.")
-        rope_deltas = prefix_cache.metadata.get("rope_deltas")
-        suffix_position_ids = self._build_continuation_position_ids(continuation_offsets, suffix_pad_masks)
-        decode_context.forward_kwargs["position_ids"] = suffix_position_ids
-        decode_context.metadata["rope_deltas"] = rope_deltas
-        return decode_context
-
-    def build_prefix_cache_metadata(
-        self,
-        prefix_batch: PrefixBatch,
-        *,
-        prefill_context: AttentionContext,
-    ) -> dict[str, object]:
-        metadata = dict(prefix_batch.metadata)
-        metadata.update(prefill_context.metadata)
-        # TODO: replace these OpenPI-style prefix positions with Qwen continuation positions once
-        # suffix denoising consumes backend-specific cache/position metadata end-to-end.
-        return metadata
 
     def embed_image(self, image: torch.Tensor):
         pixel_values, image_grid_thw, _ = self._preprocess_image_with_processor(image)
