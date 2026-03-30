@@ -78,6 +78,15 @@ def test_tokenize_prompt():
     assert np.allclose(tok_mask, data["tokenized_prompt_mask"])
 
 
+def test_tokenize_prompt_preserve_raw_prompt():
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len=12)
+    transform = _transforms.TokenizePrompt(tokenizer, preserve_raw_prompt=True)
+
+    data = transform({"prompt": "Hello, world!"})
+
+    assert data["raw_prompt"].item() == "Hello, world!"
+
+
 def test_tokenize_no_prompt():
     transform = _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer())
 

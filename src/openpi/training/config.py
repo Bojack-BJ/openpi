@@ -110,6 +110,10 @@ class ModelTransformFactory(GroupFactory):
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
 
+    @staticmethod
+    def _preserve_raw_prompt(model_config: _model.BaseModelConfig) -> bool:
+        return getattr(model_config, "vlm_backend", "paligemma") in ("qwen2_vl", "qwen2_5_vl")
+
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
@@ -119,6 +123,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
                             _tokenizer.create_prompt_tokenizer(model_config),
+                            preserve_raw_prompt=self._preserve_raw_prompt(model_config),
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -132,6 +137,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.create_prompt_tokenizer(model_config),
                             discrete_state_input=model_config.discrete_state_input,
+                            preserve_raw_prompt=self._preserve_raw_prompt(model_config),
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],

@@ -463,9 +463,10 @@ class TorchDataLoader:
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
+                    batch = _drop_backend_only_fields(batch)
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    yield jax.tree.map(_torchify_leaf, batch)
 
 
 def _collate_fn(items):
@@ -473,6 +474,19 @@ def _collate_fn(items):
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
     return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+
+
+def _drop_backend_only_fields(batch):
+    if not isinstance(batch, dict):
+        return batch
+    return {k: v for k, v in batch.items() if k != "raw_prompt"}
+
+
+def _torchify_leaf(x):
+    array = np.asarray(x)
+    if array.dtype.kind in {"U", "S", "O"}:
+        return array
+    return torch.as_tensor(x)
 
 
 def _worker_init_fn(worker_id: int) -> None:

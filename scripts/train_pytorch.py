@@ -146,6 +146,10 @@ def get_model_parameters(model):
     )
 
 
+def move_observation_to_device(observation, device):
+    return jax.tree.map(lambda x: x.to(device) if hasattr(x, "to") else x, observation)
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -517,7 +521,7 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+            observation = move_observation_to_device(observation, device)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 

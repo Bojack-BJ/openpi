@@ -10,6 +10,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen2 import modeling_qwen2
 
+from openpi.models_pytorch.vlm_backbone_base import AttentionContext
 from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
 from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
 
@@ -243,6 +244,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         img_masks,
         lang_tokens,
         lang_masks,
+        raw_prompts=None,
         *,
         checkpoint_fn=None,
     ) -> PrefixBatch:
@@ -284,6 +286,9 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         metadata = {
             "image_grid_thw": torch.stack(image_grid_thws, dim=1) if image_grid_thws else None,
             "image_processor_modes": tuple(image_processor_modes),
+            # Preserve original prompt text so the backend can later switch from text-only token ids
+            # to Qwen's official multimodal chat-template construction without changing PI0Pytorch again.
+            "raw_prompts": raw_prompts,
             # TODO: populate multimodal token types and RoPE deltas once the joint-attention path
             # consumes official Qwen multimodal position metadata instead of only 1D position_ids.
             "mm_token_type_ids": None,
@@ -301,14 +306,10 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         self,
         prefix_batch: PrefixBatch,
         *,
-        prefix_att_2d_masks: torch.Tensor,
-        prefix_position_ids: torch.Tensor,
-        prefix_att_2d_masks_4d: torch.Tensor,
-    ) -> dict[str, torch.Tensor | tuple[str, ...] | None]:
-        del prefix_att_2d_masks_4d
+        prefill_context: AttentionContext,
+    ) -> dict[str, object]:
         metadata = dict(prefix_batch.metadata)
-        metadata["prefix_position_ids"] = prefix_position_ids
-        metadata["prefix_att_2d_masks"] = prefix_att_2d_masks
+        metadata.update(prefill_context.metadata)
         # TODO: replace these OpenPI-style prefix positions with Qwen continuation positions once
         # suffix denoising consumes backend-specific cache/position metadata end-to-end.
         return metadata

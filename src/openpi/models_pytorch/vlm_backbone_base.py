@@ -23,6 +23,14 @@ class PrefixBatch:
 
 
 @dataclasses.dataclass
+class AttentionContext:
+    """Backend-owned attention inputs for prefix prefill, joint train, or suffix decode."""
+
+    forward_kwargs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
 class PrefixCache:
     """Backend-owned prefix cache for suffix-only denoising steps."""
 
@@ -61,6 +69,7 @@ class VLMWithExpertModel(nn.Module):
         img_masks,
         lang_tokens,
         lang_masks,
+        raw_prompts=None,
         *,
         checkpoint_fn: CheckpointFn | None = None,
     ) -> PrefixBatch:
@@ -97,36 +106,99 @@ class VLMWithExpertModel(nn.Module):
             embeds=embs,
             pad_masks=pad_masks,
             att_masks=att_masks,
-            metadata=self.build_prefix_metadata(images, img_masks, lang_tokens, lang_masks),
+            metadata=self.build_prefix_metadata(images, img_masks, lang_tokens, lang_masks, raw_prompts),
         )
 
-    def build_prefix_metadata(self, images, img_masks, lang_tokens, lang_masks) -> dict[str, Any]:
-        del images, img_masks, lang_tokens, lang_masks
+    def build_prefix_metadata(self, images, img_masks, lang_tokens, lang_masks, raw_prompts=None) -> dict[str, Any]:
+        del images, img_masks, lang_tokens, lang_masks, raw_prompts
         return {}
+
+    def build_prefix_prefill_context(self, prefix_batch: PrefixBatch) -> AttentionContext:
+        prefix_att_2d_masks = self.make_att_2d_masks(prefix_batch.pad_masks, prefix_batch.att_masks)
+        prefix_position_ids = torch.cumsum(prefix_batch.pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self.prepare_attention_mask_4d(prefix_att_2d_masks)
+        return AttentionContext(
+            forward_kwargs={
+                "attention_mask": prefix_att_2d_masks_4d,
+                "position_ids": prefix_position_ids,
+            },
+            metadata={
+                "prefix_att_2d_masks": prefix_att_2d_masks,
+                "prefix_position_ids": prefix_position_ids,
+                "prefix_att_2d_masks_4d": prefix_att_2d_masks_4d,
+            },
+        )
+
+    def build_joint_attention_context(
+        self,
+        prefix_batch: PrefixBatch,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> AttentionContext:
+        pad_masks = torch.cat([prefix_batch.pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_batch.att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = self.make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self.prepare_attention_mask_4d(att_2d_masks)
+        return AttentionContext(
+            forward_kwargs={
+                "attention_mask": att_2d_masks_4d,
+                "position_ids": position_ids,
+            },
+            metadata={
+                "att_2d_masks": att_2d_masks,
+                "pad_masks": pad_masks,
+                "att_masks": att_masks,
+            },
+        )
+
+    def build_suffix_decode_context(
+        self,
+        prefix_cache: PrefixCache,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> AttentionContext:
+        prefix_pad_masks = prefix_cache.pad_masks
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = self.make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        full_att_2d_masks_4d = self.prepare_attention_mask_4d(full_att_2d_masks)
+        return AttentionContext(
+            forward_kwargs={
+                "attention_mask": full_att_2d_masks_4d,
+                "position_ids": position_ids,
+            },
+            metadata={
+                "full_att_2d_masks": full_att_2d_masks,
+                "prefix_offsets": prefix_offsets,
+            },
+        )
 
     def build_prefix_cache_metadata(
         self,
         prefix_batch: PrefixBatch,
         *,
-        prefix_att_2d_masks: torch.Tensor,
-        prefix_position_ids: torch.Tensor,
-        prefix_att_2d_masks_4d: torch.Tensor,
+        prefill_context: AttentionContext,
     ) -> dict[str, Any]:
-        del prefix_att_2d_masks, prefix_position_ids, prefix_att_2d_masks_4d
+        del prefill_context
         return dict(prefix_batch.metadata)
 
     def build_prefix_cache(self, prefix_batch: PrefixBatch) -> PrefixCache:
-        prefix_att_2d_masks = self.make_att_2d_masks(prefix_batch.pad_masks, prefix_batch.att_masks)
-        prefix_position_ids = torch.cumsum(prefix_batch.pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self.prepare_attention_mask_4d(prefix_att_2d_masks)
+        prefill_context = self.build_prefix_prefill_context(prefix_batch)
 
         self.set_prefix_attention_implementation("eager")
         _, past_key_values = self.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
             past_key_values=None,
             inputs_embeds=[prefix_batch.embeds, None],
             use_cache=True,
+            **prefill_context.forward_kwargs,
         )
 
         return PrefixCache(
@@ -134,8 +206,6 @@ class VLMWithExpertModel(nn.Module):
             past_key_values=past_key_values,
             metadata=self.build_prefix_cache_metadata(
                 prefix_batch,
-                prefix_att_2d_masks=prefix_att_2d_masks,
-                prefix_position_ids=prefix_position_ids,
-                prefix_att_2d_masks_4d=prefix_att_2d_masks_4d,
+                prefill_context=prefill_context,
             ),
         )

@@ -294,6 +294,7 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PromptTokenizer
     discrete_state_input: bool = False
+    preserve_raw_prompt: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -309,7 +310,10 @@ class TokenizePrompt(DataTransformFn):
             prompt = prompt.item()
 
         tokens, token_masks = self.tokenizer.tokenize(prompt, state)
-        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        output = {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        if self.preserve_raw_prompt:
+            output["raw_prompt"] = np.asarray(prompt)
+        return output
 
 
 @dataclasses.dataclass(frozen=True)
