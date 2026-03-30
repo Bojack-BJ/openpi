@@ -75,8 +75,10 @@ class PaligemmaTokenizer:
 class Qwen2VLTokenizer:
     """Minimal prompt tokenizer for the OpenPI-style Qwen adapter.
 
-    This only tokenizes the text side of the prompt. Images are still embedded separately
-    inside the model and are not serialized through Qwen's official multimodal processor.
+    This only tokenizes the text side of the prompt. The PyTorch Qwen backend can already
+    route image preprocessing through the official processor, but prefix construction still
+    embeds images and text separately and does not yet serialize the whole prompt through
+    Qwen's official multimodal chat-template path.
     """
 
     def __init__(self, max_len: int = 48, model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"):

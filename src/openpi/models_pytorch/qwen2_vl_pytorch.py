@@ -4,11 +4,13 @@ from typing import Literal
 import pytest
 import torch
 from torch import nn
+from transformers import AutoProcessor
 from transformers import Qwen2ForCausalLM
 from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen2 import modeling_qwen2
 
+from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
 from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
 
 
@@ -27,8 +29,10 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
     """Qwen2.5-VL adapter that preserves OpenPI's existing prefix/suffix contract.
 
     Images and prompt tokens are embedded separately, then mixed through the same shared
-    prefix/suffix self-attention pattern used by the PaliGemma path. This is intentionally
-    not a drop-in reproduction of the official Qwen multimodal input stack.
+    prefix/suffix self-attention pattern used by the PaliGemma path. Image preprocessing
+    can already route through the official Qwen processor, but the joint-attention path
+    still uses OpenPI's 1D prefix/suffix positions rather than Qwen's full multimodal
+    position semantics.
     """
 
     def __init__(
@@ -46,6 +50,9 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             raise NotImplementedError("Qwen2.5-VL backbone does not support pi05/AdaRMS expert conditioning yet.")
         super().__init__()
         self.hf_model_id = hf_model_id
+        self.qwen_processor = (
+            AutoProcessor.from_pretrained(hf_model_id, trust_remote_code=True) if hf_model_id is not None else None
+        )
 
         # The current adapter reuses native Qwen blocks and directly copies the text-tower weights
         # into the action expert, so it currently requires the full prefix/expert text geometry to
@@ -182,12 +189,46 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         grid = torch.tensor([1, height, width], dtype=torch.long, device=image.device)
         return grid[None, :].expand(image.shape[0], -1)
 
-    def embed_image(self, image: torch.Tensor):
-        image = self._normalize_images_for_qwen(image)
-        image_grid_thw = self._image_grid_thw(image)
-        # TODO: move to the full Qwen processor/input path when we support image placeholders and
-        # multimodal position ids end-to-end instead of OpenPI's separate prefix embeddings.
-        image_features = self.qwen_vl.get_image_features(pixel_values=image, image_grid_thw=image_grid_thw)
+    @staticmethod
+    def _extract_processor_value(batch_feature, key: str):
+        if batch_feature is None:
+            return None
+        if isinstance(batch_feature, dict):
+            return batch_feature.get(key)
+        if hasattr(batch_feature, key):
+            return getattr(batch_feature, key)
+        try:
+            return batch_feature[key]
+        except (KeyError, TypeError):
+            return None
+
+    def _preprocess_image_with_processor(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, str]:
+        if self.qwen_processor is None or not hasattr(self.qwen_processor, "image_processor"):
+            normalized = self._normalize_images_for_qwen(image)
+            return normalized, self._image_grid_thw(normalized), "manual"
+
+        # The processor expects raw image values rather than the OpenPI [-1, 1] normalization.
+        processor_images = torch.clamp((image + 1.0) / 2.0, 0.0, 1.0)
+        image_inputs = self.qwen_processor.image_processor(
+            images=[img.detach().cpu() for img in processor_images],
+            return_tensors="pt",
+        )
+
+        pixel_values = self._extract_processor_value(image_inputs, "pixel_values")
+        if pixel_values is None:
+            raise ValueError("Qwen image processor did not return `pixel_values`.")
+        pixel_values = pixel_values.to(device=image.device, dtype=torch.float32)
+
+        image_grid_thw = self._extract_processor_value(image_inputs, "image_grid_thw")
+        if image_grid_thw is None:
+            image_grid_thw = self._image_grid_thw(pixel_values)
+        else:
+            image_grid_thw = image_grid_thw.to(device=image.device, dtype=torch.long)
+
+        return pixel_values, image_grid_thw, "official_image_processor"
+
+    def _embed_processed_image(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        image_features = self.qwen_vl.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
         if isinstance(image_features, torch.Tensor):
             return image_features
         if hasattr(image_features, "last_hidden_state"):
@@ -195,6 +236,86 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         if isinstance(image_features, tuple):
             return image_features[0]
         raise TypeError(f"Unexpected image feature output type: {type(image_features)!r}")
+
+    def build_prefix_batch(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        *,
+        checkpoint_fn=None,
+    ) -> PrefixBatch:
+        if checkpoint_fn is None:
+            checkpoint_fn = lambda func, *args, **kwargs: func(*args, **kwargs)
+
+        embs = []
+        pad_masks = []
+        att_masks = []
+        image_grid_thws = []
+        image_processor_modes = []
+
+        for img, img_mask in zip(images, img_masks, strict=True):
+            pixel_values, image_grid_thw, processor_mode = self._preprocess_image_with_processor(img)
+            img_emb = checkpoint_fn(self._embed_processed_image, pixel_values, image_grid_thw)
+
+            batch_size, num_img_embs = img_emb.shape[:2]
+            embs.append(img_emb)
+            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs))
+            att_masks += [0] * num_img_embs
+            image_grid_thws.append(image_grid_thw)
+            image_processor_modes.append(processor_mode)
+
+        def embed_language(lang_tokens):
+            lang_emb = self.embed_language_tokens(lang_tokens)
+            lang_emb_dim = lang_emb.shape[-1]
+            return lang_emb * (lang_emb_dim**0.5)
+
+        lang_emb = checkpoint_fn(embed_language, lang_tokens)
+        embs.append(lang_emb)
+        pad_masks.append(lang_masks)
+        att_masks += [0] * lang_emb.shape[1]
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = att_masks[None, :].expand(pad_masks.shape[0], len(att_masks))
+
+        metadata = {
+            "image_grid_thw": torch.stack(image_grid_thws, dim=1) if image_grid_thws else None,
+            "image_processor_modes": tuple(image_processor_modes),
+            # TODO: populate multimodal token types and RoPE deltas once the joint-attention path
+            # consumes official Qwen multimodal position metadata instead of only 1D position_ids.
+            "mm_token_type_ids": None,
+            "rope_deltas": None,
+        }
+
+        return PrefixBatch(
+            embeds=embs,
+            pad_masks=pad_masks,
+            att_masks=att_masks,
+            metadata=metadata,
+        )
+
+    def build_prefix_cache_metadata(
+        self,
+        prefix_batch: PrefixBatch,
+        *,
+        prefix_att_2d_masks: torch.Tensor,
+        prefix_position_ids: torch.Tensor,
+        prefix_att_2d_masks_4d: torch.Tensor,
+    ) -> dict[str, torch.Tensor | tuple[str, ...] | None]:
+        del prefix_att_2d_masks_4d
+        metadata = dict(prefix_batch.metadata)
+        metadata["prefix_position_ids"] = prefix_position_ids
+        metadata["prefix_att_2d_masks"] = prefix_att_2d_masks
+        # TODO: replace these OpenPI-style prefix positions with Qwen continuation positions once
+        # suffix denoising consumes backend-specific cache/position metadata end-to-end.
+        return metadata
+
+    def embed_image(self, image: torch.Tensor):
+        pixel_values, image_grid_thw, _ = self._preprocess_image_with_processor(image)
+        return self._embed_processed_image(pixel_values, image_grid_thw)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.qwen_vl.model.embed_tokens(tokens)

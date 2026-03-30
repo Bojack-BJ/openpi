@@ -41,9 +41,9 @@ class VLMWithExpertModel(nn.Module):
     @staticmethod
     def make_att_2d_masks(pad_masks: torch.Tensor, att_masks: torch.Tensor) -> torch.Tensor:
         if att_masks.ndim != 2:
-            raise ValueError(att_masks.ndim)
+            raise ValueError(f'att_masks.ndim must be 2, got {att_masks.ndim}')
         if pad_masks.ndim != 2:
-            raise ValueError(pad_masks.ndim)
+            raise ValueError(f'pad_masks.ndim must be 2, got {pad_masks.ndim}')
 
         cumsum = torch.cumsum(att_masks, dim=1)
         att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]

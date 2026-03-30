@@ -156,13 +156,15 @@ Status update:
 - `Qwen2.5-VL-7B-Instruct` backbone adapter now exists in `src/openpi/models_pytorch/qwen2_vl_pytorch.py`
 - prompt tokenizer routing is now backend-aware via `src/openpi/models/tokenizer.py:create_prompt_tokenizer`
 - `Qwen2VLTokenizer` now handles prompt tokenization for `qwen2_vl` / `qwen2_5_vl`
+- Qwen prefix image preprocessing now starts from the official `AutoProcessor` image path when an HF model id is provided, and the backend records `image_grid_thw` in prefix metadata for later multimodal-position work
 - current supported configuration is:
   - `vlm_backend="qwen2_5_vl"` or `vlm_backend="qwen2_vl"`
   - `vlm_hf_model_id="Qwen/Qwen2.5-VL-7B-Instruct"`
   - `vlm_backbone_variant="qwen2_5_7b"`
   - `action_expert_variant="qwen2_5_7b"`
 - current limitations:
-  - only the prompt tokenizer path has been migrated; FAST/action-tokenizer paths are still PaliGemma-specific
+  - only text prompt tokenization plus image preprocessing metadata have been migrated; FAST/action-tokenizer paths are still PaliGemma-specific
+  - Qwen's multimodal position inputs (`mm_token_type_ids`, `rope_deltas`, continuation cache positions) are still TODOs; joint attention still runs on OpenPI's 1D prefix/suffix positions
   - `pi05` / AdaRMS is not supported for the Qwen backend
 
 ### Phase C: after Qwen is stable
