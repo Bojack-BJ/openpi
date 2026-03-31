@@ -482,6 +482,7 @@ def train_loop(config: _config.TrainConfig):
     else:
         enable_gradient_checkpointing = False
         logging.info("Gradient checkpointing is not supported for this model")
+    write_rank_stage_marker(rank, "after_gradient_checkpointing")
 
     # Enable memory optimizations for large-scale training
     if world_size >= 8:
@@ -491,6 +492,7 @@ def train_loop(config: _config.TrainConfig):
         # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
+    write_rank_stage_marker(rank, "after_memory_optimizations")
 
     param_count = sum(1 for _ in model.parameters())
     trainable_param_count = sum(1 for p in model.parameters() if p.requires_grad)
@@ -501,6 +503,7 @@ def train_loop(config: _config.TrainConfig):
         trainable_param_count,
     )
     write_rank_param_signature(rank, model)
+    write_rank_stage_marker(rank, "after_param_signature")
 
     if use_ddp:
         write_rank_stage_marker(rank, "before_ddp_wrap")
