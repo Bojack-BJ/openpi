@@ -125,7 +125,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                 torch_dtype="float32",
             )
             self.qwen_expert = Qwen2ForCausalLM(config=action_expert_config_hf)
-            self.qwen_expert.model.load_state_dict(self.qwen_vl.model.state_dict(), strict=False)
+            self.qwen_expert.model.load_state_dict(self._get_qwen_text_model().state_dict(), strict=False)
             self.qwen_expert.model.embed_tokens = None
         else:
             vlm_config_hf = CONFIG_MAPPING["qwen2_5_vl"]()
@@ -159,17 +159,39 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
         self.to_bfloat16_for_selected_params(precision)
 
+    def _get_qwen_text_model(self) -> nn.Module:
+        candidates = []
+
+        decoder_getter = getattr(self.qwen_vl, "get_decoder", None)
+        if callable(decoder_getter):
+            candidates.append(decoder_getter())
+
+        candidates.extend(
+            [
+                getattr(self.qwen_vl, "model", None),
+                getattr(getattr(self.qwen_vl, "model", None), "model", None),
+                getattr(getattr(self.qwen_vl, "model", None), "language_model", None),
+                getattr(self.qwen_vl, "language_model", None),
+            ]
+        )
+
+        for candidate in candidates:
+            if candidate is not None and hasattr(candidate, "layers"):
+                return candidate
+
+        raise AttributeError("Could not locate the Qwen text decoder layers on the loaded VLM backbone.")
+
     def set_gradient_checkpointing_enabled(self, enabled: bool):
-        self.qwen_vl.model.gradient_checkpointing = enabled
+        self._get_qwen_text_model().gradient_checkpointing = enabled
         if hasattr(self.qwen_vl, "visual") and hasattr(self.qwen_vl.visual, "gradient_checkpointing"):
             self.qwen_vl.visual.gradient_checkpointing = enabled
         self.qwen_expert.model.gradient_checkpointing = enabled
 
     def prefix_q_proj_dtype(self):
-        return self.qwen_vl.model.layers[0].self_attn.q_proj.weight.dtype
+        return self._get_qwen_text_model().layers[0].self_attn.q_proj.weight.dtype
 
     def set_prefix_attention_implementation(self, implementation: str):
-        self.qwen_vl.model.config._attn_implementation = implementation  # noqa: SLF001
+        self._get_qwen_text_model().config._attn_implementation = implementation  # noqa: SLF001
 
     def set_suffix_attention_implementation(self, implementation: str):
         self.qwen_expert.model.config._attn_implementation = implementation  # noqa: SLF001
@@ -487,8 +509,9 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         adarms_cond: list[torch.Tensor] | None = None,
     ):
         del adarms_cond
+        prefix_text_model = self._get_qwen_text_model()
         if inputs_embeds[1] is None:
-            prefix_output = self.qwen_vl.model.forward(
+            prefix_output = prefix_text_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -527,7 +550,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                     device=query_states.device,
                     dtype=query_states.dtype,
                 )
-                cos, sin = self.qwen_vl.model.rotary_emb(dummy_hidden_states, position_ids)
+                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, position_ids)
                 query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
                 past_key_states, past_value_states = _get_layer_past_key_value(past_key_values, layer_idx)
@@ -560,8 +583,8 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             # Joint mode mirrors the existing OpenPI path: each branch computes its own q/k/v, the
             # sequence dimension is concatenated for one shared attention pass, then each slice runs
             # through its own residual/norm/MLP stack.
-            models = [self.qwen_vl.model, self.qwen_expert.model]
-            num_layers = len(self.qwen_vl.model.layers)
+            models = [prefix_text_model, self.qwen_expert.model]
+            num_layers = len(prefix_text_model.layers)
 
             use_gradient_checkpointing = (
                 hasattr(self.qwen_expert.model, "gradient_checkpointing")
@@ -570,7 +593,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             ) or (hasattr(self, "gradient_checkpointing") and self.gradient_checkpointing and self.training)
 
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids):
-                models = [self.qwen_vl.model, self.qwen_expert.model]
+                models = [prefix_text_model, self.qwen_expert.model]
 
                 query_states = []
                 key_states = []
@@ -606,7 +629,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                     device=query_states.device,
                     dtype=query_states.dtype,
                 )
-                cos, sin = self.qwen_vl.model.rotary_emb(dummy_hidden_states, position_ids)
+                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, position_ids)
                 query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
                 num_kv_heads = key_states.shape[1]
