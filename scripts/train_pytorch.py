@@ -31,6 +31,11 @@ import platform
 import shutil
 import time
 
+# Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
+
 import jax
 import numpy as np
 import safetensors.torch
