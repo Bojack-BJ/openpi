@@ -156,7 +156,7 @@ def move_observation_to_device(observation, device):
     return jax.tree.map(lambda x: x.to(device) if hasattr(x, "to") else x, observation)
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, wandb_enabled: bool):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -200,7 +200,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
         # Log checkpoint to wandb
-        if config.wandb_enabled:
+        if wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
@@ -321,6 +321,8 @@ def train_loop(config: _config.TrainConfig):
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
     rank = dist.get_rank() if use_ddp else 0
+    wandb_mode = os.environ.get("WANDB_MODE", "").lower()
+    wandb_enabled = config.wandb_enabled and wandb_mode != "disabled"
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -361,7 +363,10 @@ def train_loop(config: _config.TrainConfig):
 
     # Initialize wandb (only on main process)
     if is_main:
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        logging.info("Rank %s entering wandb init (enabled=%s, mode=%s)", rank, wandb_enabled, wandb_mode or "default")
+        if wandb_enabled:
+            init_wandb(config, resuming=resuming, enabled=True)
+        logging.info("Rank %s finished wandb init", rank)
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -378,7 +383,7 @@ def train_loop(config: _config.TrainConfig):
     logging.info("Rank %s finished build_datasets", rank)
 
     # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming and not use_ddp:
+    if is_main and wandb_enabled and not resuming and not use_ddp:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
@@ -617,7 +622,7 @@ def train_loop(config: _config.TrainConfig):
                 )
 
                 # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
+                if wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
@@ -633,7 +638,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, wandb_enabled)
 
             # Update progress bar
             if pbar is not None:
@@ -647,7 +652,7 @@ def train_loop(config: _config.TrainConfig):
         pbar.close()
 
     # Finish wandb run
-    if is_main and config.wandb_enabled:
+    if is_main and wandb_enabled:
         wandb.finish()
 
     cleanup_ddp()
