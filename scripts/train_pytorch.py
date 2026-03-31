@@ -24,6 +24,7 @@ Multi-Node Training:
 """
 
 import dataclasses
+import faulthandler
 import gc
 import logging
 import os
@@ -319,6 +320,7 @@ def train_loop(config: _config.TrainConfig):
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
+    rank = dist.get_rank() if use_ddp else 0
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -371,7 +373,9 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
+    logging.info("Rank %s entering build_datasets on device %s", rank, device)
     loader, data_config = build_datasets(config)
+    logging.info("Rank %s finished build_datasets", rank)
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming and not use_ddp:
@@ -421,10 +425,13 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
+    logging.info("Rank %s entering model construction", rank)
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    logging.info("Rank %s finished model construction", rank)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
+        logging.info("Rank %s enabling gradient checkpointing", rank)
         model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for memory optimization")
     else:
@@ -648,11 +655,12 @@ def train_loop(config: _config.TrainConfig):
 
 def main():
     init_logging()
+    faulthandler.enable()
     config = _config.cli()
     rank = int(os.environ.get("RANK", "0"))
     try:
         train_loop(config)
-    except Exception:
+    except BaseException:
         logging.exception("Rank %s failed during PyTorch training", rank)
         try:
             if dist.is_initialized():
