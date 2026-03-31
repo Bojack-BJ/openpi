@@ -135,6 +135,33 @@ def write_rank_stage_marker(rank: int, stage: str) -> None:
     marker_path.write_text(f"{time.time():.3f} {stage}\n")
 
 
+def write_rank_param_signature(rank: int, model: torch.nn.Module) -> None:
+    """Persist a per-rank parameter signature so DDP mismatches can be compared offline."""
+    lines = []
+    total_numel = 0
+    trainable_numel = 0
+    for name, param in model.named_parameters():
+        total_numel += param.numel()
+        if param.requires_grad:
+            trainable_numel += param.numel()
+        lines.append(
+            f"{name}\tshape={tuple(param.shape)}\tdtype={param.dtype}\trequires_grad={param.requires_grad}\tnumel={param.numel()}"
+        )
+
+    signature_path = pathlib.Path("/tmp") / f"openpi_params_rank_{rank}.txt"
+    signature_path.write_text(
+        "\n".join(
+            [
+                f"total_tensors={len(lines)}",
+                f"total_numel={total_numel}",
+                f"trainable_numel={trainable_numel}",
+                *lines,
+            ]
+        )
+        + "\n"
+    )
+
+
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
@@ -473,6 +500,7 @@ def train_loop(config: _config.TrainConfig):
         param_count,
         trainable_param_count,
     )
+    write_rank_param_signature(rank, model)
 
     if use_ddp:
         write_rank_stage_marker(rank, "before_ddp_wrap")
