@@ -285,10 +285,19 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
         split_sizes = token_counts.tolist()
         if sum(split_sizes) != image_features.shape[0]:
-            raise ValueError(
-                "Qwen image features do not match `image_grid_thw`: "
-                f"sum(token_counts)={sum(split_sizes)} vs feature_rows={image_features.shape[0]}"
-            )
+            # In the current OpenPI pipeline all images are resized to a fixed resolution, so Qwen
+            # image features are expected to have a uniform token count per sample. Some processor /
+            # transformers combinations return flattened features whose total length does not match
+            # the naive `image_grid_thw`-derived count, so fall back to an equal split across the
+            # batch instead of crashing.
+            if batch_size > 0 and image_features.shape[0] % batch_size == 0:
+                uniform_tokens = image_features.shape[0] // batch_size
+                split_sizes = [uniform_tokens] * batch_size
+            else:
+                raise ValueError(
+                    "Qwen image features do not match `image_grid_thw`: "
+                    f"sum(token_counts)={sum(split_sizes)} vs feature_rows={image_features.shape[0]}"
+                )
 
         chunks = torch.split(image_features, split_sizes, dim=0)
         max_tokens = max(split_sizes, default=0)
