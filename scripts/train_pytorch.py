@@ -360,8 +360,6 @@ def train_loop(config: _config.TrainConfig):
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
-    if use_ddp:
-        dist.barrier()
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -441,9 +439,6 @@ def train_loop(config: _config.TrainConfig):
         # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
-
-    if use_ddp:
-        dist.barrier()
 
     param_count = sum(1 for _ in model.parameters())
     trainable_param_count = sum(1 for p in model.parameters() if p.requires_grad)
