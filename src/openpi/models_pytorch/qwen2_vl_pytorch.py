@@ -111,8 +111,8 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             ):
                 raise ValueError(
                     "The loaded Qwen2.5-VL checkpoint does not match the configured expert geometry. "
-                    "Use `vlm_backbone_variant=\"qwen2_5_7b\"` and `action_expert_variant=\"qwen2_5_7b\"` "
-                    "with `Qwen/Qwen2.5-VL-7B-Instruct`."
+                    "Use a matching pair such as `qwen2_5_3b` + `Qwen/Qwen2.5-VL-3B-Instruct` "
+                    "or `qwen2_5_7b` + `Qwen/Qwen2.5-VL-7B-Instruct` for both prefix and expert."
                 )
             action_expert_config_hf = CONFIG_MAPPING["qwen2"](
                 hidden_size=action_expert_config.width,

@@ -48,7 +48,12 @@ class Pi0Config(_model.BaseModelConfig):
         if self.vlm_backend not in ("paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"):
             raise ValueError(f"Unsupported vlm_backend: {self.vlm_backend}")
         if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl") and self.vlm_hf_model_id is None:
-            object.__setattr__(self, "vlm_hf_model_id", "Qwen/Qwen2.5-VL-7B-Instruct")
+            default_model_id = (
+                "Qwen/Qwen2.5-VL-3B-Instruct"
+                if self.vlm_backbone_variant == "qwen2_5_3b"
+                else "Qwen/Qwen2.5-VL-7B-Instruct"
+            )
+            object.__setattr__(self, "vlm_hf_model_id", default_model_id)
 
     @property
     @override
