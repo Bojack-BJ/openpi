@@ -472,7 +472,10 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         return self._embed_processed_image(pixel_values, image_grid_thw)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.qwen_vl.model.embed_tokens(tokens)
+        embedding_layer = self.qwen_vl.get_input_embeddings()
+        if embedding_layer is None:
+            raise ValueError("Qwen2.5-VL model did not expose input embeddings.")
+        return embedding_layer(tokens)
 
     def forward(
         self,
