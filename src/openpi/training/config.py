@@ -1619,6 +1619,10 @@ _CONFIGS = [
         ),
         data=FastUMIdualData14DRPYConfig(
             repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
             base_config=DataConfig(
                 # local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,
