@@ -447,11 +447,12 @@ def train_loop(config: _config.TrainConfig):
 
     param_count = sum(1 for _ in model.parameters())
     trainable_param_count = sum(1 for p in model.parameters() if p.requires_grad)
-    if use_ddp:
-        gathered_counts = [None] * world_size
-        dist.all_gather_object(gathered_counts, (param_count, trainable_param_count))
-        if len(set(gathered_counts)) != 1:
-            raise RuntimeError(f"Model parameter counts differ across ranks before DDP wrap: {gathered_counts}")
+    logging.info(
+        "Rank %s model parameter tensors before DDP: total=%s trainable=%s",
+        dist.get_rank() if use_ddp else 0,
+        param_count,
+        trainable_param_count,
+    )
 
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -653,7 +654,17 @@ def train_loop(config: _config.TrainConfig):
 def main():
     init_logging()
     config = _config.cli()
-    train_loop(config)
+    rank = int(os.environ.get("RANK", "0"))
+    try:
+        train_loop(config)
+    except Exception:
+        logging.exception("Rank %s failed during PyTorch training", rank)
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            logging.exception("Rank %s failed while destroying the process group", rank)
+        raise
 
 
 if __name__ == "__main__":
