@@ -10,6 +10,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.qwen2 import modeling_qwen2
 
+from openpi.models_pytorch.vlm_backbone_base import AttentionContext
 from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
 from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
 
@@ -187,6 +188,19 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         # table because HF VL/text wrappers can expose different vocab sizes even when the decoder
         # geometry matches.
         return {key: value for key, value in state_dict.items() if not key.startswith("embed_tokens.")}
+
+    @staticmethod
+    def _prepare_qwen_position_ids(position_ids: torch.Tensor | None) -> torch.Tensor | None:
+        if position_ids is None:
+            return None
+        if position_ids.ndim == 3:
+            return position_ids
+        if position_ids.ndim != 2:
+            raise ValueError(f"Expected Qwen position_ids to have rank 2 or 3, got {tuple(position_ids.shape)}")
+        # Qwen2.5-VL rotary embeddings expect 3 position streams. For the current OpenPI-style
+        # simple prefix/suffix path we intentionally reuse the same 1D positions on all three axes
+        # instead of reproducing Qwen's full multimodal THW position semantics.
+        return position_ids.unsqueeze(0).expand(3, -1, -1)
 
     def set_gradient_checkpointing_enabled(self, enabled: bool):
         self._get_qwen_text_model().gradient_checkpointing = enabled
@@ -475,6 +489,9 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         pad_masks.append(lang_masks)
         att_masks += [0] * lang_emb.shape[1]
 
+        image_token_lengths = tuple(emb.shape[1] for emb in embs[:-1])
+        language_token_length = lang_emb.shape[1]
+
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -482,6 +499,8 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
         metadata = {
             "image_grid_thw": torch.stack(image_grid_thws, dim=1) if image_grid_thws else None,
+            "image_token_lengths": image_token_lengths,
+            "language_token_length": language_token_length,
             "image_processor_modes": tuple(image_processor_modes),
             "prompt_token_source": prompt_token_source,
             # Preserve original prompt text so future backend-specific multimodal templates can
@@ -506,6 +525,207 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             raise ValueError("Qwen2.5-VL model did not expose input embeddings.")
         return embedding_layer(tokens)
 
+    def _build_qwen_text_position_chunk(
+        self,
+        valid_count: int,
+        *,
+        start_position: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        positions = torch.arange(start_position, start_position + valid_count, device=device, dtype=torch.long)
+        return positions.unsqueeze(0).expand(3, -1)
+
+    def _build_qwen_vision_position_chunk(
+        self,
+        grid_thw: torch.Tensor | None,
+        *,
+        valid_count: int,
+        start_position: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if grid_thw is None:
+            return self._build_qwen_text_position_chunk(valid_count, start_position=start_position, device=device)
+
+        merge_size = int(getattr(self.qwen_vl.visual, "spatial_merge_size", 1))
+        grid_t, grid_h, grid_w = (int(x) for x in grid_thw.tolist())
+        llm_grid_t = max(grid_t, 1)
+        llm_grid_h = max(grid_h // merge_size, 1)
+        llm_grid_w = max(grid_w // merge_size, 1)
+        expected_count = llm_grid_t * llm_grid_h * llm_grid_w
+
+        if expected_count != valid_count:
+            # Some processor/transformers combinations expose image features whose flattened token
+            # count does not line up with the naive THW-derived expectation. Keep the backend-owned
+            # path robust by falling back to the simpler 1D positions for that image block.
+            return self._build_qwen_text_position_chunk(valid_count, start_position=start_position, device=device)
+
+        temporal = torch.arange(llm_grid_t, device=device, dtype=torch.long).repeat_interleave(llm_grid_h * llm_grid_w)
+        height = (
+            torch.arange(llm_grid_h, device=device, dtype=torch.long)
+            .repeat_interleave(llm_grid_w)
+            .repeat(llm_grid_t)
+        )
+        width = torch.arange(llm_grid_w, device=device, dtype=torch.long).repeat(llm_grid_t * llm_grid_h)
+        return torch.stack([temporal, height, width], dim=0) + start_position
+
+    def _build_qwen_prefix_position_ids(self, prefix_batch: PrefixBatch) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, prefix_len = prefix_batch.pad_masks.shape
+        device = prefix_batch.pad_masks.device
+        position_ids = torch.zeros((3, batch_size, prefix_len), dtype=torch.long, device=device)
+        next_positions = torch.zeros(batch_size, dtype=torch.long, device=device)
+
+        image_grid_thw = prefix_batch.metadata.get("image_grid_thw")
+        image_token_lengths = prefix_batch.metadata.get("image_token_lengths", ())
+        language_token_length = int(prefix_batch.metadata.get("language_token_length", 0))
+
+        cursor = 0
+        for image_idx, image_token_length in enumerate(image_token_lengths):
+            token_slice = slice(cursor, cursor + image_token_length)
+            for batch_idx in range(batch_size):
+                valid_count = int(prefix_batch.pad_masks[batch_idx, token_slice].sum().item())
+                if valid_count == 0:
+                    continue
+
+                grid_thw = None
+                if image_grid_thw is not None:
+                    grid_thw = image_grid_thw[batch_idx, image_idx]
+
+                chunk_position_ids = self._build_qwen_vision_position_chunk(
+                    grid_thw,
+                    valid_count=valid_count,
+                    start_position=int(next_positions[batch_idx].item()),
+                    device=device,
+                )
+                position_ids[:, batch_idx, cursor : cursor + valid_count] = chunk_position_ids
+                next_positions[batch_idx] = int(chunk_position_ids.max().item()) + 1
+            cursor += image_token_length
+
+        if language_token_length > 0:
+            token_slice = slice(cursor, cursor + language_token_length)
+            for batch_idx in range(batch_size):
+                valid_count = int(prefix_batch.pad_masks[batch_idx, token_slice].sum().item())
+                if valid_count == 0:
+                    continue
+                chunk_position_ids = self._build_qwen_text_position_chunk(
+                    valid_count,
+                    start_position=int(next_positions[batch_idx].item()),
+                    device=device,
+                )
+                position_ids[:, batch_idx, cursor : cursor + valid_count] = chunk_position_ids
+                next_positions[batch_idx] = int(chunk_position_ids[0, -1].item()) + 1
+
+        return position_ids, next_positions
+
+    def _build_qwen_suffix_position_ids(
+        self,
+        suffix_pad_masks: torch.Tensor,
+        start_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, suffix_len = suffix_pad_masks.shape
+        device = suffix_pad_masks.device
+        position_ids = torch.zeros((3, batch_size, suffix_len), dtype=torch.long, device=device)
+
+        for batch_idx in range(batch_size):
+            valid_count = int(suffix_pad_masks[batch_idx].sum().item())
+            if valid_count == 0:
+                continue
+            chunk_position_ids = self._build_qwen_text_position_chunk(
+                valid_count,
+                start_position=int(start_positions[batch_idx].item()),
+                device=device,
+            )
+            position_ids[:, batch_idx, :valid_count] = chunk_position_ids
+
+        return position_ids
+
+    def build_prefix_prefill_context(self, prefix_batch: PrefixBatch) -> AttentionContext:
+        prefix_att_2d_masks = self.make_att_2d_masks(prefix_batch.pad_masks, prefix_batch.att_masks)
+        prefix_position_ids, prefix_next_positions = self._build_qwen_prefix_position_ids(prefix_batch)
+        prefix_att_2d_masks_4d = self.prepare_attention_mask_4d(prefix_att_2d_masks)
+        return AttentionContext(
+            forward_kwargs={
+                "attention_mask": prefix_att_2d_masks_4d,
+                "position_ids": prefix_position_ids,
+            },
+            metadata={
+                "prefix_att_2d_masks": prefix_att_2d_masks,
+                "prefix_att_2d_masks_4d": prefix_att_2d_masks_4d,
+                "prefix_position_ids": prefix_position_ids,
+                "prefix_next_positions": prefix_next_positions,
+            },
+        )
+
+    def build_joint_attention_context(
+        self,
+        prefix_batch: PrefixBatch,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> AttentionContext:
+        pad_masks = torch.cat([prefix_batch.pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_batch.att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = self.make_att_2d_masks(pad_masks, att_masks)
+        prefix_position_ids, prefix_next_positions = self._build_qwen_prefix_position_ids(prefix_batch)
+        suffix_position_ids = self._build_qwen_suffix_position_ids(suffix_pad_masks, prefix_next_positions)
+        position_ids = torch.cat([prefix_position_ids, suffix_position_ids], dim=2)
+        att_2d_masks_4d = self.prepare_attention_mask_4d(att_2d_masks)
+        return AttentionContext(
+            forward_kwargs={
+                "attention_mask": att_2d_masks_4d,
+                "position_ids": position_ids,
+            },
+            metadata={
+                "att_2d_masks": att_2d_masks,
+                "att_masks": att_masks,
+                "pad_masks": pad_masks,
+                "prefix_next_positions": prefix_next_positions,
+                "prefix_position_ids": prefix_position_ids,
+                "suffix_position_ids": suffix_position_ids,
+            },
+        )
+
+    def build_suffix_decode_context(
+        self,
+        prefix_cache,
+        suffix_pad_masks: torch.Tensor,
+        suffix_att_masks: torch.Tensor,
+    ) -> AttentionContext:
+        prefix_pad_masks = prefix_cache.pad_masks
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = self.make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        full_att_2d_masks_4d = self.prepare_attention_mask_4d(full_att_2d_masks)
+
+        prefix_next_positions = prefix_cache.metadata.get("prefix_next_positions")
+        if prefix_next_positions is None:
+            prefix_next_positions = torch.sum(prefix_pad_masks, dim=-1)
+        suffix_position_ids = self._build_qwen_suffix_position_ids(suffix_pad_masks, prefix_next_positions)
+        return AttentionContext(
+            forward_kwargs={
+                "attention_mask": full_att_2d_masks_4d,
+                "position_ids": suffix_position_ids,
+            },
+            metadata={
+                "full_att_2d_masks": full_att_2d_masks,
+                "prefix_next_positions": prefix_next_positions,
+                "suffix_position_ids": suffix_position_ids,
+            },
+        )
+
+    def build_prefix_cache_metadata(
+        self,
+        prefix_batch: PrefixBatch,
+        *,
+        prefill_context: AttentionContext,
+    ) -> dict[str, torch.Tensor]:
+        metadata = dict(prefix_batch.metadata)
+        metadata["prefix_next_positions"] = prefill_context.metadata["prefix_next_positions"]
+        metadata["prefix_position_ids"] = prefill_context.metadata["prefix_position_ids"]
+        return metadata
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -517,11 +737,12 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
     ):
         del adarms_cond
         prefix_text_model = self._get_qwen_text_model()
+        qwen_position_ids = self._prepare_qwen_position_ids(position_ids)
         if inputs_embeds[1] is None:
             prefix_output = prefix_text_model.forward(
                 inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                position_ids=qwen_position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
             )
@@ -557,7 +778,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                     device=query_states.device,
                     dtype=query_states.dtype,
                 )
-                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, position_ids)
+                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
                 query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
                 past_key_states, past_value_states = _get_layer_past_key_value(past_key_values, layer_idx)
@@ -636,7 +857,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                     device=query_states.device,
                     dtype=query_states.dtype,
                 )
-                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, position_ids)
+                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
                 query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
                 num_kv_heads = key_states.shape[1]
