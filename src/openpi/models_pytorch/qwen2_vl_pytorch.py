@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from typing import Literal
 
 import pytest
@@ -68,6 +69,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             raise NotImplementedError("Qwen2.5-VL backbone does not support pi05/AdaRMS expert conditioning yet.")
         super().__init__()
         self.hf_model_id = hf_model_id
+        self.precision = precision
         self.qwen_processor = (
             AutoProcessor.from_pretrained(hf_model_id, trust_remote_code=True) if hf_model_id is not None else None
         )
@@ -198,6 +200,11 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             raise ValueError("Qwen2.5-VL config did not expose `rope_scaling['mrope_section']`.")
         return rope_scaling["mrope_section"]
 
+    def _autocast_context(self, device: torch.device):
+        if device.type == "cuda" and self.precision == "bfloat16":
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
     @staticmethod
     def _prepare_qwen_position_ids(position_ids: torch.Tensor | None) -> torch.Tensor | None:
         if position_ids is None:
@@ -303,7 +310,8 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         return pixel_values, image_grid_thw, "official_image_processor"
 
     def _embed_processed_image(self, pixel_values: torch.Tensor, image_grid_thw: torch.Tensor) -> torch.Tensor:
-        image_features = self.qwen_vl.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
+        with self._autocast_context(pixel_values.device):
+            image_features = self.qwen_vl.get_image_features(pixel_values=pixel_values, image_grid_thw=image_grid_thw)
         if isinstance(image_features, torch.Tensor):
             return image_features
         if hasattr(image_features, "last_hidden_state"):
@@ -750,13 +758,14 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         qwen_position_ids = self._prepare_qwen_position_ids(position_ids)
         mrope_section = self._get_qwen_mrope_section()
         if inputs_embeds[1] is None:
-            prefix_output = prefix_text_model.forward(
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=qwen_position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-            )
+            with self._autocast_context(inputs_embeds[0].device):
+                prefix_output = prefix_text_model.forward(
+                    inputs_embeds=inputs_embeds[0],
+                    attention_mask=attention_mask,
+                    position_ids=qwen_position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
@@ -764,66 +773,67 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
             hidden_states = inputs_embeds[1]
             num_layers = len(self.qwen_expert.model.layers)
 
-            for layer_idx in range(num_layers):
-                layer = self.qwen_expert.model.layers[layer_idx]
-                residual = hidden_states
-                hidden_states = layer.input_layernorm(hidden_states)
+            with self._autocast_context(hidden_states.device):
+                for layer_idx in range(num_layers):
+                    layer = self.qwen_expert.model.layers[layer_idx]
+                    residual = hidden_states
+                    hidden_states = layer.input_layernorm(hidden_states)
 
-                batch_size, seq_len, _ = hidden_states.shape
-                head_dim = layer.self_attn.head_dim
-                num_heads = layer.self_attn.q_proj.out_features // head_dim
-                num_kv_heads = layer.self_attn.k_proj.out_features // head_dim
+                    batch_size, seq_len, _ = hidden_states.shape
+                    head_dim = layer.self_attn.head_dim
+                    num_heads = layer.self_attn.q_proj.out_features // head_dim
+                    num_kv_heads = layer.self_attn.k_proj.out_features // head_dim
 
-                query_states = layer.self_attn.q_proj(hidden_states).view(batch_size, seq_len, num_heads, head_dim)
-                key_states = layer.self_attn.k_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
-                value_states = layer.self_attn.v_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
+                    query_states = layer.self_attn.q_proj(hidden_states).view(batch_size, seq_len, num_heads, head_dim)
+                    key_states = layer.self_attn.k_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
+                    value_states = layer.self_attn.v_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
 
-                query_states = query_states.transpose(1, 2)
-                key_states = key_states.transpose(1, 2)
-                value_states = value_states.transpose(1, 2)
+                    query_states = query_states.transpose(1, 2)
+                    key_states = key_states.transpose(1, 2)
+                    value_states = value_states.transpose(1, 2)
 
-                dummy_hidden_states = torch.zeros(
-                    batch_size,
-                    seq_len,
-                    query_states.shape[-1] * query_states.shape[1],
-                    device=query_states.device,
-                    dtype=query_states.dtype,
-                )
-                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
-                query_states, key_states = modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    mrope_section,
-                )
+                    dummy_hidden_states = torch.zeros(
+                        batch_size,
+                        seq_len,
+                        query_states.shape[-1] * query_states.shape[1],
+                        device=query_states.device,
+                        dtype=query_states.dtype,
+                    )
+                    cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
+                    query_states, key_states = modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb(
+                        query_states,
+                        key_states,
+                        cos,
+                        sin,
+                        mrope_section,
+                    )
 
-                past_key_states, past_value_states = _get_layer_past_key_value(past_key_values, layer_idx)
-                if past_key_states is not None and past_value_states is not None:
-                    key_states = torch.cat([past_key_states, key_states], dim=2)
-                    value_states = torch.cat([past_value_states, value_states], dim=2)
+                    past_key_states, past_value_states = _get_layer_past_key_value(past_key_values, layer_idx)
+                    if past_key_states is not None and past_value_states is not None:
+                        key_states = torch.cat([past_key_states, key_states], dim=2)
+                        value_states = torch.cat([past_value_states, value_states], dim=2)
 
-                key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
-                value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
+                    key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
+                    value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
 
-                attn_output = F.scaled_dot_product_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attn_mask=attention_mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
-                attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
+                    attn_output = F.scaled_dot_product_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        attn_mask=attention_mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+                    attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
 
-                out_emb = layer.self_attn.o_proj(attn_output)
-                hidden_states = residual + out_emb
-                residual = hidden_states
-                hidden_states = layer.post_attention_layernorm(hidden_states)
-                hidden_states = layer.mlp(hidden_states)
-                hidden_states = residual + hidden_states
+                    out_emb = layer.self_attn.o_proj(attn_output)
+                    hidden_states = residual + out_emb
+                    residual = hidden_states
+                    hidden_states = layer.post_attention_layernorm(hidden_states)
+                    hidden_states = layer.mlp(hidden_states)
+                    hidden_states = residual + hidden_states
 
-            suffix_output = self.qwen_expert.model.norm(hidden_states)
+                suffix_output = self.qwen_expert.model.norm(hidden_states)
             prefix_output = None
             prefix_past_key_values = None
         else:
@@ -841,81 +851,81 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
 
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids):
                 models = [prefix_text_model, self.qwen_expert.model]
+                with self._autocast_context(inputs_embeds[0].device):
+                    query_states = []
+                    key_states = []
+                    value_states = []
+                    residuals = []
+                    seq_lens = []
+                    for i, hidden_states in enumerate(inputs_embeds):
+                        layer = models[i].layers[layer_idx]
+                        residuals.append(hidden_states)
+                        hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
+                        batch_size, seq_len, _ = hidden_states.shape
+                        seq_lens.append(seq_len)
+                        head_dim = layer.self_attn.head_dim
+                        num_heads = layer.self_attn.q_proj.out_features // head_dim
+                        num_kv_heads = layer.self_attn.k_proj.out_features // head_dim
 
-                query_states = []
-                key_states = []
-                value_states = []
-                residuals = []
-                seq_lens = []
-                for i, hidden_states in enumerate(inputs_embeds):
-                    layer = models[i].layers[layer_idx]
-                    residuals.append(hidden_states)
-                    hidden_states = layer.input_layernorm(hidden_states)  # noqa: PLW2901
-                    batch_size, seq_len, _ = hidden_states.shape
-                    seq_lens.append(seq_len)
-                    head_dim = layer.self_attn.head_dim
-                    num_heads = layer.self_attn.q_proj.out_features // head_dim
-                    num_kv_heads = layer.self_attn.k_proj.out_features // head_dim
+                        query_state = layer.self_attn.q_proj(hidden_states).view(batch_size, seq_len, num_heads, head_dim)
+                        key_state = layer.self_attn.k_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
+                        value_state = layer.self_attn.v_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
 
-                    query_state = layer.self_attn.q_proj(hidden_states).view(batch_size, seq_len, num_heads, head_dim)
-                    key_state = layer.self_attn.k_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
-                    value_state = layer.self_attn.v_proj(hidden_states).view(batch_size, seq_len, num_kv_heads, head_dim)
+                        query_states.append(query_state.transpose(1, 2))
+                        key_states.append(key_state.transpose(1, 2))
+                        value_states.append(value_state.transpose(1, 2))
 
-                    query_states.append(query_state.transpose(1, 2))
-                    key_states.append(key_state.transpose(1, 2))
-                    value_states.append(value_state.transpose(1, 2))
+                    query_states = torch.cat(query_states, dim=2)
+                    key_states = torch.cat(key_states, dim=2)
+                    value_states = torch.cat(value_states, dim=2)
 
-                query_states = torch.cat(query_states, dim=2)
-                key_states = torch.cat(key_states, dim=2)
-                value_states = torch.cat(value_states, dim=2)
+                    dummy_hidden_states = torch.zeros(
+                        query_states.shape[0],
+                        query_states.shape[2],
+                        query_states.shape[-1] * query_states.shape[1],
+                        device=query_states.device,
+                        dtype=query_states.dtype,
+                    )
+                    cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
+                    query_states, key_states = modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb(
+                        query_states,
+                        key_states,
+                        cos,
+                        sin,
+                        mrope_section,
+                    )
 
-                dummy_hidden_states = torch.zeros(
-                    query_states.shape[0],
-                    query_states.shape[2],
-                    query_states.shape[-1] * query_states.shape[1],
-                    device=query_states.device,
-                    dtype=query_states.dtype,
-                )
-                cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
-                query_states, key_states = modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb(
-                    query_states,
-                    key_states,
-                    cos,
-                    sin,
-                    mrope_section,
-                )
+                    num_kv_heads = key_states.shape[1]
+                    num_heads = query_states.shape[1]
+                    key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
+                    value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
 
-                num_kv_heads = key_states.shape[1]
-                num_heads = query_states.shape[1]
-                key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
-                value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
+                    attn_output = F.scaled_dot_product_attention(
+                        query_states,
+                        key_states,
+                        value_states,
+                        attn_mask=attention_mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                    )
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    attn_output = attn_output.reshape(attn_output.shape[0], attn_output.shape[1], -1)
 
-                attn_output = F.scaled_dot_product_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attn_mask=attention_mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                )
-                attn_output = attn_output.transpose(1, 2).contiguous()
-                attn_output = attn_output.reshape(attn_output.shape[0], attn_output.shape[1], -1)
+                    outputs_embeds = []
+                    start_pos = 0
+                    for i, residual in enumerate(residuals):
+                        layer = models[i].layers[layer_idx]
+                        end_pos = start_pos + seq_lens[i]
+                        out_emb = layer.self_attn.o_proj(attn_output[:, start_pos:end_pos])
+                        hidden_states = residual + out_emb
+                        residual = hidden_states
+                        hidden_states = layer.post_attention_layernorm(hidden_states)
+                        hidden_states = layer.mlp(hidden_states)
+                        hidden_states = residual + hidden_states
+                        outputs_embeds.append(hidden_states)
+                        start_pos = end_pos
 
-                outputs_embeds = []
-                start_pos = 0
-                for i, residual in enumerate(residuals):
-                    layer = models[i].layers[layer_idx]
-                    end_pos = start_pos + seq_lens[i]
-                    out_emb = layer.self_attn.o_proj(attn_output[:, start_pos:end_pos])
-                    hidden_states = residual + out_emb
-                    residual = hidden_states
-                    hidden_states = layer.post_attention_layernorm(hidden_states)
-                    hidden_states = layer.mlp(hidden_states)
-                    hidden_states = residual + hidden_states
-                    outputs_embeds.append(hidden_states)
-                    start_pos = end_pos
-
-                return outputs_embeds
+                    return outputs_embeds
 
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
@@ -931,9 +941,10 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                 else:
                     inputs_embeds = compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids)
 
-            outputs_embeds = []
-            for i, hidden_states in enumerate(inputs_embeds):
-                outputs_embeds.append(models[i].norm(hidden_states))
+            with self._autocast_context(inputs_embeds[0].device):
+                outputs_embeds = []
+                for i, hidden_states in enumerate(inputs_embeds):
+                    outputs_embeds.append(models[i].norm(hidden_states))
 
             prefix_output = outputs_embeds[0]
             suffix_output = outputs_embeds[1]
