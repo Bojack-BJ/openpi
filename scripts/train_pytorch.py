@@ -433,10 +433,6 @@ def train_loop(config: _config.TrainConfig):
         enable_gradient_checkpointing = False
         logging.info("Gradient checkpointing is not supported for this model")
 
-    # Log initial memory usage after model creation
-    if is_main and torch.cuda.is_available():
-        log_memory_usage(device, 0, "after_model_creation")
-
     # Enable memory optimizations for large-scale training
     if world_size >= 8:
         torch.backends.cudnn.benchmark = True
@@ -449,6 +445,14 @@ def train_loop(config: _config.TrainConfig):
     if use_ddp:
         dist.barrier()
 
+    param_count = sum(1 for _ in model.parameters())
+    trainable_param_count = sum(1 for p in model.parameters() if p.requires_grad)
+    if use_ddp:
+        gathered_counts = [None] * world_size
+        dist.all_gather_object(gathered_counts, (param_count, trainable_param_count))
+        if len(set(gathered_counts)) != 1:
+            raise RuntimeError(f"Model parameter counts differ across ranks before DDP wrap: {gathered_counts}")
+
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
@@ -457,6 +461,10 @@ def train_loop(config: _config.TrainConfig):
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
+
+    # Log initial memory usage after model creation / DDP wrapping.
+    if is_main and torch.cuda.is_available():
+        log_memory_usage(device, 0, "after_model_creation")
 
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
