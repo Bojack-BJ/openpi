@@ -232,6 +232,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         processor_images = torch.clamp((image + 1.0) / 2.0, 0.0, 1.0)
         image_inputs = self.qwen_processor.image_processor(
             images=[img.detach().cpu() for img in processor_images],
+            do_rescale=False,
             return_tensors="pt",
         )
 
@@ -257,6 +258,49 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         if isinstance(image_features, tuple):
             return image_features[0]
         raise TypeError(f"Unexpected image feature output type: {type(image_features)!r}")
+
+    def _get_image_token_counts(self, image_grid_thw: torch.Tensor) -> torch.Tensor:
+        merge_size = int(getattr(self.qwen_vl.visual, "spatial_merge_size", 1))
+        return image_grid_thw.prod(dim=-1) // (merge_size**2)
+
+    def _pack_image_features(
+        self,
+        image_features: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_counts = self._get_image_token_counts(image_grid_thw)
+        batch_size = image_grid_thw.shape[0]
+
+        if image_features.ndim == 3:
+            if image_features.shape[0] != batch_size:
+                raise ValueError(
+                    f"Expected batched image features for {batch_size} samples, got {tuple(image_features.shape)}."
+                )
+            max_tokens = image_features.shape[1]
+            token_pad_mask = torch.arange(max_tokens, device=image_features.device)[None, :] < token_counts[:, None]
+            return image_features, token_pad_mask
+
+        if image_features.ndim != 2:
+            raise ValueError(f"Unexpected Qwen image feature shape: {tuple(image_features.shape)}")
+
+        split_sizes = token_counts.tolist()
+        if sum(split_sizes) != image_features.shape[0]:
+            raise ValueError(
+                "Qwen image features do not match `image_grid_thw`: "
+                f"sum(token_counts)={sum(split_sizes)} vs feature_rows={image_features.shape[0]}"
+            )
+
+        chunks = torch.split(image_features, split_sizes, dim=0)
+        max_tokens = max(split_sizes, default=0)
+        hidden_size = image_features.shape[-1]
+        packed = image_features.new_zeros((batch_size, max_tokens, hidden_size))
+        token_pad_mask = torch.zeros((batch_size, max_tokens), dtype=torch.bool, device=image_features.device)
+
+        for idx, chunk in enumerate(chunks):
+            packed[idx, : chunk.shape[0]] = chunk
+            token_pad_mask[idx, : chunk.shape[0]] = True
+
+        return packed, token_pad_mask
 
     @staticmethod
     def _normalize_raw_prompts(raw_prompts, batch_size: int) -> list[str] | None:
@@ -362,10 +406,11 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         for img, img_mask in zip(images, img_masks, strict=True):
             pixel_values, image_grid_thw, processor_mode = self._preprocess_image_with_processor(img)
             img_emb = checkpoint_fn(self._embed_processed_image, pixel_values, image_grid_thw)
+            img_emb, img_token_pad_mask = self._pack_image_features(img_emb, image_grid_thw)
 
             batch_size, num_img_embs = img_emb.shape[:2]
             embs.append(img_emb)
-            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs))
+            pad_masks.append(img_mask[:, None].expand(batch_size, num_img_embs) & img_token_pad_mask)
             att_masks += [0] * num_img_embs
             image_grid_thws.append(image_grid_thw)
             image_processor_modes.append(processor_mode)
