@@ -31,6 +31,7 @@ import os
 import platform
 import shutil
 import time
+import pathlib
 
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -126,6 +127,12 @@ def set_seed(seed: int, local_rank: int):
     np.random.seed(seed + local_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed + local_rank)
+
+
+def write_rank_stage_marker(rank: int, stage: str) -> None:
+    """Persist the latest trainer stage for each rank to aid debugging hard hangs/crashes."""
+    marker_path = pathlib.Path("/tmp") / f"openpi_train_rank_{rank}.stage"
+    marker_path.write_text(f"{time.time():.3f} {stage}\n")
 
 
 def build_datasets(config: _config.TrainConfig):
@@ -363,10 +370,12 @@ def train_loop(config: _config.TrainConfig):
 
     # Initialize wandb (only on main process)
     if is_main:
+        write_rank_stage_marker(rank, "before_wandb_init")
         logging.info("Rank %s entering wandb init (enabled=%s, mode=%s)", rank, wandb_enabled, wandb_mode or "default")
         if wandb_enabled:
             init_wandb(config, resuming=resuming, enabled=True)
         logging.info("Rank %s finished wandb init", rank)
+        write_rank_stage_marker(rank, "after_wandb_init")
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -378,9 +387,11 @@ def train_loop(config: _config.TrainConfig):
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
+    write_rank_stage_marker(rank, "before_build_datasets")
     logging.info("Rank %s entering build_datasets on device %s", rank, device)
     loader, data_config = build_datasets(config)
     logging.info("Rank %s finished build_datasets", rank)
+    write_rank_stage_marker(rank, "after_build_datasets")
 
     # Log sample images to wandb on first batch
     if is_main and wandb_enabled and not resuming and not use_ddp:
@@ -430,9 +441,11 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
+    write_rank_stage_marker(rank, "before_model_construction")
     logging.info("Rank %s entering model construction", rank)
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
     logging.info("Rank %s finished model construction", rank)
+    write_rank_stage_marker(rank, "after_model_construction")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -462,6 +475,7 @@ def train_loop(config: _config.TrainConfig):
     )
 
     if use_ddp:
+        write_rank_stage_marker(rank, "before_ddp_wrap")
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
@@ -469,6 +483,7 @@ def train_loop(config: _config.TrainConfig):
             gradient_as_bucket_view=True,  # Enable for memory efficiency
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
+        write_rank_stage_marker(rank, "after_ddp_wrap")
 
     # Log initial memory usage after model creation / DDP wrapping.
     if is_main and torch.cuda.is_available():
