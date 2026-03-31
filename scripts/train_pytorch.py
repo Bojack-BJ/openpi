@@ -360,6 +360,8 @@ def train_loop(config: _config.TrainConfig):
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if use_ddp:
+        dist.barrier()
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -374,7 +376,7 @@ def train_loop(config: _config.TrainConfig):
     loader, data_config = build_datasets(config)
 
     # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
+    if is_main and config.wandb_enabled and not resuming and not use_ddp:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
@@ -443,6 +445,9 @@ def train_loop(config: _config.TrainConfig):
         # Set memory allocation configuration
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
+
+    if use_ddp:
+        dist.barrier()
 
     if use_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
