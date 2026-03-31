@@ -8,7 +8,7 @@ from transformers import AutoProcessor
 from transformers import Qwen2ForCausalLM
 from transformers import Qwen2_5_VLForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
-from transformers.models.qwen2 import modeling_qwen2
+from transformers.models.qwen2_5_vl import modeling_qwen2_5_vl
 
 from openpi.models_pytorch.vlm_backbone_base import AttentionContext
 from openpi.models_pytorch.vlm_backbone_base import PrefixBatch
@@ -188,6 +188,14 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         # table because HF VL/text wrappers can expose different vocab sizes even when the decoder
         # geometry matches.
         return {key: value for key, value in state_dict.items() if not key.startswith("embed_tokens.")}
+
+    def _get_qwen_mrope_section(self) -> list[int]:
+        rope_scaling = getattr(self.qwen_vl.config, "rope_scaling", None)
+        if rope_scaling is None:
+            rope_scaling = getattr(getattr(self._get_qwen_text_model(), "config", None), "rope_scaling", None)
+        if rope_scaling is None or "mrope_section" not in rope_scaling:
+            raise ValueError("Qwen2.5-VL config did not expose `rope_scaling['mrope_section']`.")
+        return rope_scaling["mrope_section"]
 
     @staticmethod
     def _prepare_qwen_position_ids(position_ids: torch.Tensor | None) -> torch.Tensor | None:
@@ -738,6 +746,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         del adarms_cond
         prefix_text_model = self._get_qwen_text_model()
         qwen_position_ids = self._prepare_qwen_position_ids(position_ids)
+        mrope_section = self._get_qwen_mrope_section()
         if inputs_embeds[1] is None:
             prefix_output = prefix_text_model.forward(
                 inputs_embeds=inputs_embeds[0],
@@ -779,7 +788,13 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                     dtype=query_states.dtype,
                 )
                 cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
-                query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                query_states, key_states = modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    mrope_section,
+                )
 
                 past_key_states, past_value_states = _get_layer_past_key_value(past_key_values, layer_idx)
                 if past_key_states is not None and past_value_states is not None:
@@ -858,7 +873,13 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                     dtype=query_states.dtype,
                 )
                 cos, sin = prefix_text_model.rotary_emb(dummy_hidden_states, qwen_position_ids)
-                query_states, key_states = modeling_qwen2.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+                query_states, key_states = modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb(
+                    query_states,
+                    key_states,
+                    cos,
+                    sin,
+                    mrope_section,
+                )
 
                 num_kv_heads = key_states.shape[1]
                 num_heads = query_states.shape[1]
