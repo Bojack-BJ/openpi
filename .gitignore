@@ -36,3 +36,5 @@ dist/
 /assets/
 /checkpoints/
 /wandb/
+
+/exp_intermediate
