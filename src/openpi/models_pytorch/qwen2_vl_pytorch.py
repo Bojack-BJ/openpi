@@ -125,7 +125,7 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                 torch_dtype="float32",
             )
             self.qwen_expert = Qwen2ForCausalLM(config=action_expert_config_hf)
-            self.qwen_expert.model.load_state_dict(self._get_qwen_text_model().state_dict(), strict=False)
+            self.qwen_expert.model.load_state_dict(self._get_qwen_expert_init_state_dict(), strict=False)
             self.qwen_expert.model.embed_tokens = None
         else:
             vlm_config_hf = CONFIG_MAPPING["qwen2_5_vl"]()
@@ -180,6 +180,13 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                 return candidate
 
         raise AttributeError("Could not locate the Qwen text decoder layers on the loaded VLM backbone.")
+
+    def _get_qwen_expert_init_state_dict(self) -> dict[str, torch.Tensor]:
+        state_dict = self._get_qwen_text_model().state_dict()
+        # The suffix expert reuses decoder layers and final norm only. Skip the token embedding
+        # table because HF VL/text wrappers can expose different vocab sizes even when the decoder
+        # geometry matches.
+        return {key: value for key, value in state_dict.items() if not key.startswith("embed_tokens.")}
 
     def set_gradient_checkpointing_enabled(self, enabled: bool):
         self._get_qwen_text_model().gradient_checkpointing = enabled
