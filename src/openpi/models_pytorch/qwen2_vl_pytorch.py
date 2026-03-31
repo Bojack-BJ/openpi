@@ -4,6 +4,7 @@ from typing import Literal
 import pytest
 import torch
 from torch import nn
+import torch.nn.functional as F  # noqa: N812
 from transformers import AutoProcessor
 from transformers import Qwen2ForCausalLM
 from transformers import Qwen2_5_VLForConditionalGeneration
@@ -290,7 +291,8 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
         pixel_values = self._extract_processor_value(image_inputs, "pixel_values")
         if pixel_values is None:
             raise ValueError("Qwen image processor did not return `pixel_values`.")
-        pixel_values = pixel_values.to(device=image.device, dtype=torch.float32)
+        visual_dtype = next(self.qwen_vl.visual.parameters()).dtype
+        pixel_values = pixel_values.to(device=image.device, dtype=visual_dtype)
 
         image_grid_thw = self._extract_processor_value(image_inputs, "image_grid_thw")
         if image_grid_thw is None:
@@ -804,12 +806,14 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                 key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
                 value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
 
-                attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(
-                    query_states.shape[-1]
+                attn_output = F.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
                 )
-                attn_weights = attn_weights + attention_mask
-                attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_output = torch.matmul(attn_weights, value_states)
                 attn_output = attn_output.transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1)
 
                 out_emb = layer.self_attn.o_proj(attn_output)
@@ -886,12 +890,14 @@ class Qwen2_5_VLWithExpertModel(VLMWithExpertModel):
                 key_states = _repeat_kv(key_states, num_heads // num_kv_heads)
                 value_states = _repeat_kv(value_states, num_heads // num_kv_heads)
 
-                attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(
-                    query_states.shape[-1]
+                attn_output = F.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=attention_mask,
+                    dropout_p=0.0,
+                    is_causal=False,
                 )
-                attn_weights = attn_weights + attention_mask
-                attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-                attn_output = torch.matmul(attn_weights, value_states)
                 attn_output = attn_output.transpose(1, 2).contiguous()
                 attn_output = attn_output.reshape(attn_output.shape[0], attn_output.shape[1], -1)
 
