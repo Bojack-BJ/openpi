@@ -262,6 +262,69 @@ def get_model_param_stats(model: torch.nn.Module) -> tuple[int, int, int, int]:
     return total_tensors, trainable_tensors, total_numel, trainable_numel
 
 
+def wait_for_local_model_params(
+    model: torch.nn.Module,
+    *,
+    rank: int,
+    backend_name: str,
+    timeout_sec: int,
+    poll_interval_sec: float = 5.0,
+    stable_polls: int = 2,
+) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + timeout_sec
+    last_stats: tuple[int, int, int, int] | None = None
+    stable_count = 0
+    warned = False
+
+    while True:
+        stats = get_model_param_stats(model)
+        total_tensors, trainable_tensors, total_numel, trainable_numel = stats
+        params_ready = total_tensors > 0 and trainable_tensors > 0 and total_numel > 0 and trainable_numel > 0
+
+        if params_ready:
+            if stats == last_stats:
+                stable_count += 1
+            else:
+                last_stats = stats
+                stable_count = 1
+
+            if stable_count >= stable_polls:
+                logging.info(
+                    "Rank %s local model params ready for %s: total_tensors=%s trainable_tensors=%s total_numel=%s trainable_numel=%s",
+                    rank,
+                    backend_name,
+                    total_tensors,
+                    trainable_tensors,
+                    total_numel,
+                    trainable_numel,
+                )
+                return stats
+        else:
+            last_stats = stats
+            stable_count = 0
+            if not warned:
+                logging.warning(
+                    "Rank %s model construction returned before parameters were fully registered for %s. "
+                    "Waiting up to %ss for local params to appear. Current stats: total_tensors=%s trainable_tensors=%s total_numel=%s trainable_numel=%s",
+                    rank,
+                    backend_name,
+                    timeout_sec,
+                    total_tensors,
+                    trainable_tensors,
+                    total_numel,
+                    trainable_numel,
+                )
+                warned = True
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out while waiting for local model parameters to become ready before DDP. "
+                f"Rank {rank}, backend={backend_name}, stats={stats}"
+            )
+
+        time.sleep(poll_interval_sec)
+
+
 def format_model_param_stats(stats_by_rank: list[tuple[int, int, int, int]]) -> str:
     return "; ".join(
         (
@@ -660,6 +723,16 @@ def train_loop(config: _config.TrainConfig):
     if debug_artifacts:
         logging.info("Rank %s finished model construction", rank)
     write_rank_stage_marker(rank, "after_model_construction")
+
+    if use_ddp and getattr(model_cfg, "vlm_backend", "paligemma") in ("qwen2_vl", "qwen2_5_vl"):
+        write_rank_stage_marker(rank, "before_wait_for_local_model_params")
+        wait_for_local_model_params(
+            model,
+            rank=rank,
+            backend_name=model_cfg.vlm_backend,
+            timeout_sec=max(config.ddp_timeout_sec * 3, 1800),
+        )
+        write_rank_stage_marker(rank, "after_wait_for_local_model_params")
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
