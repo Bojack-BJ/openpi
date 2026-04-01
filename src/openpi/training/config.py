@@ -1641,6 +1641,39 @@ _CONFIGS = [
         num_workers = 32
         ),
     TrainConfig(
+        name="fruit_classification_Aa_torch",
+        # PyTorch-only Qwen fine-tuning config. The current Qwen adapter requires matching
+        # prefix/expert geometry, so use the 3B VL backbone together with a 3B action expert.
+        model=pi0_config.Pi0Config(
+            # vlm_backend="qwen2_5_vl",
+            # vlm_hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            # vlm_backbone_variant="qwen2_5_3b",
+            # action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        # `train_pytorch.py` initializes Qwen weights from `vlm_hf_model_id`; JAX checkpoint
+        # loaders are not consumed on the PyTorch path.
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=60_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
         name="fruit_classification_Aa",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(),

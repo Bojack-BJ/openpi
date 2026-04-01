@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1,2,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
@@ -8,7 +8,7 @@ REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
 
-cfg=fruit_classification_Aa_torch
+cfg=fruit_classification_Aa_qwen
 exp="${exp:-$cfg}"
 
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/root/Users/dataset/lerobot_home}"
