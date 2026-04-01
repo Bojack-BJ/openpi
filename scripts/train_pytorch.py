@@ -248,6 +248,102 @@ def run_ddp_preflight_collective(rank: int, device: torch.device) -> None:
     logging.info("Rank %s finished DDP preflight all_reduce: value=%s", rank, actual)
 
 
+def get_model_param_stats(model: torch.nn.Module) -> tuple[int, int, int, int]:
+    total_tensors = 0
+    trainable_tensors = 0
+    total_numel = 0
+    trainable_numel = 0
+    for param in model.parameters():
+        total_tensors += 1
+        total_numel += param.numel()
+        if param.requires_grad:
+            trainable_tensors += 1
+            trainable_numel += param.numel()
+    return total_tensors, trainable_tensors, total_numel, trainable_numel
+
+
+def format_model_param_stats(stats_by_rank: list[tuple[int, int, int, int]]) -> str:
+    return "; ".join(
+        (
+            f"rank {rank}: total_tensors={total_tensors}, trainable_tensors={trainable_tensors}, "
+            f"total_numel={total_numel}, trainable_numel={trainable_numel}"
+        )
+        for rank, (total_tensors, trainable_tensors, total_numel, trainable_numel) in enumerate(stats_by_rank)
+    )
+
+
+def gather_model_param_stats_across_ranks(
+    model: torch.nn.Module, rank: int, world_size: int, device: torch.device
+) -> list[tuple[int, int, int, int]]:
+    if not dist.is_initialized() or world_size <= 1:
+        return [get_model_param_stats(model)]
+
+    stats = torch.tensor(get_model_param_stats(model), device=device, dtype=torch.int64)
+    gathered = [torch.zeros_like(stats) for _ in range(world_size)]
+    dist.all_gather(gathered, stats)
+    stats_by_rank = [tuple(int(v) for v in item.detach().cpu().tolist()) for item in gathered]
+    logging.info("Rank %s pre-DDP model stats: %s", rank, format_model_param_stats(stats_by_rank))
+    return stats_by_rank
+
+
+def enable_gradients_for_all_params(model: torch.nn.Module) -> int:
+    changed = 0
+    for param in model.parameters():
+        if not param.requires_grad:
+            param.requires_grad_(True)
+            changed += 1
+    return changed
+
+
+def ensure_ddp_model_readiness(
+    model: torch.nn.Module,
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    if not dist.is_initialized() or world_size <= 1:
+        return
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    write_rank_stage_marker(rank, "before_pre_ddp_barrier")
+    barrier_kwargs = {"device_ids": [device.index]} if device.type == "cuda" and device.index is not None else {}
+    dist.barrier(**barrier_kwargs)
+    write_rank_stage_marker(rank, "after_pre_ddp_barrier")
+
+    stats_by_rank = gather_model_param_stats_across_ranks(model, rank, world_size, device)
+    unique_stats = set(stats_by_rank)
+    all_have_trainable_params = all(trainable_tensors > 0 for _, trainable_tensors, _, _ in stats_by_rank)
+    all_have_registered_params = all(total_tensors > 0 for total_tensors, _, _, _ in stats_by_rank)
+    if len(unique_stats) == 1 and all_have_trainable_params and all_have_registered_params:
+        return
+
+    if all_have_registered_params and not all_have_trainable_params:
+        logging.warning(
+            "Rank %s detected zero trainable parameters on at least one rank before DDP. "
+            "Enabling gradients for all parameters on every rank and retrying.",
+            rank,
+        )
+        changed = enable_gradients_for_all_params(model)
+        logging.info("Rank %s restored requires_grad=True on %s parameter tensors before DDP", rank, changed)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dist.barrier(**barrier_kwargs)
+        stats_by_rank = gather_model_param_stats_across_ranks(model, rank, world_size, device)
+        unique_stats = set(stats_by_rank)
+        all_have_trainable_params = all(trainable_tensors > 0 for _, trainable_tensors, _, _ in stats_by_rank)
+        all_have_registered_params = all(total_tensors > 0 for total_tensors, _, _, _ in stats_by_rank)
+        if len(unique_stats) == 1 and all_have_trainable_params and all_have_registered_params:
+            return
+
+    raise RuntimeError(
+        "Model parameters are inconsistent across ranks before DDP wrap. "
+        f"{format_model_param_stats(stats_by_rank)}"
+    )
+
+
 def get_model_state_dict(model):
     """Get state dict from model, handling DDP wrapper."""
     return (
@@ -586,9 +682,12 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Enabled memory optimizations for 8+ GPU training")
     write_rank_stage_marker(rank, "after_memory_optimizations")
 
+    if use_ddp:
+        ensure_ddp_model_readiness(model, rank=rank, world_size=world_size, device=device)
+    write_rank_stage_marker(rank, "after_ddp_model_readiness")
+
     if debug_artifacts:
-        param_count = sum(1 for _ in model.parameters())
-        trainable_param_count = sum(1 for p in model.parameters() if p.requires_grad)
+        param_count, trainable_param_count, _, _ = get_model_param_stats(model)
         logging.info(
             "Rank %s model parameter tensors before DDP: total=%s trainable=%s",
             dist.get_rank() if use_ddp else 0,
