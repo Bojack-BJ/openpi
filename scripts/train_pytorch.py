@@ -117,10 +117,18 @@ def _ddp_debug_artifacts_enabled() -> bool:
     return os.environ.get("OPENPI_DDP_DEBUG_ARTIFACTS", "0").lower() not in ("", "0", "false")
 
 
-def setup_ddp(config: _config.TrainConfig):
+def setup_device_and_ddp_flags(config: _config.TrainConfig):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     backend = "nccl" if torch.cuda.is_available() else "gloo"
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+    return use_ddp, local_rank, device, backend
+
+
+def init_process_group_if_needed(config: _config.TrainConfig, backend: str, use_ddp: bool) -> None:
     if use_ddp and not torch.distributed.is_initialized():
         torch.distributed.init_process_group(
             backend=backend,
@@ -131,12 +139,6 @@ def setup_ddp(config: _config.TrainConfig):
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
-    return use_ddp, local_rank, device, backend
 
 
 def cleanup_ddp():
@@ -592,10 +594,12 @@ def log_memory_usage(device, step, phase="unknown"):
 def train_loop(config: _config.TrainConfig):
     os.environ["OPENPI_DDP_DEBUG_ARTIFACTS"] = "1" if config.ddp_debug_artifacts else "0"
 
-    use_ddp, local_rank, device, ddp_backend = setup_ddp(config)
-    is_main = (not use_ddp) or (dist.get_rank() == 0)
+    use_ddp, local_rank, device, ddp_backend = setup_device_and_ddp_flags(config)
+    env_rank = int(os.environ.get("RANK", "0"))
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_main = (not use_ddp) or (env_rank == 0)
     set_seed(config.seed, local_rank)
-    rank = dist.get_rank() if use_ddp else 0
+    rank = env_rank
     wandb_mode = os.environ.get("WANDB_MODE", "").lower()
     wandb_enabled = config.wandb_enabled and wandb_mode != "disabled"
     debug_artifacts = config.ddp_debug_artifacts
@@ -621,8 +625,6 @@ def train_loop(config: _config.TrainConfig):
         if is_main:
             shutil.rmtree(config.checkpoint_dir)
             logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
-        if use_ddp:
-            dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
@@ -631,8 +633,6 @@ def train_loop(config: _config.TrainConfig):
         if is_main:
             exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
             logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-        if use_ddp:
-            dist.barrier()
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
@@ -649,55 +649,6 @@ def train_loop(config: _config.TrainConfig):
         if debug_artifacts:
             logging.info("Rank %s finished wandb init", rank)
         write_rank_stage_marker(rank, "after_wandb_init")
-
-    # Build data loader using the unified data loader
-    # Calculate effective batch size per GPU for DDP
-    # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
-    world_size = torch.distributed.get_world_size() if use_ddp else 1
-    effective_batch_size = config.batch_size // world_size
-    logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
-    )
-
-    # Pass the original batch size to data loader - it will handle DDP splitting internally
-    write_rank_stage_marker(rank, "before_build_datasets")
-    if debug_artifacts:
-        logging.info("Rank %s entering build_datasets on device %s", rank, device)
-    loader, data_config = build_datasets(config)
-    if debug_artifacts:
-        logging.info("Rank %s finished build_datasets", rank)
-    write_rank_stage_marker(rank, "after_build_datasets")
-
-    # Log sample images to wandb on first batch
-    if is_main and wandb_enabled and not resuming and not use_ddp:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
-        sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
-        sample_batch = observation.to_dict()
-        sample_batch["actions"] = actions
-
-        # Create sample images for wandb
-        images_to_log = []
-        # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
-        for i in range(min(5, batch_size)):
-            # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
-            img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
-
-        wandb.log({"camera_views": images_to_log}, step=0)
-
-        # Clear sample batch from memory aggressively
-        del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
@@ -733,6 +684,14 @@ def train_loop(config: _config.TrainConfig):
             timeout_sec=max(config.ddp_timeout_sec * 3, 1800),
         )
         write_rank_stage_marker(rank, "after_wait_for_local_model_params")
+
+    init_process_group_if_needed(config, ddp_backend, use_ddp)
+    if use_ddp:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        is_main = rank == 0
+    else:
+        world_size = 1
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -814,6 +773,54 @@ def train_loop(config: _config.TrainConfig):
         write_rank_stage_marker(rank, "before_ddp_wrap")
         model = torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
         write_rank_stage_marker(rank, "after_ddp_wrap")
+
+    # Build data loader using the unified data loader
+    # Calculate effective batch size per GPU for DDP
+    # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
+    effective_batch_size = config.batch_size // world_size
+    logging.info(
+        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+    )
+
+    # Pass the original batch size to data loader - it will handle DDP splitting internally
+    write_rank_stage_marker(rank, "before_build_datasets")
+    if debug_artifacts:
+        logging.info("Rank %s entering build_datasets on device %s", rank, device)
+    loader, data_config = build_datasets(config)
+    if debug_artifacts:
+        logging.info("Rank %s finished build_datasets", rank)
+    write_rank_stage_marker(rank, "after_build_datasets")
+
+    # Log sample images to wandb on first batch
+    if is_main and wandb_enabled and not resuming and not use_ddp:
+        # Create a separate data loader for sample batch to avoid consuming the main loader
+        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
+        sample_batch = next(iter(sample_data_loader))
+        # Convert observation and actions to torch tensors
+        observation, actions = sample_batch
+        sample_batch = observation.to_dict()
+        sample_batch["actions"] = actions
+
+        # Create sample images for wandb
+        images_to_log = []
+        # Get batch size from the first image tensor
+        batch_size = next(iter(sample_batch["image"].values())).shape[0]
+        for i in range(min(5, batch_size)):
+            # Concatenate all camera views horizontally for this batch item
+            # Convert from NCHW to NHWC format for wandb
+            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
+            img_concatenated = img_concatenated.cpu().numpy()
+            images_to_log.append(wandb.Image(img_concatenated))
+
+        wandb.log({"camera_views": images_to_log}, step=0)
+
+        # Clear sample batch from memory aggressively
+        del sample_batch, observation, actions, images_to_log, img_concatenated
+        del sample_data_loader  # Also delete the sample data loader
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        logging.info("Cleared sample batch and data loader from memory")
 
     # Log initial memory usage after model creation / DDP wrapping.
     if is_main and torch.cuda.is_available():
