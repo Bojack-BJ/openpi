@@ -88,16 +88,29 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
 
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+    run_id_path = ckpt_dir / "wandb_id.txt"
+    if resuming and run_id_path.exists():
+        run_id = run_id_path.read_text().strip()
+        if run_id:
+            logging.info("Resuming wandb run %s with resume='allow'", run_id)
+            wandb.init(id=run_id, resume="allow", project=config.project_name)
+        else:
+            logging.warning("Found empty wandb run id in %s. Starting a new wandb run.", run_id_path)
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                project=config.project_name,
+            )
+            run_id_path.write_text(wandb.run.id)
     else:
+        if resuming:
+            logging.warning("No wandb run id found in %s. Starting a new wandb run.", run_id_path)
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        run_id_path.write_text(wandb.run.id)
 
 
 def _ddp_debug_artifacts_enabled() -> bool:
