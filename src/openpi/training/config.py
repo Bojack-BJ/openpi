@@ -992,6 +992,25 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # If true, overrides DDP options with a more conservative configuration to help isolate startup issues.
+    ddp_safe_mode: bool = False
+    # If true, runs a tiny collective before DDP wrapping to separate communicator/bootstrap failures from DDP sync.
+    ddp_preflight_collective: bool = False
+    # If true, emits extra per-rank debug logs and `/tmp/openpi_*` diagnostic artifacts.
+    ddp_debug_artifacts: bool = False
+    # Timeout used when initializing the process group and waiting on DDP collectives during setup.
+    ddp_timeout_sec: int = 600
+    # Controls the DDP `static_graph` option. `auto` keeps the previous behavior.
+    ddp_static_graph: Literal["auto", "on", "off"] = "auto"
+    # Controls the DDP `find_unused_parameters` option.
+    ddp_find_unused_parameters: bool = True
+    # Controls the DDP `gradient_as_bucket_view` option.
+    ddp_gradient_as_bucket_view: bool = True
+    # Controls the DDP `broadcast_buffers` option.
+    ddp_broadcast_buffers: bool = True
+    # Controls the DDP `init_sync` option when supported by the installed torch version.
+    ddp_init_sync: bool = True
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 

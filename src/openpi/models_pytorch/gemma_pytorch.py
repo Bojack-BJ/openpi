@@ -1,3 +1,4 @@
+import logging
 from typing import Literal
 import os
 import pathlib
@@ -15,9 +16,17 @@ from openpi.models_pytorch.vlm_backbone_base import VLMWithExpertModel
 
 
 def _write_backbone_stage_marker(stage: str) -> None:
+    if os.environ.get("OPENPI_DDP_DEBUG_ARTIFACTS", "0").lower() in ("", "0", "false"):
+        return
     rank = int(os.environ.get("RANK", "0"))
     marker_path = pathlib.Path("/tmp") / f"openpi_model_rank_{rank}.stage"
     marker_path.write_text(f"{time.time():.3f} {stage}\n")
+
+
+def _log_backbone_debug(msg: str, *args) -> None:
+    if os.environ.get("OPENPI_DDP_DEBUG_ARTIFACTS", "0").lower() in ("", "0", "false"):
+        return
+    logging.info(msg, *args)
 
 
 class PaliGemmaWithExpertModel(VLMWithExpertModel):
@@ -34,7 +43,7 @@ class PaliGemmaWithExpertModel(VLMWithExpertModel):
         super().__init__()
         self.hf_model_id = hf_model_id
         _write_backbone_stage_marker("paligemma_expert_init_start")
-        print("PaliGemmaWithExpertModel init start", flush=True)
+        _log_backbone_debug("PaliGemmaWithExpertModel init start")
 
         vlm_config_hf = CONFIG_MAPPING["paligemma"]()
         vlm_config_hf._vocab_size = 257152  # noqa: SLF001
@@ -69,19 +78,19 @@ class PaliGemmaWithExpertModel(VLMWithExpertModel):
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
-        print("PaliGemmaWithExpertModel building PaliGemma backbone", flush=True)
+        _log_backbone_debug("PaliGemmaWithExpertModel building PaliGemma backbone")
         _write_backbone_stage_marker("paligemma_before_backbone")
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        print("PaliGemmaWithExpertModel building Gemma expert", flush=True)
+        _log_backbone_debug("PaliGemmaWithExpertModel building Gemma expert")
         _write_backbone_stage_marker("paligemma_after_backbone_before_expert")
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
-        print(f"PaliGemmaWithExpertModel converting params to precision={precision}", flush=True)
+        _log_backbone_debug("PaliGemmaWithExpertModel converting params to precision=%s", precision)
         _write_backbone_stage_marker("paligemma_before_precision_convert")
         self.to_bfloat16_for_selected_params(precision)
         _write_backbone_stage_marker("paligemma_after_precision_convert")
-        print("PaliGemmaWithExpertModel init finished", flush=True)
+        _log_backbone_debug("PaliGemmaWithExpertModel init finished")
 
     def set_gradient_checkpointing_enabled(self, enabled: bool):
         self.paligemma.language_model.gradient_checkpointing = enabled
