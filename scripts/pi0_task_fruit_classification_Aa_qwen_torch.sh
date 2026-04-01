@@ -13,7 +13,7 @@ exp="${exp:-$cfg}"
 
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/root/Users/dataset/lerobot_home}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/root/Users/.cache/}"
-export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_MODE="${WANDB_MODE:-disabled}"
 
 cd /root/Users/lixiaotong/openpi
 
@@ -33,5 +33,6 @@ torchrun \
   scripts/train_pytorch.py "$cfg" \
   --exp-name "$exp" \
   --overwrite \
+  # --wandb_enabled False \
   --pytorch-training-precision "bfloat16" \
   "$@"
