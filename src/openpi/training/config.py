@@ -1756,6 +1756,48 @@ _CONFIGS = [
         num_workers = 32
         ),
     TrainConfig(
+        name="toy_block_placement_Ab_on_Aa",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ab_toy_block",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=120_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
+        name="toy_block_placement_Ba",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
         name="unplug_network_cable",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(),

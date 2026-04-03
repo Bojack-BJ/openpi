@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
@@ -34,4 +34,5 @@ torchrun \
   --exp-name "$exp" \
   --overwrite \
   --pytorch-training-precision "bfloat16" \
+  --project_name "umi-openpi" \
   "$@"

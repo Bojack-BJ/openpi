@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICES=0,1,2,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
@@ -13,7 +13,7 @@ exp="${exp:-$cfg}"
 
 export HF_LEROBOT_HOME="${HF_LEROBOT_HOME:-/root/Users/dataset/lerobot_home}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/root/Users/.cache/}"
-export WANDB_MODE="${WANDB_MODE:-disabled}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 cd /root/Users/lixiaotong/openpi
 
@@ -32,7 +32,7 @@ torchrun \
   --nproc_per_node="$nproc_per_node" \
   scripts/train_pytorch.py "$cfg" \
   --exp-name "$exp" \
-  --overwrite \
-  # --wandb_enabled False \
+  --resume \
   --pytorch-training-precision "bfloat16" \
+  --project_name "umi-openpi" \
   "$@"
