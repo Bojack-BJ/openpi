@@ -23,8 +23,9 @@ Current split by runtime:
   - backend-aware prompt tokenization is implemented
 - JAX:
   - prompt-tokenizer routing is backend-aware
-  - `Pi0` runtime is still being migrated from the original hard-coded `Gemma + SigLIP` stack
-  - this migration phase is structural only; `paligemma` remains the only supported JAX runtime backend
+  - `Pi0` runtime now dispatches through a backend factory instead of hard-coding `Gemma + SigLIP`
+  - `paligemma` remains the only fully supported JAX runtime backend today
+  - Qwen JAX scaffolding now lives under `src/openpi/models/qwen2_5/`, but the vision tower and multimodal image path are still incomplete
 
 ## Recommended rollout order
 
@@ -184,7 +185,7 @@ Status update:
 2. Route `src/openpi/models/pi0.py` through a backend factory instead of directly constructing Gemma/SigLIP.
 3. Use a neutral JAX runtime handle (`vlm_with_expert`) and auto-remap legacy `PaliGemma/...` checkpoints so existing JAX checkpoints remain loadable.
 4. Make `vlm_backend="paligemma"` work exactly as today in JAX.
-5. Make `qwen2_vl`, `qwen2_5_vl`, and `internvl3` raise explicit `NotImplementedError` in JAX instead of silently using the old stack.
+5. Keep building out the new JAX Qwen scaffold under `src/openpi/models/qwen2_5/` until the vision tower, projector, and multimodal positions are runnable end-to-end.
 6. Leave `pi0_fast` / FAST action-tokenizer migration out of scope for this phase.
 
 ### Phase D: after JAX structural decoupling and Qwen stability

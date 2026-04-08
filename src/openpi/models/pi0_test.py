@@ -72,11 +72,12 @@ def test_pi0_all_lora():
     assert all("llm" in p for p in state)
 
 
-def test_pi0_qwen_backend_not_implemented_in_jax():
+def test_pi0_qwen_backend_scaffold_raises_on_image_embedding():
     config = _pi0_config.Pi0Config(
         vlm_backend="qwen2_5_vl",
         vlm_backbone_variant="qwen2_5_3b",
         action_expert_variant="qwen2_5_3b",
     )
-    with pytest.raises(NotImplementedError, match="JAX Pi0 recognizes `vlm_backend=qwen2_5_vl`"):
-        config.create(jax.random.key(0))
+    model = config.create(jax.random.key(0))
+    with pytest.raises(NotImplementedError, match="JAX Qwen image embedding is not implemented yet"):
+        model.embed_prefix(config.fake_obs())

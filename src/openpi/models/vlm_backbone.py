@@ -8,6 +8,7 @@ import flax.nnx.bridge as nnx_bridge
 from typing_extensions import runtime_checkable
 
 import openpi.models.gemma as _gemma
+from openpi.models.qwen2_5.adapter import Qwen2_5_VLWithExpertModel
 import openpi.models.siglip as _siglip
 
 VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
@@ -113,10 +114,21 @@ def create_vlm_with_expert_model(
             rngs=rngs,
         )
 
-    if vlm_backend in ("qwen2_vl", "qwen2_5_vl", "internvl3"):
+    if vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
+        return Qwen2_5_VLWithExpertModel(
+            vlm_backbone_config,
+            action_expert_config,
+            use_adarms=use_adarms,
+            precision=precision,
+            image_example=image_example,
+            rngs=rngs,
+            hf_model_id=hf_model_id,
+        )
+
+    if vlm_backend == "internvl3":
         raise NotImplementedError(
-            f"JAX Pi0 recognizes `vlm_backend={vlm_backend}` but does not implement it yet. "
-            "Use `vlm_backend='paligemma'` for JAX, or use the PyTorch runtime for Qwen-based training."
+            "JAX Pi0 recognizes `vlm_backend=internvl3` but does not implement it yet. "
+            "Use `vlm_backend='paligemma'` for JAX today, or use the PyTorch runtime for non-PaliGemma backends."
         )
 
     raise ValueError(f"Unsupported vlm_backend: {vlm_backend}")
