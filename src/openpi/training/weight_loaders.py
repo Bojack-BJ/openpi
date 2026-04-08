@@ -7,6 +7,7 @@ import flax.traverse_util
 import numpy as np
 
 import openpi.models.model as _model
+import openpi.models.vlm_backbone as _vlm_backbone
 import openpi.shared.array_typing as at
 import openpi.shared.download as download
 
@@ -60,6 +61,12 @@ class PaliGemmaWeightLoader(WeightLoader):
 
     This will overwrite existing weights with similar names while keeping all extra weights intact.
     This allows us to support the action expert which is used by the Pi0 model.
+
+    JAX multi-backend migration note:
+    this remains the only backend-specific official loader in the current tree. Future JAX backend
+    support (for example Qwen2-VL / InternVL3) should add dedicated loaders instead of reusing the
+    PaliGemma checkpoint mapping. Legacy official weights are still loaded, but the params will be
+    remapped onto the neutral `vlm_with_expert` runtime root when the reference tree expects it.
     """
 
     def load(self, params: at.Params) -> at.Params:
@@ -68,7 +75,10 @@ class PaliGemmaWeightLoader(WeightLoader):
         )
         with path.open("rb") as f:
             flat_params = dict(np.load(f, allow_pickle=False))
-        loaded_params = {"PaliGemma": flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
+        root_key = (
+            _vlm_backbone.RUNTIME_VLM_ROOT if _vlm_backbone.RUNTIME_VLM_ROOT in params else _vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT
+        )
+        loaded_params = {root_key: flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
 
@@ -84,6 +94,8 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     Returns:
         A new dictionary with the merged parameters.
     """
+    loaded_params = _vlm_backbone.remap_legacy_vlm_checkpoint_root_for_reference(loaded_params, params)
+
     flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
     flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
 

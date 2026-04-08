@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+import openpi.models.vlm_backbone as _vlm_backbone
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -22,8 +23,10 @@ VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
-    # Backend selection currently affects the PyTorch implementation and prompt-tokenizer routing.
-    # TODO: teach the JAX Pi0 path to dispatch on vlm_backend instead of always building the Gemma/SigLIP stack.
+    # Backend selection now routes prompt-tokenizer selection everywhere and dispatches the JAX/PyTorch
+    # Pi0 runtime through backend factories. JAX currently only implements `paligemma`; other backends
+    # are recognized but raise explicit NotImplementedError during model creation. Legacy JAX checkpoints
+    # saved under the historical top-level `PaliGemma` subtree are remapped automatically at load time.
     vlm_backend: VLMBackend = "paligemma"
     vlm_hf_model_id: str | None = None
     vlm_backbone_variant: _vlm_backbone_config.Variant = "gemma_2b"
@@ -67,6 +70,11 @@ class Pi0Config(_model.BaseModelConfig):
         from openpi.models.pi0 import Pi0
 
         return Pi0(self, rngs=nnx.Rngs(rng))
+
+    @override
+    def load(self, params: at.Params, *, remove_extra_params: bool = True):
+        params = _vlm_backbone.remap_legacy_vlm_checkpoint_root(params)
+        return super().load(params, remove_extra_params=remove_extra_params)
 
     @override
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:

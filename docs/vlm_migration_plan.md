@@ -1,6 +1,6 @@
 # PI0 VLM Backend Migration Plan
 
-This project is currently hard-wired to a `PaliGemma + Gemma expert` stack in several layers:
+This project originally hard-wired a `PaliGemma + Gemma expert` stack in several layers:
 
 - `src/openpi/models_pytorch/pi0_pytorch.py`
 - `src/openpi/models_pytorch/gemma_pytorch.py`
@@ -8,12 +8,23 @@ This project is currently hard-wired to a `PaliGemma + Gemma expert` stack in se
 - `src/openpi/training/weight_loaders.py`
 - `src/openpi/training/config.py`
 
-The first migration step implemented in this branch is structural decoupling:
+The PyTorch migration steps implemented in the current `multi-backbone` line are:
 
 - `Pi0Config` now has `vlm_backend` and `vlm_hf_model_id`
 - `PI0Pytorch` now routes VLM creation through `models_pytorch/vlm_backbone.py`
 - the runtime path now uses a neutral `vlm_with_expert` handle instead of hard-coding all logic to `paligemma_with_expert`
 - the existing PaliGemma implementation remains the default backend
+
+Current split by runtime:
+
+- PyTorch:
+  - structural multi-backbone dispatch is implemented
+  - `qwen2_vl` / `qwen2_5_vl` adapters exist
+  - backend-aware prompt tokenization is implemented
+- JAX:
+  - prompt-tokenizer routing is backend-aware
+  - `Pi0` runtime is still being migrated from the original hard-coded `Gemma + SigLIP` stack
+  - this migration phase is structural only; `paligemma` remains the only supported JAX runtime backend
 
 ## Recommended rollout order
 
@@ -144,7 +155,7 @@ Primary risk:
 - add `vlm_backend` config
 - add VLM backend factory
 
-### Phase B: next implementation target
+### Phase B: completed PyTorch target
 
 1. Add `Qwen2VLWithExpertModel`.
 2. Add `Qwen2VLTokenizer` or processor wrapper.
@@ -167,7 +178,16 @@ Status update:
   - Qwen's multimodal position inputs (`mm_token_type_ids`, `rope_deltas`, continuation cache positions) are still TODOs; joint attention still runs on OpenPI's 1D prefix/suffix positions
   - `pi05` / AdaRMS is not supported for the Qwen backend
 
-### Phase C: after Qwen is stable
+### Phase C: current JAX target
+
+1. Add a JAX-side backend abstraction under `src/openpi/models/`.
+2. Route `src/openpi/models/pi0.py` through a backend factory instead of directly constructing Gemma/SigLIP.
+3. Use a neutral JAX runtime handle (`vlm_with_expert`) and auto-remap legacy `PaliGemma/...` checkpoints so existing JAX checkpoints remain loadable.
+4. Make `vlm_backend="paligemma"` work exactly as today in JAX.
+5. Make `qwen2_vl`, `qwen2_5_vl`, and `internvl3` raise explicit `NotImplementedError` in JAX instead of silently using the old stack.
+6. Leave `pi0_fast` / FAST action-tokenizer migration out of scope for this phase.
+
+### Phase D: after JAX structural decoupling and Qwen stability
 
 1. Add `InternVL3WithExpertModel`.
 2. Add InternVL3 tokenizer/processor wrapper.
