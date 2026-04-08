@@ -128,7 +128,7 @@ Use fake data first. This checks whether the JAX trainer, sharding, optimizer, a
 ### PaliGemma tiny training smoke
 
 ```bash
-python scripts/train.py debug --exp_name jax_paligemma_debug --overwrite True --wandb_enabled False
+python scripts/train.py debug --exp_name jax_paligemma_debug --overwrite --no-wandb-enabled
 ```
 
 This uses:
@@ -150,11 +150,11 @@ There is no dedicated `debug_qwen_jax` config yet, so the simplest tiny backend 
 python scripts/train.py \
   debug \
   --exp_name jax_qwen_debug \
-  --overwrite True \
-  --wandb_enabled False \
-  --model.vlm_backend qwen2_5_vl \
-  --model.vlm_backbone_variant dummy \
-  --model.action_expert_variant dummy
+  --overwrite \
+  --no-wandb-enabled \
+  --model.vlm-backend qwen2_5_vl \
+  --model.vlm-backbone-variant dummy \
+  --model.action-expert-variant dummy
 ```
 
 What this checks:
