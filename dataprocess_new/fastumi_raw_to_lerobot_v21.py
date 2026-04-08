@@ -202,8 +202,8 @@ SOURCE_CAMERA_FPS = 60
 STATE_NAMES_8 = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_width"]
 
 STEP1_CFG = {
-    "base_x": 0.250,
-    "base_y": 0.2,
+    "base_x": 0.3,
+    "base_y": 0.0,
     "base_z": 0.145,
     "base_euler_deg": [180, -90, 0.0],
     "max_gripper": 88.0, # 84 for acone/fasttouch, 88 for robotiq
@@ -226,12 +226,12 @@ STEP1_CFG = {
 # fasttouch
 STEP1_CFG_DUAL = {
     "base_x_0": 0.3,
-    "base_y_0": 0.0,
+    "base_y_0": 0.04,
     "base_z_0": 0.16,
     "base_euler_deg_0": [0.0, 0.0, 0.0],
     "max_gripper_0": 84.0, # 84 for acone/fasttouch, 88 for robotiq
     "base_x_1": 0.3,
-    "base_y_1": -0.0,
+    "base_y_1": -0.04,
     "base_z_1": 0.16,
     "base_euler_deg_1": [0.0, 0.0, 0.0],
     "max_gripper_1": 84.0, # 84 for acone/fasttouch, 88 for robotiq
