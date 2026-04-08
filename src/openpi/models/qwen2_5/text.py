@@ -49,6 +49,7 @@ class Embedder(nn.Module):
 class Attention(nn.Module):
     configs: Sequence[Config]
     rope_theta: float = qwen_rotary.QWEN2_ROPE_THETA
+    mrope_section: tuple[int, int, int] | None = None
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -83,7 +84,13 @@ class Attention(nn.Module):
             qkvs.append((q, k, v))
 
         q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkvs, strict=True))
-        q, k = qwen_rotary.apply_rotary_embedding(q, k, positions=positions, theta=self.rope_theta)
+        q, k = qwen_rotary.apply_rotary_embedding(
+            q,
+            k,
+            positions=positions,
+            theta=self.rope_theta,
+            mrope_section=self.mrope_section,
+        )
         q *= self.configs[0].head_dim**-0.5
 
         if kv_cache is not None:
@@ -166,6 +173,7 @@ class FeedForward(nn.Module):
 class Block(nn.Module):
     configs: tuple[Config, ...]
     rope_theta: float = qwen_rotary.QWEN2_ROPE_THETA
+    mrope_section: tuple[int, int, int] | None = None
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
 
@@ -177,7 +185,12 @@ class Block(nn.Module):
         xs = sharding.activation_sharding_constraint(xs)
         drop = nn.Dropout(self.dropout, self.dropout_bdims) if self.dropout else lambda x, _: x
 
-        attn = Attention(configs=self.configs, rope_theta=self.rope_theta, name="attn")
+        attn = Attention(
+            configs=self.configs,
+            rope_theta=self.rope_theta,
+            mrope_section=self.mrope_section,
+            name="attn",
+        )
 
         pre_attn = [RMSNorm(name=_name("pre_attention_norm", i))(x) if x is not None else None for i, x in enumerate(xs)]
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
@@ -217,6 +230,7 @@ class Module(nn.Module):
     embed_dtype: str
     vocab_size: int = QWEN2_5_VL_VOCAB_SIZE
     rope_theta: float = qwen_rotary.QWEN2_ROPE_THETA
+    mrope_section: tuple[int, int, int] | None = None
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()
 
@@ -243,6 +257,7 @@ class Module(nn.Module):
         )(
             configs=tuple(self.configs),
             rope_theta=self.rope_theta,
+            mrope_section=self.mrope_section,
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
         )
@@ -256,7 +271,7 @@ class Module(nn.Module):
     def __call__(
         self,
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
-        positions: at.Int[at.Array, "b t"],
+        positions: at.Array,
         mask: at.Bool[at.Array, "b t s"],
         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
         *,
@@ -264,6 +279,7 @@ class Module(nn.Module):
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+        positions = qwen_rotary.repeat_text_positions(positions)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
@@ -278,7 +294,7 @@ class Module(nn.Module):
         total_tokens = len(self.configs)
         self(
             [jnp.zeros((1, 1, c.width), dtype=jnp.dtype(self.embed_dtype)) for c in self.configs],
-            jnp.arange(total_tokens, dtype=jnp.int32)[None, :],
+            jnp.broadcast_to(jnp.arange(total_tokens, dtype=jnp.int32)[None, :], (1, total_tokens)),
             jnp.ones((1, total_tokens, total_tokens), dtype=bool),
             adarms_cond=[None for _ in self.configs],
         )

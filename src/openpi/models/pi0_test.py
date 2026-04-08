@@ -1,6 +1,5 @@
 import flax.nnx as nnx
 import jax
-import pytest
 
 import openpi.models.pi0_config as _pi0_config
 
@@ -72,12 +71,17 @@ def test_pi0_all_lora():
     assert all("llm" in p for p in state)
 
 
-def test_pi0_qwen_backend_scaffold_raises_on_image_embedding():
+def test_pi0_qwen_backend_embed_prefix_smoke():
     config = _pi0_config.Pi0Config(
         vlm_backend="qwen2_5_vl",
         vlm_backbone_variant="qwen2_5_3b",
         action_expert_variant="qwen2_5_3b",
     )
     model = config.create(jax.random.key(0))
-    with pytest.raises(NotImplementedError, match="JAX Qwen image embedding is not implemented yet"):
-        model.embed_prefix(config.fake_obs())
+    prefix_tokens, prefix_mask, prefix_ar_mask, prefix_layout = model.embed_prefix(config.fake_obs())
+    positions = model.vlm_with_expert.build_prefix_positions(prefix_mask, prefix_layout=prefix_layout)
+
+    assert prefix_tokens.shape[0] == 1
+    assert prefix_mask.shape[0] == 1
+    assert prefix_ar_mask.ndim == 1
+    assert positions.shape == (3, prefix_mask.shape[0], prefix_mask.shape[1])

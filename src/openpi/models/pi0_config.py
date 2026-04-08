@@ -24,10 +24,11 @@ VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     # Backend selection now routes prompt-tokenizer selection everywhere and dispatches the JAX/PyTorch
-    # Pi0 runtime through backend factories. JAX fully supports `paligemma`; the Qwen path now builds
-    # a real text/expert scaffold but still lacks the vision tower and multimodal projector, so image
-    # embedding remains NotImplemented. Legacy JAX checkpoints saved under the historical top-level
-    # `PaliGemma` subtree are remapped automatically at load time.
+    # Pi0 runtime through backend factories. JAX fully supports `paligemma`; the JAX Qwen path now
+    # includes a native vision tower, projector, and backend-owned multimodal positions so the Pi0
+    # prefix/suffix path can run structurally end-to-end. It is still not HF-weight-compatible yet.
+    # Legacy JAX checkpoints saved under the historical top-level `PaliGemma` subtree are remapped
+    # automatically at load time.
     vlm_backend: VLMBackend = "paligemma"
     vlm_hf_model_id: str | None = None
     vlm_backbone_variant: _vlm_backbone_config.Variant = "gemma_2b"

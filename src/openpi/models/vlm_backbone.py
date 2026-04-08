@@ -1,10 +1,12 @@
 from collections.abc import Mapping
+import dataclasses
 from typing import Any
 from typing import Literal
 from typing import Protocol
 
 import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
+import jax.numpy as jnp
 from typing_extensions import runtime_checkable
 
 import openpi.models.gemma as _gemma
@@ -16,13 +18,28 @@ LEGACY_VLM_CHECKPOINT_ROOT = "PaliGemma"
 RUNTIME_VLM_ROOT = "vlm_with_expert"
 
 
+@dataclasses.dataclass(frozen=True)
+class PrefixPositionLayout:
+    image_token_lengths: tuple[int, ...] = ()
+    image_grid_thw: tuple[tuple[int, int, int] | None, ...] = ()
+    language_token_length: int = 0
+
+
 @runtime_checkable
 class VLMWithExpertModel(Protocol):
     def embed_image(self, image): ...
 
+    def embed_image_with_metadata(self, image): ...
+
     def embed_language_tokens(self, tokens): ...
 
     def forward(self, inputs_embeds, mask, positions, kv_cache=None, adarms_cond=None): ...
+
+    def build_prefix_positions(self, prefix_pad_mask, *, prefix_layout: PrefixPositionLayout): ...
+
+    def build_joint_positions(self, prefix_pad_mask, suffix_pad_mask, *, prefix_layout: PrefixPositionLayout): ...
+
+    def build_decode_positions(self, prefix_pad_mask, suffix_pad_mask, *, prefix_layout: PrefixPositionLayout): ...
 
 
 class PaliGemmaWithExpertModel(nnx.Module):
@@ -63,6 +80,9 @@ class PaliGemmaWithExpertModel(nnx.Module):
         image_tokens, _ = self.img(image, train=False)
         return image_tokens
 
+    def embed_image_with_metadata(self, image):
+        return self.embed_image(image), None
+
     def embed_language_tokens(self, tokens):
         return self.llm(tokens, method="embed")
 
@@ -70,6 +90,19 @@ class PaliGemmaWithExpertModel(nnx.Module):
         if adarms_cond is None:
             adarms_cond = [None, None]
         return self.llm(inputs_embeds, mask=mask, positions=positions, kv_cache=kv_cache, adarms_cond=adarms_cond)
+
+    def build_prefix_positions(self, prefix_pad_mask, *, prefix_layout: PrefixPositionLayout):
+        del prefix_layout
+        return jnp.cumsum(prefix_pad_mask, axis=1) - 1
+
+    def build_joint_positions(self, prefix_pad_mask, suffix_pad_mask, *, prefix_layout: PrefixPositionLayout):
+        del prefix_layout
+        input_mask = jnp.concatenate([prefix_pad_mask, suffix_pad_mask], axis=1)
+        return jnp.cumsum(input_mask, axis=1) - 1
+
+    def build_decode_positions(self, prefix_pad_mask, suffix_pad_mask, *, prefix_layout: PrefixPositionLayout):
+        del prefix_layout
+        return jnp.sum(prefix_pad_mask, axis=-1)[:, None] + jnp.cumsum(suffix_pad_mask, axis=-1) - 1
 
 
 def remap_legacy_vlm_checkpoint_root(

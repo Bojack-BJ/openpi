@@ -42,3 +42,17 @@ def test_qwen_jax_scaffold_text_forward_shapes():
     assert prefix_out.shape == prefix.shape
     assert suffix_out.shape == suffix.shape
     assert kv_cache is not None
+
+
+def test_qwen_jax_scaffold_embed_image_and_multimodal_positions():
+    config = _make_qwen_config()
+    model = config.create(jax.random.key(0))
+    obs = config.fake_obs(batch_size=2)
+
+    prefix_tokens, prefix_mask, _, prefix_layout = model.embed_prefix(obs)
+    positions = model.vlm_with_expert.build_prefix_positions(prefix_mask, prefix_layout=prefix_layout)
+
+    assert prefix_tokens.shape[0] == 2
+    assert positions.shape == (3, 2, prefix_mask.shape[1])
+    assert prefix_layout.image_token_lengths
+    assert prefix_layout.image_grid_thw
