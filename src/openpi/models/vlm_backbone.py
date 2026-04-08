@@ -135,8 +135,6 @@ def create_vlm_with_expert_model(
     rngs: nnx.Rngs,
     hf_model_id: str | None = None,
 ) -> VLMWithExpertModel:
-    del hf_model_id
-
     if vlm_backend == "paligemma":
         return PaliGemmaWithExpertModel(
             vlm_backbone_config,
