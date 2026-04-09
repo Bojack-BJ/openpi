@@ -200,6 +200,7 @@ class Qwen3_5VisionPatchMerger(nn.Module):
         merged_h = grid_h // self.merge_size
         merged_w = grid_w // self.merge_size
         batch_size = image_tokens.shape[0]
+        image_tokens = nn.LayerNorm(name="norm", dtype=self.dtype_mm)(image_tokens)
         image_tokens = image_tokens.reshape(batch_size, grid_h, grid_w, self.input_width)
         image_tokens = image_tokens.reshape(
             batch_size,
@@ -215,7 +216,6 @@ class Qwen3_5VisionPatchMerger(nn.Module):
             merged_h * merged_w,
             self.input_width * self.merge_size * self.merge_size,
         )
-        image_tokens = nn.LayerNorm(name="norm", dtype=self.dtype_mm)(image_tokens)
         image_tokens = nn.Dense(
             self.hidden_width,
             use_bias=True,
