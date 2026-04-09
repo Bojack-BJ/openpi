@@ -244,7 +244,10 @@ You can also load from a direct local directory:
 
 - `weight_loader=Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/path/to/local/qwen2.5")`
 
-Note: the JAX `qwen2_5_vl` vision path is still pragmatic, so `Qwen2_5WeightLoader` loads text-stack weights only.
+Current expectation:
+
+- the JAX `qwen2_5_vl` vision path is still pragmatic, so `Qwen2_5WeightLoader` loads text-stack weights only
+- `Qwen2_5WeightLoader` initializes the VLM branch by default; the action expert remains random-init unless `load_action_expert=True`
 
 ### Qwen3.5 tiny training smoke
 
@@ -350,9 +353,12 @@ Important notes:
 
 ### Small Qwen-native action experts
 
-The repo now includes smaller Qwen3.5 action-expert variants that preserve the Qwen attention/KV interface while
-shrinking only the expert width/MLP capacity:
+The repo now includes smaller Qwen2.5/Qwen3.5 action-expert variants that preserve each family's attention/KV
+interface while shrinking only the expert width/MLP capacity:
 
+- `qwen2_5_7b_action_1b`
+- `qwen2_5_3b_action_700m`
+- `qwen2_5_3b_action_400m`
 - `qwen3_5_4b_action_1b`
 - `qwen3_5_2b_action_700m`
 - `qwen3_5_2b_action_400m`
@@ -363,7 +369,14 @@ This follows the original OpenPI PaliGemma pattern more closely:
 - the action expert can stay randomly initialized and specialize for flow-matching control
 - layer-wise KV/cache reuse remains valid because the expert keeps the same attention geometry as its paired VLM
 
-Example:
+Examples:
+
+```bash
+python scripts/train.py debug_qwen2_5_pretrained \
+  --overwrite \
+  --no-wandb-enabled \
+  --model.action-expert-variant qwen2_5_3b_action_400m
+```
 
 ```bash
 python scripts/train.py debug_qwen3_5_pretrained \

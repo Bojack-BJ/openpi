@@ -49,6 +49,9 @@ Variant = Literal[
     "gemma_2b_lora",
     "qwen2_5_3b",
     "qwen2_5_7b",
+    "qwen2_5_3b_action_700m",
+    "qwen2_5_3b_action_400m",
+    "qwen2_5_7b_action_1b",
     "qwen3_5_2b",
     "qwen3_5_4b",
     "qwen3_5_2b_action_700m",
@@ -116,11 +119,41 @@ def get_config(variant: Variant) -> Config:
             head_dim=128,
             vocab_size=151_936,
         )
+    if variant == "qwen2_5_7b_action_1b":
+        return Config(
+            width=1280,
+            depth=28,
+            mlp_dim=5120,
+            num_heads=28,
+            num_kv_heads=4,
+            head_dim=128,
+            vocab_size=151_936,
+        )
     if variant == "qwen2_5_3b":
         return Config(
             width=2048,
             depth=36,
             mlp_dim=11_008,
+            num_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            vocab_size=151_936,
+        )
+    if variant == "qwen2_5_3b_action_700m":
+        return Config(
+            width=960,
+            depth=36,
+            mlp_dim=3840,
+            num_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            vocab_size=151_936,
+        )
+    if variant == "qwen2_5_3b_action_400m":
+        return Config(
+            width=640,
+            depth=36,
+            mlp_dim=2560,
             num_heads=16,
             num_kv_heads=2,
             head_dim=128,
