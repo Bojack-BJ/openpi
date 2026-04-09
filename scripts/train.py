@@ -184,7 +184,7 @@ def _summarize_param_tree(params: at.PyTree) -> str:
     return f"tensor_count={tensor_count}, total_elements={total_elements:,}, dtypes=[{dtype_summary}]"
 
 
-def _elapsed_logger_process(label: str, start_time: float, interval_sec: float, stop_event: multiprocessing.synchronize.Event):
+def _elapsed_logger_process(label: str, start_time: float, interval_sec: float, stop_event: Any):
     while not stop_event.wait(interval_sec):
         elapsed = time.perf_counter() - start_time
         print(f"{time.strftime('%H:%M:%S')} [I] {label} still running after {elapsed:.1f} seconds.", flush=True)
@@ -193,7 +193,7 @@ def _elapsed_logger_process(label: str, start_time: float, interval_sec: float, 
 
 def _start_elapsed_logger(
     label: str, *, interval_sec: float = 60.0
-) -> tuple[multiprocessing.synchronize.Event, multiprocessing.Process]:
+) -> tuple[Any, multiprocessing.Process]:
     ctx = multiprocessing.get_context("spawn")
     stop_event = ctx.Event()
     start_time = time.perf_counter()
