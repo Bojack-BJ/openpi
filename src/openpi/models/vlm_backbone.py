@@ -11,9 +11,10 @@ from typing_extensions import runtime_checkable
 
 import openpi.models.gemma as _gemma
 from openpi.models.qwen2_5.adapter import Qwen2_5_VLWithExpertModel
+from openpi.models.qwen3_5.adapter import Qwen3_5_VLWithExpertModel
 import openpi.models.siglip as _siglip
 
-VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
+VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "qwen3_5_vl", "internvl3"]
 LEGACY_VLM_CHECKPOINT_ROOT = "PaliGemma"
 RUNTIME_VLM_ROOT = "vlm_with_expert"
 
@@ -147,6 +148,16 @@ def create_vlm_with_expert_model(
 
     if vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
         return Qwen2_5_VLWithExpertModel(
+            vlm_backbone_config,
+            action_expert_config,
+            use_adarms=use_adarms,
+            precision=precision,
+            image_example=image_example,
+            rngs=rngs,
+            hf_model_id=hf_model_id,
+        )
+    if vlm_backend == "qwen3_5_vl":
+        return Qwen3_5_VLWithExpertModel(
             vlm_backbone_config,
             action_expert_config,
             use_adarms=use_adarms,

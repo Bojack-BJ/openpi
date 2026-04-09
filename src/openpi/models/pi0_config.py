@@ -17,18 +17,18 @@ if TYPE_CHECKING:
     from openpi.models.pi0 import Pi0
 
 
-VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"]
+VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "qwen3_5_vl", "internvl3"]
 
 
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     # Backend selection now routes prompt-tokenizer selection everywhere and dispatches the JAX/PyTorch
-    # Pi0 runtime through backend factories. JAX fully supports `paligemma`; the JAX Qwen path now
-    # includes a native vision tower, projector, and backend-owned multimodal positions so the Pi0
-    # prefix/suffix path can run structurally end-to-end. It is still not HF-weight-compatible yet.
-    # Legacy JAX checkpoints saved under the historical top-level `PaliGemma` subtree are remapped
-    # automatically at load time.
+    # Pi0 runtime through backend factories. JAX fully supports `paligemma`; the JAX `qwen2_5_vl`
+    # path includes a native vision tower, projector, and backend-owned multimodal positions; and
+    # `qwen3_5_vl` now uses an official-style hybrid Qwen3.5 text backbone, a dedicated JAX Qwen3.5
+    # vision tower, and a backend-specific Hugging Face weight loader. Legacy JAX checkpoints saved
+    # under the historical top-level `PaliGemma` subtree are remapped automatically at load time.
     vlm_backend: VLMBackend = "paligemma"
     vlm_hf_model_id: str | None = None
     vlm_backbone_variant: _vlm_backbone_config.Variant = "gemma_2b"
@@ -50,7 +50,7 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
-        if self.vlm_backend not in ("paligemma", "qwen2_vl", "qwen2_5_vl", "internvl3"):
+        if self.vlm_backend not in ("paligemma", "qwen2_vl", "qwen2_5_vl", "qwen3_5_vl", "internvl3"):
             raise ValueError(f"Unsupported vlm_backend: {self.vlm_backend}")
         if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl") and self.vlm_hf_model_id is None:
             default_model_id = (
@@ -58,6 +58,9 @@ class Pi0Config(_model.BaseModelConfig):
                 if self.vlm_backbone_variant == "qwen2_5_3b"
                 else "Qwen/Qwen2.5-VL-7B-Instruct"
             )
+            object.__setattr__(self, "vlm_hf_model_id", default_model_id)
+        if self.vlm_backend == "qwen3_5_vl" and self.vlm_hf_model_id is None:
+            default_model_id = "Qwen/Qwen3.5-2B" if self.vlm_backbone_variant == "qwen3_5_2b" else "Qwen/Qwen3.5-4B"
             object.__setattr__(self, "vlm_hf_model_id", default_model_id)
 
     @property

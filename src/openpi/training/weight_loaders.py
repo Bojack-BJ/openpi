@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import pathlib
 import re
 from typing import Protocol, runtime_checkable
 
@@ -63,10 +64,9 @@ class PaliGemmaWeightLoader(WeightLoader):
     This allows us to support the action expert which is used by the Pi0 model.
 
     JAX multi-backend migration note:
-    this remains the only backend-specific official loader in the current tree. Future JAX backend
-    support (for example Qwen2-VL / InternVL3) should add dedicated loaders instead of reusing the
-    PaliGemma checkpoint mapping. Legacy official weights are still loaded, but the params will be
-    remapped onto the neutral `vlm_with_expert` runtime root when the reference tree expects it.
+    legacy official weights are still loaded, but the params will be remapped onto the neutral
+    `vlm_with_expert` runtime root when the reference tree expects it. Non-PaliGemma backends
+    should use dedicated backend-specific loaders.
     """
 
     def load(self, params: at.Params) -> at.Params:
@@ -81,6 +81,30 @@ class PaliGemmaWeightLoader(WeightLoader):
         loaded_params = {root_key: flax.traverse_util.unflatten_dict(flat_params, sep="/")["params"]}
         # Add all missing weights.
         return _merge_params(loaded_params, params, missing_regex=".*")
+
+
+@dataclasses.dataclass(frozen=True)
+class Qwen3_5WeightLoader(WeightLoader):
+    """Loads weights from an official Hugging Face Qwen3.5 checkpoint.
+
+    This loader targets the JAX `qwen3_5_vl` runtime path. It maps official language-model
+    and vision-model tensors into the OpenPI parameter tree, including the duplicated prefix/expert
+    text branches used by `Pi0`.
+    """
+
+    model_id: str
+    local_files_only: bool = False
+
+    def load(self, params: at.Params) -> at.Params:
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        hf_tensors = _load_hf_safetensors_snapshot(self.model_id, local_files_only=self.local_files_only)
+
+        flat_loaded: dict[str, np.ndarray] = {}
+        _load_qwen3_5_text_weights(flat_loaded, flat_ref, hf_tensors)
+        _load_qwen3_5_vision_weights(flat_loaded, flat_ref, hf_tensors)
+
+        loaded_params = flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
 
 def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
@@ -114,3 +138,442 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
             result[k] = flat_ref[k]
 
     return flax.traverse_util.unflatten_dict(result, sep="/")
+
+
+def _load_hf_safetensors_snapshot(model_id: str, *, local_files_only: bool) -> dict[str, np.ndarray]:
+    try:
+        from huggingface_hub import snapshot_download
+        from safetensors.numpy import load_file
+    except ImportError as exc:
+        raise ImportError(
+            "Loading official Qwen3.5 weights requires `huggingface_hub` and `safetensors` "
+            "to be installed in the active Python environment."
+        ) from exc
+
+    snapshot_dir = pathlib.Path(
+        snapshot_download(
+            repo_id=model_id,
+            allow_patterns=["*.safetensors", "*.json"],
+            cache_dir=str(download.get_cache_dir() / "huggingface"),
+            local_files_only=local_files_only,
+        )
+    )
+    safetensor_files = sorted(snapshot_dir.rglob("*.safetensors"))
+    if not safetensor_files:
+        raise FileNotFoundError(f"No .safetensors files found in Hugging Face snapshot for {model_id}")
+
+    tensors: dict[str, np.ndarray] = {}
+    for path in safetensor_files:
+        tensors.update(load_file(str(path)))
+    return tensors
+
+
+def _resolve_ref_key(flat_ref: dict[str, at.Array], suffix: str) -> str:
+    matches = [key for key in flat_ref if key.endswith(suffix)]
+    if not matches:
+        raise KeyError(f"Could not find parameter ending with '{suffix}' in current JAX model.")
+    if len(matches) > 1:
+        raise KeyError(f"Parameter suffix '{suffix}' is ambiguous in current JAX model: {matches}")
+    return matches[0]
+
+
+def _target_shape(flat_ref: dict[str, at.Array], suffix: str) -> tuple[str, tuple[int, ...]]:
+    key = _resolve_ref_key(flat_ref, suffix)
+    return key, tuple(flat_ref[key].shape)
+
+
+def _store_loaded(flat_loaded: dict[str, np.ndarray], flat_ref: dict[str, at.Array], suffix: str, value: np.ndarray):
+    key, expected_shape = _target_shape(flat_ref, suffix)
+    if tuple(value.shape) != expected_shape:
+        raise ValueError(f"Shape mismatch for {suffix}: expected {expected_shape}, got {value.shape}")
+    flat_loaded[key] = np.asarray(value)
+
+
+def _dense_to_kernel(weight: np.ndarray) -> np.ndarray:
+    return np.asarray(weight).T
+
+
+def _conv1d_depthwise_to_kernel(weight: np.ndarray) -> np.ndarray:
+    weight = np.asarray(weight)
+    if weight.ndim == 3:
+        if weight.shape[1] != 1:
+            raise ValueError(f"Expected depthwise conv1d weight with shape [channels, 1, kernel], got {weight.shape}")
+        weight = weight[:, 0, :]
+    if weight.ndim != 2:
+        raise ValueError(f"Expected 2D depthwise conv1d kernel after squeeze, got {weight.shape}")
+    return weight.T[::-1]
+
+
+def _conv3d_to_kernel(weight: np.ndarray) -> np.ndarray:
+    weight = np.asarray(weight)
+    if weight.ndim != 5:
+        raise ValueError(f"Expected Conv3D weight with shape [out, in, kt, kh, kw], got {weight.shape}")
+    return np.transpose(weight, (2, 3, 4, 1, 0))
+
+
+def _hf_norm_to_rms_scale(weight: np.ndarray) -> np.ndarray:
+    return np.asarray(weight) - 1.0
+
+
+def _full_attention_qg_kernel(q_weight: np.ndarray, g_weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+    num_heads, input_width, doubled_head_dim = expected_shape
+    head_dim = doubled_head_dim // 2
+    q_kernel = _dense_to_kernel(q_weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
+    g_kernel = _dense_to_kernel(g_weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
+    return np.concatenate([q_kernel, g_kernel], axis=-1)
+
+
+def _full_attention_head_kernel(weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+    num_heads, input_width, head_dim = expected_shape
+    return _dense_to_kernel(weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
+
+
+def _full_attention_output_kernel(weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+    num_heads, head_dim, output_width = expected_shape
+    kernel = _dense_to_kernel(weight)
+    return kernel.reshape(num_heads, head_dim, output_width)
+
+
+def _linear_attention_output_kernel(weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+    num_value_heads, value_dim, output_width = expected_shape
+    kernel = _dense_to_kernel(weight)
+    return kernel.reshape(num_value_heads, value_dim, output_width)
+
+
+def _load_qwen3_5_text_weights(
+    flat_loaded: dict[str, np.ndarray],
+    flat_ref: dict[str, at.Array],
+    hf_tensors: dict[str, np.ndarray],
+):
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "llm/embedder/input_embedding",
+        np.asarray(hf_tensors["model.language_model.embed_tokens.weight"]),
+    )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "llm/final_norm/scale",
+        _hf_norm_to_rms_scale(hf_tensors["model.language_model.norm.weight"]),
+    )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "llm/final_norm_1/scale",
+        _hf_norm_to_rms_scale(hf_tensors["model.language_model.norm.weight"]),
+    )
+
+    layer_indices = sorted(
+        {
+            int(match.group(1))
+            for key in flat_ref
+            for match in [re.search(r"llm/layers_(\d+)/", key)]
+            if match is not None
+        }
+    )
+
+    for layer_idx in layer_indices:
+        hf_prefix = f"model.language_model.layers.{layer_idx}."
+        input_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}input_layernorm.weight"])
+        post_attn_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}post_attention_layernorm.weight"])
+        for branch_suffix in ("", "_1"):
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/pre_attention_norm{branch_suffix}/scale",
+                input_norm,
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/pre_ffw_norm{branch_suffix}/scale",
+                post_attn_norm,
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/mlp{branch_suffix}/gate_proj/w",
+                _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.gate_proj.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/mlp{branch_suffix}/up_proj/w",
+                _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.up_proj.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/mlp{branch_suffix}/down_proj/w",
+                _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.down_proj.weight"]),
+            )
+
+        has_linear = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/in_proj_qkv/w") for key in flat_ref)
+        has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/qg_einsum/w") for key in flat_ref)
+
+        if has_full:
+            for branch_suffix in ("", "_1"):
+                qg_suffix = f"llm/layers_{layer_idx}/self_attn/qg_einsum{branch_suffix}/w"
+                _, qg_shape = _target_shape(flat_ref, qg_suffix)
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    qg_suffix,
+                    _full_attention_qg_kernel(
+                        hf_tensors[f"{hf_prefix}self_attn.q_proj.weight"],
+                        hf_tensors[f"{hf_prefix}self_attn.g_proj.weight"],
+                        qg_shape,
+                    ),
+                )
+                head_suffixes = (
+                    ("k_einsum", "self_attn.k_proj.weight"),
+                    ("v_einsum", "self_attn.v_proj.weight"),
+                )
+                for target_name, hf_name in head_suffixes:
+                    target_suffix = f"llm/layers_{layer_idx}/self_attn/{target_name}{branch_suffix}/w"
+                    _, target_shape = _target_shape(flat_ref, target_suffix)
+                    _store_loaded(
+                        flat_loaded,
+                        flat_ref,
+                        target_suffix,
+                        _full_attention_head_kernel(hf_tensors[f"{hf_prefix}{hf_name}"], target_shape),
+                    )
+                o_suffix = f"llm/layers_{layer_idx}/self_attn/o_einsum{branch_suffix}/w"
+                _, o_shape = _target_shape(flat_ref, o_suffix)
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    o_suffix,
+                    _full_attention_output_kernel(hf_tensors[f"{hf_prefix}self_attn.o_proj.weight"], o_shape),
+                )
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    f"llm/layers_{layer_idx}/self_attn/q_norm{branch_suffix}/scale",
+                    _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}self_attn.q_norm.weight"]),
+                )
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    f"llm/layers_{layer_idx}/self_attn/k_norm{branch_suffix}/scale",
+                    _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}self_attn.k_norm.weight"]),
+                )
+        elif has_linear:
+            branch_linear_weights = (
+                ("in_proj_qkv", "linear_attn.in_proj_qkv.weight"),
+                ("in_proj_z", "linear_attn.in_proj_z.weight"),
+                ("in_proj_b", "linear_attn.in_proj_b.weight"),
+                ("in_proj_a", "linear_attn.in_proj_a.weight"),
+                ("out_proj", "linear_attn.out_proj.weight"),
+            )
+            for branch_suffix in ("", "_1"):
+                for target_name, hf_name in branch_linear_weights:
+                    target_suffix = f"llm/layers_{layer_idx}/self_attn/{target_name}{branch_suffix}/w"
+                    target_key, target_shape = _target_shape(flat_ref, target_suffix)
+                    value = hf_tensors[f"{hf_prefix}{hf_name}"]
+                    if target_name == "out_proj":
+                        mapped = _linear_attention_output_kernel(value, target_shape)
+                    else:
+                        mapped = _dense_to_kernel(value)
+                    if tuple(mapped.shape) != target_shape:
+                        raise ValueError(
+                            f"Shape mismatch for {target_suffix}: expected {target_shape}, got {mapped.shape}"
+                        )
+                    flat_loaded[target_key] = np.asarray(mapped)
+
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/short_conv/kernel",
+                _conv1d_depthwise_to_kernel(hf_tensors[f"{hf_prefix}linear_attn.conv1d.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/q_norm/scale",
+                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.q_norm.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/k_norm/scale",
+                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.k_norm.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/norm/scale",
+                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.norm.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/A_log",
+                np.asarray(hf_tensors[f"{hf_prefix}linear_attn.A_log"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/dt_bias",
+                np.asarray(hf_tensors[f"{hf_prefix}linear_attn.dt_bias"]),
+            )
+        else:
+            raise ValueError(f"Could not determine Qwen3.5 layer type for layer {layer_idx} from the JAX reference tree.")
+
+
+def _load_qwen3_5_vision_weights(
+    flat_loaded: dict[str, np.ndarray],
+    flat_ref: dict[str, at.Array],
+    hf_tensors: dict[str, np.ndarray],
+):
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "vision/encoder/patch_embed/proj/kernel",
+        _conv3d_to_kernel(hf_tensors["model.visual.patch_embed.proj.weight"]),
+    )
+    if "model.visual.patch_embed.proj.bias" in hf_tensors:
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            "vision/encoder/patch_embed/proj/bias",
+            np.asarray(hf_tensors["model.visual.patch_embed.proj.bias"]),
+        )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "vision/encoder/pos_embed/embedding",
+        np.asarray(hf_tensors["model.visual.pos_embed.weight"]),
+    )
+
+    block_indices = sorted(
+        {
+            int(match.group(1))
+            for key in flat_ref
+            for match in [re.search(r"vision/encoder/blocks_(\d+)/", key)]
+            if match is not None
+        }
+    )
+    for block_idx in block_indices:
+        hf_prefix = f"model.visual.blocks.{block_idx}."
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            f"vision/encoder/blocks_{block_idx}/norm1/scale",
+            np.asarray(hf_tensors[f"{hf_prefix}norm1.weight"]),
+        )
+        if f"{hf_prefix}norm1.bias" in hf_tensors:
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"vision/encoder/blocks_{block_idx}/norm1/bias",
+                np.asarray(hf_tensors[f"{hf_prefix}norm1.bias"]),
+            )
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            f"vision/encoder/blocks_{block_idx}/norm2/scale",
+            np.asarray(hf_tensors[f"{hf_prefix}norm2.weight"]),
+        )
+        if f"{hf_prefix}norm2.bias" in hf_tensors:
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"vision/encoder/blocks_{block_idx}/norm2/bias",
+                np.asarray(hf_tensors[f"{hf_prefix}norm2.bias"]),
+            )
+
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            f"vision/encoder/blocks_{block_idx}/attn/qkv/kernel",
+            _dense_to_kernel(hf_tensors[f"{hf_prefix}attn.qkv.weight"]),
+        )
+        if f"{hf_prefix}attn.qkv.bias" in hf_tensors:
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"vision/encoder/blocks_{block_idx}/attn/qkv/bias",
+                np.asarray(hf_tensors[f"{hf_prefix}attn.qkv.bias"]),
+            )
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            f"vision/encoder/blocks_{block_idx}/attn/proj/kernel",
+            _dense_to_kernel(hf_tensors[f"{hf_prefix}attn.proj.weight"]),
+        )
+        if f"{hf_prefix}attn.proj.bias" in hf_tensors:
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"vision/encoder/blocks_{block_idx}/attn/proj/bias",
+                np.asarray(hf_tensors[f"{hf_prefix}attn.proj.bias"]),
+            )
+
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            f"vision/encoder/blocks_{block_idx}/mlp/linear_fc1/kernel",
+            _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.fc1.weight"]),
+        )
+        if f"{hf_prefix}mlp.fc1.bias" in hf_tensors:
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"vision/encoder/blocks_{block_idx}/mlp/linear_fc1/bias",
+                np.asarray(hf_tensors[f"{hf_prefix}mlp.fc1.bias"]),
+            )
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            f"vision/encoder/blocks_{block_idx}/mlp/linear_fc2/kernel",
+            _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.fc2.weight"]),
+        )
+        if f"{hf_prefix}mlp.fc2.bias" in hf_tensors:
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"vision/encoder/blocks_{block_idx}/mlp/linear_fc2/bias",
+                np.asarray(hf_tensors[f"{hf_prefix}mlp.fc2.bias"]),
+            )
+
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "vision/encoder/merger/norm/scale",
+        np.asarray(hf_tensors["model.visual.merger.norm.weight"]),
+    )
+    if "model.visual.merger.norm.bias" in hf_tensors:
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            "vision/encoder/merger/norm/bias",
+            np.asarray(hf_tensors["model.visual.merger.norm.bias"]),
+        )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "vision/encoder/merger/linear_fc1/kernel",
+        _dense_to_kernel(hf_tensors["model.visual.merger.linear_fc1.weight"]),
+    )
+    if "model.visual.merger.linear_fc1.bias" in hf_tensors:
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            "vision/encoder/merger/linear_fc1/bias",
+            np.asarray(hf_tensors["model.visual.merger.linear_fc1.bias"]),
+        )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "vision/encoder/merger/linear_fc2/kernel",
+        _dense_to_kernel(hf_tensors["model.visual.merger.linear_fc2.weight"]),
+    )
+    if "model.visual.merger.linear_fc2.bias" in hf_tensors:
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            "vision/encoder/merger/linear_fc2/bias",
+            np.asarray(hf_tensors["model.visual.merger.linear_fc2.bias"]),
+        )

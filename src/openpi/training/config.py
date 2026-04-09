@@ -112,7 +112,7 @@ class ModelTransformFactory(GroupFactory):
 
     @staticmethod
     def _preserve_raw_prompt(model_config: _model.BaseModelConfig) -> bool:
-        return getattr(model_config, "vlm_backend", "paligemma") in ("qwen2_vl", "qwen2_5_vl")
+        return getattr(model_config, "vlm_backend", "paligemma") in ("qwen2_vl", "qwen2_5_vl", "qwen3_5_vl")
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -1660,6 +1660,30 @@ _CONFIGS = [
         num_workers = 32
         ),
     TrainConfig(
+        name="fruit_classification_Aa_qwen3_5",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B"),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=16,
+        num_workers=16,
+    ),
+    TrainConfig(
         name="fruit_classification_Aa_torch",
         # PyTorch-only Qwen fine-tuning config. The current Qwen adapter requires matching
         # prefix/expert geometry, so use the 3B VL backbone together with a 3B action expert.
@@ -2260,6 +2284,36 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
         overwrite=True,
         exp_name="debug",
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b",
+        ),
+        overwrite=True,
+        exp_name="debug_qwen3_5",
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_pretrained",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_pretrained",
         num_train_steps=10,
         wandb_enabled=False,
     ),

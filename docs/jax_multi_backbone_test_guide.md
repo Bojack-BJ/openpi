@@ -24,6 +24,29 @@ This note summarizes how to test the current JAX `Pi0` runtime after the multi-b
   - shape/cache/position-path validation
   - not pretrained-quality validation
 
+### Qwen3.5
+
+- Hugging Face exposes official `Qwen3.5` model repos such as:
+  - `Qwen/Qwen3.5-2B`
+  - `Qwen/Qwen3.5-4B`
+- At the **architecture layer**, `Qwen3.5` is **not** the same as `Qwen2.5`:
+  - the official model card and config describe a hybrid layout with `Gated DeltaNet` plus `Gated Attention`
+  - `2B` uses `6 × (3 linear-attention + 1 full-attention)` blocks
+  - `4B` uses `8 × (3 linear-attention + 1 full-attention)` blocks
+- The current repo's `qwen3_5_vl` JAX path now implements:
+  - an official-style hybrid `Qwen3.5` text backbone
+  - an official-style JAX Qwen3.5 vision tower
+  - `GatedDeltaNet` linear-attention blocks
+  - `GatedAttention` full-attention blocks
+  - a causal sequence mask in `Pi0` for the `qwen3_5_vl` backend
+- It now also includes:
+  - an HF-backed `Qwen3_5WeightLoader` for official checkpoint initialization
+
+In other words:
+
+- `qwen2_5_vl` is the more mature JAX multimodal runtime path today
+- `qwen3_5_vl` now exercises a much more faithful official 3.5 text + vision architecture, but still needs runtime validation against real Hugging Face checkpoints in your environment
+
 ## Prerequisites
 
 Your Python environment should have at least:
@@ -44,6 +67,7 @@ Run the JAX model tests first.
 ```bash
 python -m pytest src/openpi/models/pi0_test.py -q
 python -m pytest src/openpi/models/qwen2_5_test.py -q
+python -m pytest src/openpi/models/qwen3_5_test.py -q
 python -m pytest src/openpi/models/model_test.py -k paligemma -q
 ```
 
@@ -53,6 +77,7 @@ What these cover:
 - legacy `PaliGemma/...` checkpoint remapping still works
 - Qwen JAX `embed_prefix()` now runs instead of failing on image embedding
 - Qwen JAX backend-owned multimodal positions are produced with shape `[3, B, T]`
+- Qwen3.5 JAX vision embedding and merged image grid metadata are produced with the expected shapes
 
 ## 2. Minimal Forward Smoke
 
@@ -121,6 +146,36 @@ Expected:
 
 If this fails, treat it as a JAX Qwen integration bug, not a dataset issue.
 
+### Qwen3.5 forward smoke
+
+Use this to smoke-test the official-style JAX `Qwen3.5` text + vision path.
+
+```bash
+python - <<'PY'
+import jax
+from openpi.models import pi0_config
+
+cfg = pi0_config.Pi0Config(
+    vlm_backend="qwen3_5_vl",
+    vlm_backbone_variant="qwen3_5_2b",
+    action_expert_variant="qwen3_5_2b",
+)
+model = cfg.create(jax.random.key(0))
+obs, act = cfg.fake_obs(2), cfg.fake_act(2)
+
+loss = model.compute_loss(jax.random.key(1), obs, act)
+actions = model.sample_actions(jax.random.key(2), obs, num_steps=2)
+
+print("loss shape:", loss.shape)
+print("sampled actions shape:", actions.shape)
+PY
+```
+
+Interpretation:
+
+- if this passes, it means the JAX `Qwen3.5` hybrid text + vision backbone is wired into `Pi0`
+- it still does **not** guarantee Hugging Face checkpoint parity until you validate the loader path on your machine
+
 ## 3. Tiny Training Smoke
 
 Use fake data first. This checks whether the JAX trainer, sharding, optimizer, and model loop are still coherent.
@@ -170,6 +225,48 @@ What it does **not** check:
 - real dataset loading
 - real Qwen checkpoint loading
 
+### Qwen3.5 tiny training smoke
+
+Use this to validate JAX trainer integration for the new hybrid `Qwen3.5` text + vision path.
+
+```bash
+python scripts/train.py \
+  debug \
+  --exp_name jax_qwen3_5_debug \
+  --overwrite \
+  --no-wandb-enabled \
+  --model.vlm-backend qwen3_5_vl \
+  --model.vlm-backbone-variant qwen3_5_2b \
+  --model.action-expert-variant qwen3_5_2b
+```
+
+Expected success criteria:
+
+- backend dispatch works
+- model initializes
+- one or more steps run on fake data
+
+This should be interpreted as:
+
+- a trainer/runtime test for the official-style `Qwen3.5` text + vision backbone
+- not a final pretrained-parity test until you run it with official checkpoint initialization
+
+### Qwen3.5 pretrained tiny training smoke
+
+The repo now includes a named config that also validates the official Hugging Face loader path:
+
+```bash
+python scripts/train.py debug_qwen3_5_pretrained --overwrite --no-wandb-enabled
+```
+
+That config uses:
+
+- `model.vlm_backend=qwen3_5_vl`
+- `model.vlm_backbone_variant=qwen3_5_2b`
+- `model.action_expert_variant=qwen3_5_2b`
+- `model.vlm_hf_model_id=Qwen/Qwen3.5-2B`
+- `weight_loader=Qwen3_5WeightLoader("Qwen/Qwen3.5-2B")`
+
 ## 4. Real-Geometry Qwen Training Smoke
 
 If the tiny Qwen smoke passes, move on to the real JAX Qwen config already present in the repo:
@@ -178,8 +275,8 @@ If the tiny Qwen smoke passes, move on to the real JAX Qwen config already prese
 python scripts/train.py \
   fruit_classification_Aa_qwen \
   --exp_name jax_qwen_real_smoke \
-  --overwrite True \
-  --wandb_enabled False \
+  --overwrite \
+  --no-wandb-enabled \
   --num_train_steps 2
 ```
 
@@ -197,6 +294,26 @@ Expected success criteria:
 - train state initializes
 - at least one or two train steps complete
 
+### Qwen3.5 real-geometry smoke
+
+The repo now also includes a named JAX config that wires official Qwen3.5 initialization into a real dataset config:
+
+```bash
+python scripts/train.py \
+  fruit_classification_Aa_qwen3_5 \
+  --exp_name jax_qwen3_5_real_smoke \
+  --overwrite \
+  --no-wandb-enabled \
+  --num_train_steps 2
+```
+
+Important notes:
+
+- this config uses `vlm_backend="qwen3_5_vl"`
+- it initializes from `Qwen/Qwen3.5-2B` through `Qwen3_5WeightLoader`
+- you must have both Hugging Face checkpoint access and the dataset/assets required by `fruit_classification_Aa_qwen3_5`
+- this is the most meaningful current end-to-end Qwen3.5 JAX validation path in the repo
+
 ## 5. Recommended Test Order
 
 Run tests in this order:
@@ -204,9 +321,12 @@ Run tests in this order:
 1. `pytest` unit tests
 2. minimal forward smoke for `paligemma`
 3. minimal forward smoke for `qwen2_5_vl`
-4. `debug` tiny training smoke for `paligemma`
-5. `debug` tiny training smoke for `qwen2_5_vl`
-6. `fruit_classification_Aa_qwen` real-geometry smoke
+4. optional structural forward smoke for `qwen3_5_vl`
+5. `debug` tiny training smoke for `paligemma`
+6. `debug` tiny training smoke for `qwen2_5_vl`
+7. optional `debug` tiny training smoke for `qwen3_5_vl`
+8. `fruit_classification_Aa_qwen` real-geometry smoke
+9. optional `fruit_classification_Aa_qwen3_5` real-geometry smoke with official loader
 
 This order keeps failures easy to localize:
 
@@ -242,3 +362,9 @@ Current JAX Qwen limitations:
 - vision path is pragmatic rather than checkpoint-faithful
 - no dedicated JAX Qwen pretrained weight loader yet
 - this should be treated as a structural/runtime migration milestone, not final parity
+
+Current `qwen3_5_vl` limitations:
+
+- official checkpoint loading is newly wired, but still needs end-to-end validation in your JAX runtime
+- the current implementation is designed for image-only Pi0 usage, not full video/multiframe Qwen3.5-VL parity
+- should be treated as a strong JAX Qwen3.5 migration milestone rather than a finished HF parity claim until full checkpointed training/inference runs pass

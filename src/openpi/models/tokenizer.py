@@ -8,6 +8,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
 from transformers import AutoProcessor
+from transformers import AutoTokenizer
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
@@ -85,8 +86,11 @@ class Qwen2VLTokenizer:
         self._max_len = max_len
         self._model_id = model_id
 
-        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-        self._tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        try:
+            processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+            self._tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        except Exception:
+            self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
         if self._tokenizer.pad_token_id is None:
             if self._tokenizer.eos_token is not None:
@@ -117,7 +121,7 @@ def create_prompt_tokenizer(model_config) -> PromptTokenizer:
     vlm_backend = getattr(model_config, "vlm_backend", "paligemma")
     max_len = getattr(model_config, "max_token_len")
 
-    if vlm_backend in ("qwen2_vl", "qwen2_5_vl"):
+    if vlm_backend in ("qwen2_vl", "qwen2_5_vl", "qwen3_5_vl"):
         return Qwen2VLTokenizer(
             max_len=max_len,
             model_id=getattr(model_config, "vlm_hf_model_id", "Qwen/Qwen2.5-VL-7B-Instruct"),
