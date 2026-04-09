@@ -355,14 +355,23 @@ def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
 
     if initial_state is None:
         initial_state = jnp.zeros((batch_size, num_heads, key_dim, value_dim), dtype=value.dtype)
+    state_dtype = initial_state.dtype
+    compute_dtype = jnp.float32 if state_dtype in (jnp.bfloat16, jnp.float16) else state_dtype
 
     def step(state, inputs):
         q_t, k_t, v_t, g_t, beta_t = inputs
-        state = state * jnp.exp(g_t).astype(value.dtype)[..., None, None]
-        kv_mem = jnp.einsum("bhkv,bhk->bhv", state, k_t)
-        state = state + jnp.einsum("bhk,bhv->bhkv", k_t, beta_t[..., None] * (v_t - kv_mem))
-        out_t = jnp.einsum("bhkv,bhk->bhv", state.astype(value.dtype), q_t)
-        return state, out_t
+        state_f = state.astype(compute_dtype)
+        q_t = q_t.astype(compute_dtype)
+        k_t = k_t.astype(compute_dtype)
+        v_t = v_t.astype(compute_dtype)
+        beta_t = beta_t.astype(compute_dtype)
+        g_t = g_t.astype(compute_dtype)
+
+        state_f = state_f * jnp.exp(g_t)[..., None, None]
+        kv_mem = jnp.einsum("bhkv,bhk->bhv", state_f, k_t)
+        state_f = state_f + jnp.einsum("bhk,bhv->bhkv", k_t, beta_t[..., None] * (v_t - kv_mem))
+        out_t = jnp.einsum("bhkv,bhk->bhv", state_f, q_t)
+        return state_f.astype(state_dtype), out_t.astype(value.dtype)
 
     final_state, outputs = jax.lax.scan(
         step,
