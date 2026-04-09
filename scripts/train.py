@@ -1,10 +1,10 @@
 import dataclasses
 import functools
 import logging
-import multiprocessing
 import os
 import platform
 import sys
+import threading
 import time
 from collections import Counter
 from typing import Any
@@ -184,27 +184,25 @@ def _summarize_param_tree(params: at.PyTree) -> str:
     return f"tensor_count={tensor_count}, total_elements={total_elements:,}, dtypes=[{dtype_summary}]"
 
 
-def _elapsed_logger_process(label: str, start_time: float, interval_sec: float, stop_event: Any):
+def _elapsed_logger_worker(label: str, start_time: float, interval_sec: float, stop_event: threading.Event):
     while not stop_event.wait(interval_sec):
         elapsed = time.perf_counter() - start_time
-        print(f"{time.strftime('%H:%M:%S')} [I] {label} still running after {elapsed:.1f} seconds.", flush=True)
-        sys.stdout.flush()
+        print(f"{time.strftime('%H:%M:%S')} [I] {label} still running after {elapsed:.1f} seconds.", file=sys.stderr, flush=True)
 
 
 def _start_elapsed_logger(
     label: str, *, interval_sec: float = 60.0
-) -> tuple[Any, multiprocessing.Process]:
-    ctx = multiprocessing.get_context("spawn")
-    stop_event = ctx.Event()
+) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
     start_time = time.perf_counter()
-    process = ctx.Process(
-        target=_elapsed_logger_process,
+    thread = threading.Thread(
+        target=_elapsed_logger_worker,
         args=(label, start_time, interval_sec, stop_event),
         name=f"{label.replace(' ', '_')}_timer",
         daemon=True,
     )
-    process.start()
-    return stop_event, process
+    thread.start()
+    return stop_event, thread
 
 
 def _configure_jax_compilation_cache(config: _config.TrainConfig) -> None:
@@ -410,21 +408,24 @@ def main(config: _config.TrainConfig):
                 "First train step compile+execute",
                 interval_sec=60.0,
             )
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        if is_first_step:
-            # Ensure compile + first execution time is fully materialized for accurate logging.
-            train_state = jax.block_until_ready(train_state)
-            info = jax.tree.map(
-                lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
-                info,
-            )
-            compile_log_stop.set()
-            compile_log_thread.join(timeout=1.0)
-            logging.info(
-                "First train step compile+execute finished in %.1f seconds.",
-                time.perf_counter() - compile_t0,
-            )
+        try:
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+            if is_first_step:
+                # Ensure compile + first execution time is fully materialized for accurate logging.
+                train_state = jax.block_until_ready(train_state)
+                info = jax.tree.map(
+                    lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+                    info,
+                )
+                logging.info(
+                    "First train step compile+execute finished in %.1f seconds.",
+                    time.perf_counter() - compile_t0,
+                )
+        finally:
+            if is_first_step:
+                compile_log_stop.set()
+                compile_log_thread.join(timeout=1.0)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
