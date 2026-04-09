@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import platform
+import time
 from collections import Counter
 from typing import Any
 
@@ -363,8 +364,25 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        is_first_step = step == start_step
+        if is_first_step:
+            logging.info(
+                "First train step started: compiling train_step JIT for current model/sharding (this may take minutes)."
+            )
+            compile_t0 = time.perf_counter()
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
+        if is_first_step:
+            # Ensure compile + first execution time is fully materialized for accurate logging.
+            train_state = jax.block_until_ready(train_state)
+            info = jax.tree.map(
+                lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
+                info,
+            )
+            logging.info(
+                "First train step compile+execute finished in %.1f seconds.",
+                time.perf_counter() - compile_t0,
+            )
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
