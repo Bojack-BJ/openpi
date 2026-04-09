@@ -1021,6 +1021,9 @@ class TrainConfig:
     fsdp_devices: int = 1
     # If true, print per-parameter FSDP sharding decisions during initialization.
     log_sharding: bool = False
+    # If true, print the full train-state parameter tree (all tensor shapes) after init.
+    # By default we only print a compact summary to avoid overwhelming logs.
+    log_train_state_details: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:

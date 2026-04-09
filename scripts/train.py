@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import platform
+from collections import Counter
 from typing import Any
 
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
@@ -162,6 +163,24 @@ def _to_wandb_image_uint8(image: np.ndarray) -> np.ndarray:
     return np.clip(image, 0, 255).astype(np.uint8)
 
 
+def _summarize_param_tree(params: at.PyTree) -> str:
+    tree = params.to_pure_dict() if hasattr(params, "to_pure_dict") else params
+    flat = traverse_util.flatten_dict(tree)
+
+    tensor_count = 0
+    total_elements = 0
+    dtype_counts = Counter()
+    for value in flat.values():
+        if not hasattr(value, "shape"):
+            continue
+        tensor_count += 1
+        total_elements += int(np.prod(value.shape))
+        dtype_counts[str(value.dtype)] += 1
+
+    dtype_summary = ", ".join(f"{dtype}:{count}" for dtype, count in sorted(dtype_counts.items()))
+    return f"tensor_count={tensor_count}, total_elements={total_elements:,}, dtypes=[{dtype_summary}]"
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
@@ -319,7 +338,10 @@ def main(config: _config.TrainConfig):
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    if config.log_train_state_details:
+        logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    else:
+        logging.info("Initialized train state summary: %s", _summarize_param_tree(train_state.params))
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
