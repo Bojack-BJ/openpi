@@ -451,24 +451,57 @@ def _load_qwen3_5_text_weights(
                 f"llm/layers_{layer_idx}/self_attn/short_conv/kernel",
                 _conv1d_depthwise_to_kernel(hf_tensors[f"{hf_prefix}linear_attn.conv1d.weight"]),
             )
-            _store_loaded(
-                flat_loaded,
-                flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/q_norm/scale",
-                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.q_norm.weight"]),
+            q_norm_key = _first_present_or_none(
+                hf_tensors,
+                [
+                    f"{hf_prefix}linear_attn.q_norm.weight",
+                    f"{hf_prefix}linear_attn.q_norm.scale",
+                ],
             )
-            _store_loaded(
-                flat_loaded,
-                flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/k_norm/scale",
-                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.k_norm.weight"]),
+            k_norm_key = _first_present_or_none(
+                hf_tensors,
+                [
+                    f"{hf_prefix}linear_attn.k_norm.weight",
+                    f"{hf_prefix}linear_attn.k_norm.scale",
+                ],
             )
-            _store_loaded(
-                flat_loaded,
-                flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/norm/scale",
-                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.norm.weight"]),
+            norm_key = _first_present_or_none(
+                hf_tensors,
+                [
+                    f"{hf_prefix}linear_attn.norm.weight",
+                    f"{hf_prefix}linear_attn.norm.scale",
+                ],
             )
+            if q_norm_key is not None:
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    f"llm/layers_{layer_idx}/self_attn/q_norm/scale",
+                    _hf_norm_to_rms_scale(hf_tensors[q_norm_key]),
+                )
+            if k_norm_key is not None:
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    f"llm/layers_{layer_idx}/self_attn/k_norm/scale",
+                    _hf_norm_to_rms_scale(hf_tensors[k_norm_key]),
+                )
+            if norm_key is not None:
+                _store_loaded(
+                    flat_loaded,
+                    flat_ref,
+                    f"llm/layers_{layer_idx}/self_attn/norm/scale",
+                    _hf_norm_to_rms_scale(hf_tensors[norm_key]),
+                )
+            if q_norm_key is None or k_norm_key is None or norm_key is None:
+                logger.warning(
+                    "Qwen3.5 layer %s missing linear-attention norm weights "
+                    "(q_norm=%s, k_norm=%s, norm=%s). Using initialized defaults for missing tensors.",
+                    layer_idx,
+                    q_norm_key is not None,
+                    k_norm_key is not None,
+                    norm_key is not None,
+                )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
@@ -647,6 +680,13 @@ def _first_present(mapping: dict[str, np.ndarray], candidates: list[str]) -> str
         if key in mapping:
             return key
     raise KeyError(f"Could not find any of keys: {candidates}")
+
+
+def _first_present_or_none(mapping: dict[str, np.ndarray], candidates: list[str]) -> str | None:
+    for key in candidates:
+        if key in mapping:
+            return key
+    return None
 
 
 def _load_qwen2_5_text_weights(
