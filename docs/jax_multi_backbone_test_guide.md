@@ -360,6 +360,8 @@ interface while shrinking only the expert width/MLP capacity:
 - `qwen2_5_3b_action_700m`
 - `qwen2_5_3b_action_400m`
 - `qwen3_5_4b_action_1b`
+- `qwen3_5_4b_action_700m`
+- `qwen3_5_4b_action_400m`
 - `qwen3_5_2b_action_700m`
 - `qwen3_5_2b_action_400m`
 
@@ -376,6 +378,14 @@ python scripts/train.py debug_qwen2_5_pretrained \
   --overwrite \
   --no-wandb-enabled \
   --model.action-expert-variant qwen2_5_3b_action_400m
+```
+
+```bash
+python scripts/train.py debug_qwen3_5_pretrained \
+  --overwrite \
+  --no-wandb-enabled \
+  --model.vlm-backbone-variant qwen3_5_4b \
+  --model.action-expert-variant qwen3_5_4b_action_700m
 ```
 
 ```bash

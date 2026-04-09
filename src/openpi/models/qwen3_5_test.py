@@ -69,11 +69,15 @@ def test_qwen3_5_small_action_experts_preserve_attention_interface():
     expert_400m = _vlm_backbone_config.get_config("qwen3_5_2b_action_400m")
     vlm_4b = _vlm_backbone_config.get_config("qwen3_5_4b")
     expert_1b = _vlm_backbone_config.get_config("qwen3_5_4b_action_1b")
+    expert_4b_700m = _vlm_backbone_config.get_config("qwen3_5_4b_action_700m")
+    expert_4b_400m = _vlm_backbone_config.get_config("qwen3_5_4b_action_400m")
 
     for vlm_cfg, expert_cfg in (
         (vlm_2b, expert_700m),
         (vlm_2b, expert_400m),
         (vlm_4b, expert_1b),
+        (vlm_4b, expert_4b_700m),
+        (vlm_4b, expert_4b_400m),
     ):
         assert expert_cfg.depth == vlm_cfg.depth
         assert expert_cfg.num_heads == vlm_cfg.num_heads
