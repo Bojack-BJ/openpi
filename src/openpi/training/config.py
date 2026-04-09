@@ -1024,6 +1024,8 @@ class TrainConfig:
     # If true, print the full train-state parameter tree (all tensor shapes) after init.
     # By default we only print a compact summary to avoid overwhelming logs.
     log_train_state_details: bool = False
+    # Directory for JAX persistent compilation cache. Set to None to disable caching.
+    jax_compilation_cache_dir: str | None = "~/.cache/jax/openpi"
 
     @property
     def assets_dirs(self) -> pathlib.Path:

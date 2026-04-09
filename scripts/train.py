@@ -1,9 +1,10 @@
 import dataclasses
 import functools
 import logging
+import multiprocessing
 import os
 import platform
-import threading
+import sys
 import time
 from collections import Counter
 from typing import Any
@@ -183,17 +184,38 @@ def _summarize_param_tree(params: at.PyTree) -> str:
     return f"tensor_count={tensor_count}, total_elements={total_elements:,}, dtypes=[{dtype_summary}]"
 
 
-def _start_elapsed_logger(label: str, *, interval_sec: float = 60.0) -> tuple[threading.Event, threading.Thread]:
-    stop_event = threading.Event()
+def _elapsed_logger_process(label: str, start_time: float, interval_sec: float, stop_event: multiprocessing.synchronize.Event):
+    while not stop_event.wait(interval_sec):
+        elapsed = time.perf_counter() - start_time
+        print(f"{time.strftime('%H:%M:%S')} [I] {label} still running after {elapsed:.1f} seconds.", flush=True)
+        sys.stdout.flush()
+
+
+def _start_elapsed_logger(
+    label: str, *, interval_sec: float = 60.0
+) -> tuple[multiprocessing.synchronize.Event, multiprocessing.Process]:
+    ctx = multiprocessing.get_context("spawn")
+    stop_event = ctx.Event()
     start_time = time.perf_counter()
+    process = ctx.Process(
+        target=_elapsed_logger_process,
+        args=(label, start_time, interval_sec, stop_event),
+        name=f"{label.replace(' ', '_')}_timer",
+        daemon=True,
+    )
+    process.start()
+    return stop_event, process
 
-    def _worker():
-        while not stop_event.wait(interval_sec):
-            logging.info("%s still running after %.1f seconds.", label, time.perf_counter() - start_time)
 
-    thread = threading.Thread(target=_worker, name=f"{label.replace(' ', '_')}_timer", daemon=True)
-    thread.start()
-    return stop_event, thread
+def _configure_jax_compilation_cache(config: _config.TrainConfig) -> None:
+    if config.jax_compilation_cache_dir is None:
+        logging.info("JAX persistent compilation cache disabled.")
+        return
+
+    cache_dir = epath.Path(config.jax_compilation_cache_dir).expanduser()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    jax.config.update("jax_compilation_cache_dir", str(cache_dir))
+    logging.info("JAX persistent compilation cache enabled at %s", cache_dir)
 
 
 @at.typecheck
@@ -318,7 +340,7 @@ def main(config: _config.TrainConfig):
             f"Batch size {config.batch_size} must be divisible by the number of devices {jax.device_count()}."
         )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    _configure_jax_compilation_cache(config)
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -398,7 +420,7 @@ def main(config: _config.TrainConfig):
                 info,
             )
             compile_log_stop.set()
-            compile_log_thread.join(timeout=0.1)
+            compile_log_thread.join(timeout=1.0)
             logging.info(
                 "First train step compile+execute finished in %.1f seconds.",
                 time.perf_counter() - compile_t0,
