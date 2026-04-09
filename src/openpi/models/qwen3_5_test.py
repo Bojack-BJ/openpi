@@ -1,6 +1,7 @@
 import jax
 
 import openpi.models.pi0_config as _pi0_config
+import openpi.models.qwen3_5.rotary as _qwen3_5_rotary
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
 
 
@@ -29,6 +30,11 @@ def test_qwen3_5_config_uses_official_hybrid_layout():
     assert config.linear_num_value_heads == 16
     assert config.vision_temporal_patch_size == 2
     assert config.vision_spatial_merge_size == 2
+
+
+def test_qwen3_5_resolves_mrope_sections_for_mixed_rotary_widths():
+    assert _qwen3_5_rotary.resolve_mrope_section(64, (11, 11, 10)) == (11, 11, 10)
+    assert _qwen3_5_rotary.resolve_mrope_section(32, (11, 11, 10)) == (6, 5, 5)
 
 
 def test_qwen3_5_jax_embed_image_shape():

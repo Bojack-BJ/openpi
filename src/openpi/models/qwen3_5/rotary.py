@@ -38,6 +38,22 @@ def default_mrope_section(rotary_head_dim: int) -> tuple[int, int, int]:
     return tuple(base + (1 if i < remainder else 0) for i in range(3))
 
 
+def resolve_mrope_section(
+    rotary_head_dim: int, mrope_section: tuple[int, int, int] | None = None
+) -> tuple[int, int, int]:
+    default_sections = default_mrope_section(rotary_head_dim)
+    if mrope_section is None:
+        return default_sections
+
+    # Qwen3.5 mixes full-attention and linear-attention blocks with different effective
+    # rotary widths. Keep an explicit config when it matches the active layer width, but
+    # fall back to a width-specific split when the configured tuple belongs to a different
+    # rotary geometry.
+    if sum(mrope_section) == rotary_head_dim // 2:
+        return mrope_section
+    return default_sections
+
+
 def apply_rotary_embedding(
     query: at.Array,
     key: at.Array,
@@ -56,12 +72,7 @@ def apply_rotary_embedding(
     if rot_dim == 0:
         return query, key
 
-    sections = mrope_section or default_mrope_section(rot_dim)
-    if sum(sections) != rot_dim // 2:
-        raise ValueError(
-            "Qwen3.5 mRoPE sections must sum to half the rotary dim: "
-            f"{sections} vs rotary_dim={rot_dim}"
-        )
+    sections = resolve_mrope_section(rot_dim, mrope_section)
 
     cos, sin = _compute_multimodal_cos_sin(positions, rotary_head_dim=rot_dim, theta=theta, sections=sections)
     return _apply_rope_partial(query, rot_dim=rot_dim, cos=cos, sin=sin), _apply_rope_partial(
@@ -106,6 +117,7 @@ __all__ = [
     "QWEN3_5_ROPE_THETA",
     "apply_rotary_embedding",
     "default_mrope_section",
+    "resolve_mrope_section",
     "repeat_kv",
     "repeat_text_positions",
     "rotary_dim",
