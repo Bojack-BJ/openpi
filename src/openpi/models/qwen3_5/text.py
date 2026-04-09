@@ -508,8 +508,14 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,
             name="embedder",
         )
+        block_cls = nn.remat(
+            DecoderLayer,
+            prevent_cse=False,
+            static_argnums=(5,),
+            policy=jax.checkpoint_policies.nothing_saveable,
+        )
         self.layers = tuple(
-            DecoderLayer(
+            block_cls(
                 configs=tuple(self.configs),
                 layer_type=layer_types[i],
                 rope_theta=self.rope_theta,
