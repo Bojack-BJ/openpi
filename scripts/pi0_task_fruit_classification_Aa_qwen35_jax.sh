@@ -7,12 +7,12 @@ conda activate pi0_suzhou
 REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=fruit_classification_Aa_qwen
+cfg=fruit_classification_Aa_qwen3_5_4B_400M
 
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp="fruit_classification_Aa_qwen_jax"
+exp="fruit_classification_Aa_qwen3_5_4B_400M"
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
 export HF_DATASETS_CACHE="/root/Users/.cache/"
