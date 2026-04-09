@@ -98,6 +98,7 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     if isinstance(loader, _weight_loaders.NoOpWeightLoader):
         return {}
 
+    logging.info("Loading initialization weights with loader: %s", loader)
     loaded_params = loader.load(params_shape)
 
     flat_expected = traverse_util.flatten_dict(params_shape)
@@ -194,7 +195,7 @@ def init_train_state(
         )
 
     train_state_shape = jax.eval_shape(init, init_rng)
-    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
+    state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=config.log_sharding)
 
     if resume:
         return train_state_shape, state_sharding

@@ -191,10 +191,12 @@ def _load_hf_safetensors_snapshot(
 
     if local_snapshot_path is not None:
         snapshot_dir = pathlib.Path(local_snapshot_path).expanduser().resolve()
+        logger.info("Loading HF safetensors from explicit local snapshot path: %s", snapshot_dir)
     else:
         model_path = pathlib.Path(model_id).expanduser()
         if model_path.exists():
             snapshot_dir = model_path.resolve()
+            logger.info("Loading HF safetensors from local model_id directory: %s", snapshot_dir)
         else:
             snapshot_dir = pathlib.Path(
                 snapshot_download(
@@ -203,6 +205,12 @@ def _load_hf_safetensors_snapshot(
                     cache_dir=str(download.get_cache_dir() / "huggingface"),
                     local_files_only=local_files_only,
                 )
+            )
+            logger.info(
+                "Loading HF safetensors via snapshot_download repo_id=%s local_files_only=%s snapshot_dir=%s",
+                model_id,
+                local_files_only,
+                snapshot_dir,
             )
 
     if not snapshot_dir.exists():

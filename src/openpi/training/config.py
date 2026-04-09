@@ -1019,6 +1019,8 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+    # If true, print per-parameter FSDP sharding decisions during initialization.
+    log_sharding: bool = False
 
     @property
     def assets_dirs(self) -> pathlib.Path:
