@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 
 import openpi.models.pi0_config as _pi0_config
+import openpi.models.qwen2_5.text as _qwen2_5_text
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
 
 
@@ -42,6 +43,11 @@ def test_qwen_jax_scaffold_text_forward_shapes():
     assert prefix_out.shape == prefix.shape
     assert suffix_out.shape == suffix.shape
     assert kv_cache is not None
+
+
+def test_qwen_jax_config_vocab_matches_text_module():
+    qwen_cfg = _vlm_backbone_config.get_config("qwen2_5_3b")
+    assert qwen_cfg.vocab_size == _qwen2_5_text.QWEN2_5_VL_VOCAB_SIZE
 
 
 def test_qwen_jax_scaffold_embed_image_and_multimodal_positions():

@@ -13,7 +13,7 @@ import openpi.shared.array_typing as at
 import openpi.training.sharding as sharding
 
 
-QWEN2_5_VL_VOCAB_SIZE = 152_064
+QWEN2_5_VL_VOCAB_SIZE = 151_936
 
 
 @at.typecheck

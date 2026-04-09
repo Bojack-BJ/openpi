@@ -111,6 +111,7 @@ def get_config(variant: Variant) -> Config:
             num_heads=28,
             num_kv_heads=4,
             head_dim=128,
+            vocab_size=151_936,
         )
     if variant == "qwen2_5_3b":
         return Config(
@@ -120,6 +121,7 @@ def get_config(variant: Variant) -> Config:
             num_heads=16,
             num_kv_heads=2,
             head_dim=128,
+            vocab_size=151_936,
         )
     if variant == "qwen3_5_2b":
         return Config(

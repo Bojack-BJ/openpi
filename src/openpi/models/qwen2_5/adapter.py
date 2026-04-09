@@ -42,6 +42,9 @@ class Qwen2_5_VLWithExpertModel(nnx.Module):
             _qwen_text.Module(
                 configs=[vlm_config, action_expert_config],
                 embed_dtype=precision,
+                vocab_size=vlm_config.vocab_size or _qwen_text.QWEN2_5_VL_VOCAB_SIZE,
+                rope_theta=vlm_config.rope_theta or _qwen_text.qwen_rotary.QWEN2_ROPE_THETA,
+                mrope_section=vlm_config.mrope_section,
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=use_adarms)
