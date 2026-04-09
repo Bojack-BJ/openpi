@@ -123,9 +123,9 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen2_5_7b_action_1b":
         return Config(
-            width=1280,
+            width=1536,
             depth=28,
-            mlp_dim=5120,
+            mlp_dim=6144,
             num_heads=28,
             num_kv_heads=4,
             head_dim=128,
@@ -143,9 +143,9 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen2_5_3b_action_700m":
         return Config(
-            width=960,
+            width=1024,
             depth=36,
-            mlp_dim=3840,
+            mlp_dim=4096,
             num_heads=16,
             num_kv_heads=2,
             head_dim=128,
@@ -153,9 +153,9 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen2_5_3b_action_400m":
         return Config(
-            width=640,
+            width=768,
             depth=36,
-            mlp_dim=2560,
+            mlp_dim=3072,
             num_heads=16,
             num_kv_heads=2,
             head_dim=128,
@@ -191,9 +191,9 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen3_5_2b_action_700m":
         return Config(
-            width=1536,
+            width=1280,
             depth=24,
-            mlp_dim=4608,
+            mlp_dim=5120,
             num_heads=8,
             num_kv_heads=2,
             head_dim=256,
@@ -219,7 +219,7 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen3_5_2b_action_400m":
         return Config(
-            width=1024,
+            width=768,
             depth=24,
             mlp_dim=3072,
             num_heads=8,
