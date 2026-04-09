@@ -1048,7 +1048,9 @@ class TrainConfig:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
-
+LOCAL_QWEN_2_5_3B = "/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"
+LOCAL_QWEN_3_5_2B = "/root/Users/lixiaotong/Qwen3.5-2B"
+LOCAL_QWEN_3_5_4B = "/root/Users/lixiaotong/Qwen3.5-4B"
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1609,7 +1611,6 @@ _CONFIGS = [
         batch_size = 32,
         num_workers = 32
         ),
-    
     TrainConfig(
         name="task_20251231O001_10d",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
@@ -1635,11 +1636,9 @@ _CONFIGS = [
         ),
     TrainConfig(
         name="fruit_classification_Aa_qwen",
-        # PyTorch-only Qwen fine-tuning config. The current Qwen adapter requires matching
-        # prefix/expert geometry, so use the 3B VL backbone together with a 3B action expert.
         model=pi0_config.Pi0Config(
             vlm_backend="qwen2_5_vl",
-            vlm_hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
             vlm_backbone_variant="qwen2_5_3b",
             action_expert_variant="qwen2_5_3b",
         ),
@@ -1650,22 +1649,18 @@ _CONFIGS = [
                 asset_id="fastumi/fruit_classification_Aa",
             ),
             base_config=DataConfig(
-                # local_files_only=True,  # Set to True for local-only datasets.
                 prompt_from_task=True,
             ),
         ),
-        # `train_pytorch.py` initializes Qwen weights from `vlm_hf_model_id`; JAX checkpoint
-        # loaders are not consumed on the PyTorch path.
-        weight_loader=weight_loaders.NoOpWeightLoader(),
-        num_train_steps=60_000,
-        # The freeze filter defines which parameters should be frozen during training.
-        # We have a convenience function in the model config that returns the default freeze filter
-        # for the given model config for LoRA finetuning. Just make sure it matches the model config
-        # Turn off EMA for LoRA finetuning.
-        ema_decay=None,
-        batch_size = 32,
-        num_workers = 32
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
         ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
     TrainConfig(
         name="fruit_classification_Aa_qwen3_5",
         model=pi0_config.Pi0Config(
@@ -2314,13 +2309,64 @@ _CONFIGS = [
         batch_size=2,
         model=pi0_config.Pi0Config(
             vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-4B",
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_1b",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-4B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-4B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_pretrained",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_4B_400M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-4B",
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-4B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-4B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_4B_400M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_2B_700M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
             vlm_hf_model_id="Qwen/Qwen3.5-2B",
             vlm_backbone_variant="qwen3_5_2b",
-            action_expert_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_700m",
         ),
         weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-2B"),
         overwrite=True,
-        exp_name="debug_qwen3_5_pretrained",
+        exp_name="debug_qwen3_5_2B_700M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_2B_400M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-2B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_2B_400M",
         num_train_steps=10,
         ema_decay=None,
         wandb_enabled=False,
@@ -2338,6 +2384,40 @@ _CONFIGS = [
         weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
         overwrite=True,
         exp_name="debug_qwen2_5_pretrained",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_3B_700M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-3B",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_700m",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
+        overwrite=True,
+        exp_name="debug_qwen2_5_3B_700M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_3B_400M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-3B",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
+        overwrite=True,
+        exp_name="debug_qwen2_5_3B_400M",
         num_train_steps=10,
         ema_decay=None,
         wandb_enabled=False,
