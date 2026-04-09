@@ -560,27 +560,27 @@ def _load_qwen3_5_vision_weights(
             flat_loaded,
             flat_ref,
             f"vision/encoder/blocks_{block_idx}/mlp/linear_fc1/kernel",
-            _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.fc1.weight"]),
+            _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.linear_fc1.weight"]),
         )
-        if f"{hf_prefix}mlp.fc1.bias" in hf_tensors:
+        if f"{hf_prefix}mlp.linear_fc1.bias" in hf_tensors:
             _store_loaded(
                 flat_loaded,
                 flat_ref,
                 f"vision/encoder/blocks_{block_idx}/mlp/linear_fc1/bias",
-                np.asarray(hf_tensors[f"{hf_prefix}mlp.fc1.bias"]),
+                np.asarray(hf_tensors[f"{hf_prefix}mlp.linear_fc1.bias"]),
             )
         _store_loaded(
             flat_loaded,
             flat_ref,
             f"vision/encoder/blocks_{block_idx}/mlp/linear_fc2/kernel",
-            _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.fc2.weight"]),
+            _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.linear_fc2.weight"]),
         )
-        if f"{hf_prefix}mlp.fc2.bias" in hf_tensors:
+        if f"{hf_prefix}mlp.linear_fc2.bias" in hf_tensors:
             _store_loaded(
                 flat_loaded,
                 flat_ref,
                 f"vision/encoder/blocks_{block_idx}/mlp/linear_fc2/bias",
-                np.asarray(hf_tensors[f"{hf_prefix}mlp.fc2.bias"]),
+                np.asarray(hf_tensors[f"{hf_prefix}mlp.linear_fc2.bias"]),
             )
 
     _store_loaded(
