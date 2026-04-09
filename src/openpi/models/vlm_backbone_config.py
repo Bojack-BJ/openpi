@@ -153,7 +153,7 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen2_5_3b_action_400m":
         return Config(
-            width=768,
+            width=1024,
             depth=36,
             mlp_dim=3072,
             num_heads=16,
@@ -219,7 +219,7 @@ def get_config(variant: Variant) -> Config:
         )
     if variant == "qwen3_5_2b_action_400m":
         return Config(
-            width=768,
+            width=1024,
             depth=24,
             mlp_dim=3072,
             num_heads=8,

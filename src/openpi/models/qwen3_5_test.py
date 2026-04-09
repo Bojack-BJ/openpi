@@ -104,7 +104,11 @@ def test_qwen3_5_small_action_expert_model_builds():
     flat_paths = ["/".join(str(part) for part in path) for path in flat_state]
 
     assert any("action_in_proj/kernel" in path for path in flat_paths)
-    assert any("vlm_with_expert/llm/layers_0/pre_attention_norm_1" in path for path in flat_paths)
+    assert any(
+        "vlm_with_expert/llm/layers/0/layers_0/pre_attention_norm_1" in path
+        or "vlm_with_expert/llm/layers_0/pre_attention_norm_1" in path
+        for path in flat_paths
+    )
 
 
 def test_qwen3_5_resolves_mrope_sections_for_mixed_rotary_widths():
@@ -145,8 +149,28 @@ def test_qwen3_5_text_param_layout_matches_current_official_key_assumptions():
     flat_state = nnx.state(abstract_model, nnx.Param).flat_state()
     flat_paths = ["/".join(str(part) for part in path) for path in flat_state]
 
-    assert any("vlm_with_expert/llm/layers_3/self_attn/qg_einsum" in path for path in flat_paths)
-    assert not any("vlm_with_expert/llm/layers_3/self_attn/q_einsum" in path for path in flat_paths)
-    assert any("vlm_with_expert/llm/layers_0/self_attn/norm" in path for path in flat_paths)
-    assert not any("vlm_with_expert/llm/layers_0/self_attn/q_norm" in path for path in flat_paths)
-    assert not any("vlm_with_expert/llm/layers_0/self_attn/k_norm" in path for path in flat_paths)
+    assert any(
+        "vlm_with_expert/llm/layers/0/layers_3/self_attn/qg_einsum" in path
+        or "vlm_with_expert/llm/layers_3/self_attn/qg_einsum" in path
+        for path in flat_paths
+    )
+    assert not any(
+        "vlm_with_expert/llm/layers/0/layers_3/self_attn/q_einsum" in path
+        or "vlm_with_expert/llm/layers_3/self_attn/q_einsum" in path
+        for path in flat_paths
+    )
+    assert any(
+        "vlm_with_expert/llm/layers/0/layers_0/self_attn/norm" in path
+        or "vlm_with_expert/llm/layers_0/self_attn/norm" in path
+        for path in flat_paths
+    )
+    assert not any(
+        "vlm_with_expert/llm/layers/0/layers_0/self_attn/q_norm" in path
+        or "vlm_with_expert/llm/layers_0/self_attn/q_norm" in path
+        for path in flat_paths
+    )
+    assert not any(
+        "vlm_with_expert/llm/layers/0/layers_0/self_attn/k_norm" in path
+        or "vlm_with_expert/llm/layers_0/self_attn/k_norm" in path
+        for path in flat_paths
+    )

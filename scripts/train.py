@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import platform
+import threading
 import time
 from collections import Counter
 from typing import Any
@@ -180,6 +181,19 @@ def _summarize_param_tree(params: at.PyTree) -> str:
 
     dtype_summary = ", ".join(f"{dtype}:{count}" for dtype, count in sorted(dtype_counts.items()))
     return f"tensor_count={tensor_count}, total_elements={total_elements:,}, dtypes=[{dtype_summary}]"
+
+
+def _start_elapsed_logger(label: str, *, interval_sec: float = 60.0) -> tuple[threading.Event, threading.Thread]:
+    stop_event = threading.Event()
+    start_time = time.perf_counter()
+
+    def _worker():
+        while not stop_event.wait(interval_sec):
+            logging.info("%s still running after %.1f seconds.", label, time.perf_counter() - start_time)
+
+    thread = threading.Thread(target=_worker, name=f"{label.replace(' ', '_')}_timer", daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 @at.typecheck
@@ -370,6 +384,10 @@ def main(config: _config.TrainConfig):
                 "First train step started: compiling train_step JIT for current model/sharding (this may take minutes)."
             )
             compile_t0 = time.perf_counter()
+            compile_log_stop, compile_log_thread = _start_elapsed_logger(
+                "First train step compile+execute",
+                interval_sec=60.0,
+            )
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         if is_first_step:
@@ -379,6 +397,8 @@ def main(config: _config.TrainConfig):
                 lambda x: x.block_until_ready() if hasattr(x, "block_until_ready") else x,
                 info,
             )
+            compile_log_stop.set()
+            compile_log_thread.join(timeout=0.1)
             logging.info(
                 "First train step compile+execute finished in %.1f seconds.",
                 time.perf_counter() - compile_t0,

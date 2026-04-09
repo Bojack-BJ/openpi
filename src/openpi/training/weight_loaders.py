@@ -323,6 +323,21 @@ def _load_qwen3_5_text_weights(
     *,
     branch_suffixes: tuple[str, ...] = ("", "_1"),
 ):
+    layer_prefixes: dict[int, str] = {}
+    for key in flat_ref:
+        match = re.search(r"llm/layers_(\d+)/", key)
+        if match is not None:
+            layer_idx = int(match.group(1))
+            layer_prefixes.setdefault(layer_idx, f"llm/layers_{layer_idx}")
+            continue
+
+        match = re.search(r"llm/layers/(\d+)/layers_(\d+)/", key)
+        if match is not None:
+            group_idx = int(match.group(1))
+            local_idx = int(match.group(2))
+            layer_idx = group_idx * 4 + local_idx
+            layer_prefixes.setdefault(layer_idx, f"llm/layers/{group_idx}/layers_{local_idx}")
+
     _store_loaded(
         flat_loaded,
         flat_ref,
@@ -344,15 +359,11 @@ def _load_qwen3_5_text_weights(
         )
 
     layer_indices = sorted(
-        {
-            int(match.group(1))
-            for key in flat_ref
-            for match in [re.search(r"llm/layers_(\d+)/", key)]
-            if match is not None
-        }
+        layer_prefixes
     )
 
     for layer_idx in layer_indices:
+        target_prefix = layer_prefixes[layer_idx]
         hf_prefix = f"model.language_model.layers.{layer_idx}."
         input_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}input_layernorm.weight"])
         post_attn_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}post_attention_layernorm.weight"])
@@ -360,40 +371,40 @@ def _load_qwen3_5_text_weights(
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/pre_attention_norm{branch_suffix}/scale",
+                f"{target_prefix}/pre_attention_norm{branch_suffix}/scale",
                 input_norm,
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/pre_ffw_norm{branch_suffix}/scale",
+                f"{target_prefix}/pre_ffw_norm{branch_suffix}/scale",
                 post_attn_norm,
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/mlp{branch_suffix}/gate_proj/w",
+                f"{target_prefix}/mlp{branch_suffix}/gate_proj/w",
                 _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.gate_proj.weight"]),
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/mlp{branch_suffix}/up_proj/w",
+                f"{target_prefix}/mlp{branch_suffix}/up_proj/w",
                 _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.up_proj.weight"]),
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/mlp{branch_suffix}/down_proj/w",
+                f"{target_prefix}/mlp{branch_suffix}/down_proj/w",
                 _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.down_proj.weight"]),
             )
 
-        has_linear = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/in_proj_qkv/w") for key in flat_ref)
-        has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/qg_einsum/w") for key in flat_ref)
+        has_linear = f"{target_prefix}/self_attn/in_proj_qkv/w" in flat_ref
+        has_full = f"{target_prefix}/self_attn/qg_einsum/w" in flat_ref
 
         if has_full:
             for branch_suffix in branch_suffixes:
-                qg_suffix = f"llm/layers_{layer_idx}/self_attn/qg_einsum{branch_suffix}/w"
+                qg_suffix = f"{target_prefix}/self_attn/qg_einsum{branch_suffix}/w"
                 _, qg_shape = _target_shape(flat_ref, qg_suffix)
                 _store_loaded(
                     flat_loaded,
@@ -406,7 +417,7 @@ def _load_qwen3_5_text_weights(
                     ("v_einsum", "self_attn.v_proj.weight"),
                 )
                 for target_name, hf_name in head_suffixes:
-                    target_suffix = f"llm/layers_{layer_idx}/self_attn/{target_name}{branch_suffix}/w"
+                    target_suffix = f"{target_prefix}/self_attn/{target_name}{branch_suffix}/w"
                     _, target_shape = _target_shape(flat_ref, target_suffix)
                     _store_loaded(
                         flat_loaded,
@@ -414,7 +425,7 @@ def _load_qwen3_5_text_weights(
                         target_suffix,
                         _full_attention_head_kernel(hf_tensors[f"{hf_prefix}{hf_name}"], target_shape),
                     )
-                o_suffix = f"llm/layers_{layer_idx}/self_attn/o_einsum{branch_suffix}/w"
+                o_suffix = f"{target_prefix}/self_attn/o_einsum{branch_suffix}/w"
                 _, o_shape = _target_shape(flat_ref, o_suffix)
                 _store_loaded(
                     flat_loaded,
@@ -425,13 +436,13 @@ def _load_qwen3_5_text_weights(
                 _store_loaded(
                     flat_loaded,
                     flat_ref,
-                    f"llm/layers_{layer_idx}/self_attn/q_norm{branch_suffix}/scale",
+                    f"{target_prefix}/self_attn/q_norm{branch_suffix}/scale",
                     _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}self_attn.q_norm.weight"]),
                 )
                 _store_loaded(
                     flat_loaded,
                     flat_ref,
-                    f"llm/layers_{layer_idx}/self_attn/k_norm{branch_suffix}/scale",
+                    f"{target_prefix}/self_attn/k_norm{branch_suffix}/scale",
                     _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}self_attn.k_norm.weight"]),
                 )
         elif has_linear:
@@ -444,7 +455,7 @@ def _load_qwen3_5_text_weights(
             )
             for branch_suffix in branch_suffixes:
                 for target_name, hf_name in branch_linear_weights:
-                    target_suffix = f"llm/layers_{layer_idx}/self_attn/{target_name}{branch_suffix}/w"
+                    target_suffix = f"{target_prefix}/self_attn/{target_name}{branch_suffix}/w"
                     target_key, target_shape = _target_shape(flat_ref, target_suffix)
                     value = hf_tensors[f"{hf_prefix}{hf_name}"]
                     if target_name == "out_proj":
@@ -460,25 +471,25 @@ def _load_qwen3_5_text_weights(
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/short_conv/kernel",
+                f"{target_prefix}/self_attn/short_conv/kernel",
                 _conv1d_depthwise_to_kernel(hf_tensors[f"{hf_prefix}linear_attn.conv1d.weight"]),
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/norm/scale",
+                f"{target_prefix}/self_attn/norm/scale",
                 _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.norm.weight"]),
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/A_log",
+                f"{target_prefix}/self_attn/A_log",
                 np.asarray(hf_tensors[f"{hf_prefix}linear_attn.A_log"]),
             )
             _store_loaded(
                 flat_loaded,
                 flat_ref,
-                f"llm/layers_{layer_idx}/self_attn/dt_bias",
+                f"{target_prefix}/self_attn/dt_bias",
                 np.asarray(hf_tensors[f"{hf_prefix}linear_attn.dt_bias"]),
             )
         else:

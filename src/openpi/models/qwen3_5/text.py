@@ -483,7 +483,43 @@ class DecoderLayer(nn.Module):
         return xs, kv_cache
 
 
-KVCache: TypeAlias = tuple[LayerCache, ...]
+GroupCache: TypeAlias = tuple[LayerCache, LayerCache, LayerCache, LayerCache]
+
+
+@at.typecheck
+class DecoderLayerGroup(nn.Module):
+    configs: tuple[Config, ...]
+    layer_types: tuple[str, str, str, str]
+    rope_theta: float = qwen_rotary.QWEN3_5_ROPE_THETA
+    partial_rotary_factor: float = qwen_rotary.QWEN3_5_DEFAULT_PARTIAL_ROTARY_FACTOR
+    mrope_section: tuple[int, int, int] | None = None
+
+    def setup(self):
+        self.layers = tuple(
+            DecoderLayer(
+                configs=self.configs,
+                layer_type=layer_type,
+                rope_theta=self.rope_theta,
+                partial_rotary_factor=self.partial_rotary_factor,
+                mrope_section=self.mrope_section,
+                name=f"layers_{i}",
+            )
+            for i, layer_type in enumerate(self.layer_types)
+        )
+
+    @at.typecheck
+    def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
+        if kv_cache is None:
+            kv_cache = tuple(None for _ in self.layers)
+
+        next_cache = []
+        for layer, layer_cache in zip(self.layers, kv_cache, strict=True):
+            xs, layer_cache = layer(xs, layer_cache, positions, attn_mask, adarms_cond, deterministic)
+            next_cache.append(layer_cache)
+        return xs, tuple(next_cache)
+
+
+KVCache: TypeAlias = Any
 
 
 @at.typecheck
@@ -502,6 +538,13 @@ class Module(nn.Module):
             raise ValueError("Qwen3.5 text module requires explicit `layer_types` in the backbone config.")
         if len(layer_types) != self.configs[0].depth:
             raise ValueError(f"Qwen3.5 layer_types length {len(layer_types)} does not match depth {self.configs[0].depth}")
+        if self.configs[0].depth % 4 != 0:
+            raise ValueError(f"Qwen3.5 depth {self.configs[0].depth} must be divisible by the 4-layer hybrid pattern.")
+
+        layer_group_types = tuple(layer_types[:4])
+        for start in range(0, self.configs[0].depth, 4):
+            if tuple(layer_types[start : start + 4]) != layer_group_types:
+                raise ValueError("Qwen3.5 text module currently requires a repeated 4-layer hybrid pattern.")
 
         self.embedder = Embedder(
             vocab_size=self.vocab_size,
@@ -509,21 +552,23 @@ class Module(nn.Module):
             name="embedder",
         )
         block_cls = nn.remat(
-            DecoderLayer,
+            DecoderLayerGroup,
             prevent_cse=False,
             static_argnums=(5,),
             policy=jax.checkpoint_policies.nothing_saveable,
         )
-        self.layers = tuple(
-            block_cls(
-                configs=tuple(self.configs),
-                layer_type=layer_types[i],
-                rope_theta=self.rope_theta,
-                partial_rotary_factor=self.partial_rotary_factor,
-                mrope_section=self.mrope_section,
-                name=f"layers_{i}",
-            )
-            for i in range(self.configs[0].depth)
+        self.layers = nn.scan(
+            block_cls,
+            variable_axes={"params": 0},
+            split_rngs={"params": True},
+            in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast, nn.broadcast),
+            length=self.configs[0].depth // 4,
+        )(
+            configs=tuple(self.configs),
+            layer_types=layer_group_types,
+            rope_theta=self.rope_theta,
+            partial_rotary_factor=self.partial_rotary_factor,
+            mrope_section=self.mrope_section,
         )
         self.final_norms = tuple(RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs)))
 
@@ -547,15 +592,8 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        xs = list(embedded)
-        next_cache = []
-        if kv_cache is None:
-            kv_cache = tuple(None for _ in self.layers)
-        for layer, layer_cache in zip(self.layers, kv_cache, strict=True):
-            xs, layer_cache = layer(xs, layer_cache, positions, mask, adarms_cond, deterministic)
-            next_cache.append(layer_cache)
-
-        return [f(e) if e is not None else e for f, e in zip(self.final_norms, xs, strict=True)], tuple(next_cache)
+        xs, kv_cache = self.layers(list(embedded), kv_cache, positions, mask, adarms_cond, deterministic)
+        return [f(e) if e is not None else e for f, e in zip(self.final_norms, xs, strict=True)], kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         if any(use_adarms):
