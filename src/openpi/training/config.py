@@ -1662,12 +1662,12 @@ _CONFIGS = [
         num_workers=32,
     ),
     TrainConfig(
-        name="fruit_classification_Aa_qwen3_5",
+        name="fruit_classification_Aa_qwen3_5_4B_400M",
         model=pi0_config.Pi0Config(
             vlm_backend="qwen3_5_vl",
-            vlm_hf_model_id="Qwen/Qwen3.5-2B",
-            vlm_backbone_variant="qwen3_5_2b",
-            action_expert_variant="qwen3_5_2b",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_4B,
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_400m",
         ),
         data=FastUMIdualData14DRPYConfig(
             repo_id="fastumi/fruit_classification_Aa",
@@ -1679,11 +1679,11 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
-        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B"),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_4B, local_files_only=True),
         num_train_steps=60_000,
         ema_decay=None,
-        batch_size=16,
-        num_workers=16,
+        batch_size=32,
+        num_workers=32,
     ),
     TrainConfig(
         name="fruit_classification_Aa_torch",
