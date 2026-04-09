@@ -2315,6 +2315,7 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_qwen3_5_pretrained",
         num_train_steps=10,
+        ema_decay=None,
         wandb_enabled=False,
     ),
     TrainConfig(
@@ -2331,6 +2332,7 @@ _CONFIGS = [
         overwrite=True,
         exp_name="debug_qwen2_5_pretrained",
         num_train_steps=10,
+        ema_decay=None,
         wandb_enabled=False,
     ),
     TrainConfig(

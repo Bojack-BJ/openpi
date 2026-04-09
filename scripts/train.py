@@ -142,6 +142,13 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     return traverse_util.unflatten_dict(matched)
 
 
+def _select_matching_tree(reference_tree: at.PyTree, subset_tree: at.PyTree) -> at.PyTree:
+    """Selects the subtree from `reference_tree` with the same leaves as `subset_tree`."""
+    flat_reference = traverse_util.flatten_dict(reference_tree)
+    flat_subset = traverse_util.flatten_dict(subset_tree)
+    return traverse_util.unflatten_dict({key: flat_reference[key] for key in flat_subset})
+
+
 def _to_wandb_image_uint8(image: np.ndarray) -> np.ndarray:
     image = np.asarray(image)
     if image.dtype == np.uint8:
@@ -194,12 +201,15 @@ def init_train_state(
 
     partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    param_sharding = state_sharding.params.to_pure_dict()
+    partial_param_sharding = _select_matching_tree(param_sharding, partial_params)
+    partial_params = jax.device_put(partial_params, partial_param_sharding)
 
     # Initialize the train state and mix in the partial params.
     train_state = jax.jit(
         init,
         donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
+        in_shardings=(replicated_sharding, partial_param_sharding),
         out_shardings=state_sharding,
     )(init_rng, partial_params)
 
