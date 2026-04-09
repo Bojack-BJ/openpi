@@ -85,10 +85,10 @@ class PaliGemmaWeightLoader(WeightLoader):
 
 @dataclasses.dataclass(frozen=True)
 class Qwen3_5WeightLoader(WeightLoader):
-    """Loads weights from an official Hugging Face Qwen3.5 checkpoint.
+    """Loads weights from a Hugging Face Qwen3.5 checkpoint.
 
-    This loader targets the JAX `qwen3_5_vl` runtime path. It maps official language-model
-    and vision-model tensors into the OpenPI parameter tree, including the duplicated prefix/expert
+    This loader targets the JAX `qwen3_5_vl` runtime path and maps official language-model and
+    vision-model tensors into the OpenPI parameter tree, including the duplicated prefix/expert
     text branches used by `Pi0`.
     """
 
@@ -278,14 +278,6 @@ def _hf_norm_to_rms_scale(weight: np.ndarray) -> np.ndarray:
     return np.asarray(weight) - 1.0
 
 
-def _full_attention_qg_kernel(q_weight: np.ndarray, g_weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
-    num_heads, input_width, doubled_head_dim = expected_shape
-    head_dim = doubled_head_dim // 2
-    q_kernel = _dense_to_kernel(q_weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
-    g_kernel = _dense_to_kernel(g_weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
-    return np.concatenate([q_kernel, g_kernel], axis=-1)
-
-
 def _full_attention_head_kernel(weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
     num_heads, input_width, head_dim = expected_shape
     return _dense_to_kernel(weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
@@ -373,21 +365,17 @@ def _load_qwen3_5_text_weights(
             )
 
         has_linear = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/in_proj_qkv/w") for key in flat_ref)
-        has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/qg_einsum/w") for key in flat_ref)
+        has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/q_einsum/w") for key in flat_ref)
 
         if has_full:
             for branch_suffix in ("", "_1"):
-                qg_suffix = f"llm/layers_{layer_idx}/self_attn/qg_einsum{branch_suffix}/w"
-                _, qg_shape = _target_shape(flat_ref, qg_suffix)
+                q_suffix = f"llm/layers_{layer_idx}/self_attn/q_einsum{branch_suffix}/w"
+                _, q_shape = _target_shape(flat_ref, q_suffix)
                 _store_loaded(
                     flat_loaded,
                     flat_ref,
-                    qg_suffix,
-                    _full_attention_qg_kernel(
-                        hf_tensors[f"{hf_prefix}self_attn.q_proj.weight"],
-                        hf_tensors[f"{hf_prefix}self_attn.g_proj.weight"],
-                        qg_shape,
-                    ),
+                    q_suffix,
+                    _full_attention_head_kernel(hf_tensors[f"{hf_prefix}self_attn.q_proj.weight"], q_shape),
                 )
                 head_suffixes = (
                     ("k_einsum", "self_attn.k_proj.weight"),
@@ -451,57 +439,12 @@ def _load_qwen3_5_text_weights(
                 f"llm/layers_{layer_idx}/self_attn/short_conv/kernel",
                 _conv1d_depthwise_to_kernel(hf_tensors[f"{hf_prefix}linear_attn.conv1d.weight"]),
             )
-            q_norm_key = _first_present_or_none(
-                hf_tensors,
-                [
-                    f"{hf_prefix}linear_attn.q_norm.weight",
-                    f"{hf_prefix}linear_attn.q_norm.scale",
-                ],
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers_{layer_idx}/self_attn/norm/scale",
+                _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}linear_attn.norm.weight"]),
             )
-            k_norm_key = _first_present_or_none(
-                hf_tensors,
-                [
-                    f"{hf_prefix}linear_attn.k_norm.weight",
-                    f"{hf_prefix}linear_attn.k_norm.scale",
-                ],
-            )
-            norm_key = _first_present_or_none(
-                hf_tensors,
-                [
-                    f"{hf_prefix}linear_attn.norm.weight",
-                    f"{hf_prefix}linear_attn.norm.scale",
-                ],
-            )
-            if q_norm_key is not None:
-                _store_loaded(
-                    flat_loaded,
-                    flat_ref,
-                    f"llm/layers_{layer_idx}/self_attn/q_norm/scale",
-                    _hf_norm_to_rms_scale(hf_tensors[q_norm_key]),
-                )
-            if k_norm_key is not None:
-                _store_loaded(
-                    flat_loaded,
-                    flat_ref,
-                    f"llm/layers_{layer_idx}/self_attn/k_norm/scale",
-                    _hf_norm_to_rms_scale(hf_tensors[k_norm_key]),
-                )
-            if norm_key is not None:
-                _store_loaded(
-                    flat_loaded,
-                    flat_ref,
-                    f"llm/layers_{layer_idx}/self_attn/norm/scale",
-                    _hf_norm_to_rms_scale(hf_tensors[norm_key]),
-                )
-            if q_norm_key is None or k_norm_key is None or norm_key is None:
-                logger.warning(
-                    "Qwen3.5 layer %s missing linear-attention norm weights "
-                    "(q_norm=%s, k_norm=%s, norm=%s). Using initialized defaults for missing tensors.",
-                    layer_idx,
-                    q_norm_key is not None,
-                    k_norm_key is not None,
-                    norm_key is not None,
-                )
             _store_loaded(
                 flat_loaded,
                 flat_ref,

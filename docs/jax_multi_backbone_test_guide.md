@@ -40,12 +40,13 @@ This note summarizes how to test the current JAX `Pi0` runtime after the multi-b
   - `GatedAttention` full-attention blocks
   - a causal sequence mask in `Pi0` for the `qwen3_5_vl` backend
 - It now also includes:
-  - an HF-backed `Qwen3_5WeightLoader` for official checkpoint initialization
+  - a `Qwen3_5WeightLoader` aligned to the current official HF text-tree assumptions
 
 In other words:
 
 - `qwen2_5_vl` is the more mature JAX multimodal runtime path today
-- `qwen3_5_vl` now exercises a much more faithful official 3.5 text + vision architecture, but still needs runtime validation against real Hugging Face checkpoints in your environment
+- `qwen3_5_vl` now exercises a much more faithful official 3.5 text + vision architecture
+- `qwen3_5_vl` now targets the official HF Qwen3.5 checkpoint tree more directly, but still needs runtime validation in your environment
 
 ## Prerequisites
 
@@ -174,7 +175,7 @@ PY
 Interpretation:
 
 - if this passes, it means the JAX `Qwen3.5` hybrid text + vision backbone is wired into `Pi0`
-- it still does **not** guarantee Hugging Face checkpoint parity until you validate the loader path on your machine
+- it still does **not** by itself guarantee full end-to-end checkpointed training parity
 
 ## 3. Tiny Training Smoke
 
@@ -269,11 +270,11 @@ Expected success criteria:
 This should be interpreted as:
 
 - a trainer/runtime test for the official-style `Qwen3.5` text + vision backbone
-- not a final pretrained-parity test until you run it with official checkpoint initialization
+- not by itself a pretrained-quality validation path
 
 ### Qwen3.5 pretrained tiny training smoke
 
-The repo now includes a named config that also validates the official Hugging Face loader path:
+The repo includes a named config for the official loader path:
 
 ```bash
 python scripts/train.py debug_qwen3_5_pretrained --overwrite --no-wandb-enabled
@@ -292,6 +293,12 @@ You can also bypass Hugging Face cache layout and load from a direct local direc
 - `weight_loader=Qwen3_5WeightLoader("Qwen/Qwen3.5-2B", local_snapshot_path="/path/to/local/qwen3.5-2b")`
 
 The directory must contain one or more `.safetensors` files (recursively).
+
+Current expectation:
+
+- this path should exercise the HF checkpoint loader against the current JAX `qwen3_5_vl` text + vision tree
+- treat it as a real compatibility smoke, not just a structural fake-data run
+- successful execution still needs to be validated in your own JAX runtime
 
 ## 4. Real-Geometry Qwen Training Smoke
 
@@ -322,7 +329,7 @@ Expected success criteria:
 
 ### Qwen3.5 real-geometry smoke
 
-The repo now also includes a named JAX config that wires official Qwen3.5 initialization into a real dataset config:
+The repo now also includes a named JAX config for real-geometry structural testing:
 
 ```bash
 python scripts/train.py \
@@ -337,7 +344,7 @@ Important notes:
 
 - this config uses `vlm_backend="qwen3_5_vl"`
 - it initializes from `Qwen/Qwen3.5-2B` through `Qwen3_5WeightLoader`
-- you must have both Hugging Face checkpoint access and the dataset/assets required by `fruit_classification_Aa_qwen3_5`
+- you must have the dataset/assets required by `fruit_classification_Aa_qwen3_5`
 - this is the most meaningful current end-to-end Qwen3.5 JAX validation path in the repo
 
 ## 5. Recommended Test Order
@@ -392,6 +399,6 @@ Current JAX Qwen limitations:
 
 Current `qwen3_5_vl` limitations:
 
-- official checkpoint loading is newly wired, but still needs end-to-end validation in your JAX runtime
+- official checkpoint loading is newly realigned to the current HF text-tree assumptions and still needs end-to-end runtime validation
 - the current implementation is designed for image-only Pi0 usage, not full video/multiframe Qwen3.5-VL parity
 - should be treated as a strong JAX Qwen3.5 migration milestone rather than a finished HF parity claim until full checkpointed training/inference runs pass

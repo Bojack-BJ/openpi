@@ -1,3 +1,4 @@
+import flax.nnx as nnx
 import jax
 
 import openpi.models.pi0_config as _pi0_config
@@ -62,3 +63,16 @@ def test_qwen3_5_jax_embed_prefix_and_positions():
     assert positions.shape == (3, 2, prefix_mask.shape[1])
     assert prefix_layout.image_token_lengths
     assert bool(jax.numpy.all(prefix_ar_mask))
+
+
+def test_qwen3_5_text_param_layout_matches_current_official_key_assumptions():
+    config = _make_qwen3_5_config()
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    flat_state = nnx.state(abstract_model, nnx.Param).flat_state()
+    flat_paths = ["/".join(str(part) for part in path) for path in flat_state]
+
+    assert any("vlm_with_expert/llm/layers_3/self_attn/q_einsum" in path for path in flat_paths)
+    assert not any("vlm_with_expert/llm/layers_3/self_attn/qg_einsum" in path for path in flat_paths)
+    assert any("vlm_with_expert/llm/layers_0/self_attn/norm" in path for path in flat_paths)
+    assert not any("vlm_with_expert/llm/layers_0/self_attn/q_norm" in path for path in flat_paths)
+    assert not any("vlm_with_expert/llm/layers_0/self_attn/k_norm" in path for path in flat_paths)
