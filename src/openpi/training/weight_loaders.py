@@ -88,8 +88,8 @@ class Qwen3_5WeightLoader(WeightLoader):
     """Loads weights from a Hugging Face Qwen3.5 checkpoint.
 
     This loader targets the JAX `qwen3_5_vl` runtime path and maps official language-model and
-    vision-model tensors into the OpenPI parameter tree, including the duplicated prefix/expert
-    text branches used by `Pi0`.
+    vision-model tensors into the OpenPI parameter tree. By default it initializes only the VLM
+    branch; the action expert remains randomly initialized unless `load_action_expert=True`.
     """
 
     # Hugging Face repo id (for example "Qwen/Qwen3.5-2B") or an absolute/local
@@ -99,6 +99,9 @@ class Qwen3_5WeightLoader(WeightLoader):
     # `model_id` and read safetensors directly from this directory.
     local_snapshot_path: str | None = None
     local_files_only: bool = False
+    # By default only initialize the VLM branch from HF weights. The action expert remains
+    # randomly initialized, matching the original OpenPI PaliGemma pattern.
+    load_action_expert: bool = False
 
     def load(self, params: at.Params) -> at.Params:
         flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
@@ -109,7 +112,12 @@ class Qwen3_5WeightLoader(WeightLoader):
         )
 
         flat_loaded: dict[str, np.ndarray] = {}
-        _load_qwen3_5_text_weights(flat_loaded, flat_ref, hf_tensors)
+        _load_qwen3_5_text_weights(
+            flat_loaded,
+            flat_ref,
+            hf_tensors,
+            branch_suffixes=("", "_1") if self.load_action_expert else ("",),
+        )
         _load_qwen3_5_vision_weights(flat_loaded, flat_ref, hf_tensors)
 
         loaded_params = flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
@@ -122,12 +130,14 @@ class Qwen2_5WeightLoader(WeightLoader):
 
     This loader maps Qwen2.5 language-model tensors into the JAX `qwen2_5_vl` text stack.
     The current JAX Qwen2.5 vision stack is a pragmatic SigLIP-based path, so official HF
-    visual tensors are intentionally not loaded here.
+    visual tensors are intentionally not loaded here. By default it initializes only the VLM
+    branch; the action expert remains randomly initialized unless `load_action_expert=True`.
     """
 
     model_id: str
     local_snapshot_path: str | None = None
     local_files_only: bool = False
+    load_action_expert: bool = False
 
     def load(self, params: at.Params) -> at.Params:
         flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
@@ -138,7 +148,12 @@ class Qwen2_5WeightLoader(WeightLoader):
         )
 
         flat_loaded: dict[str, np.ndarray] = {}
-        _load_qwen2_5_text_weights(flat_loaded, flat_ref, hf_tensors)
+        _load_qwen2_5_text_weights(
+            flat_loaded,
+            flat_ref,
+            hf_tensors,
+            branch_suffixes=("", "_1") if self.load_action_expert else ("",),
+        )
 
         loaded_params = flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
@@ -305,6 +320,8 @@ def _load_qwen3_5_text_weights(
     flat_loaded: dict[str, np.ndarray],
     flat_ref: dict[str, at.Array],
     hf_tensors: dict[str, np.ndarray],
+    *,
+    branch_suffixes: tuple[str, ...] = ("", "_1"),
 ):
     _store_loaded(
         flat_loaded,
@@ -318,12 +335,13 @@ def _load_qwen3_5_text_weights(
         "llm/final_norm/scale",
         _hf_norm_to_rms_scale(hf_tensors["model.language_model.norm.weight"]),
     )
-    _store_loaded(
-        flat_loaded,
-        flat_ref,
-        "llm/final_norm_1/scale",
-        _hf_norm_to_rms_scale(hf_tensors["model.language_model.norm.weight"]),
-    )
+    if "_1" in branch_suffixes:
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            "llm/final_norm_1/scale",
+            _hf_norm_to_rms_scale(hf_tensors["model.language_model.norm.weight"]),
+        )
 
     layer_indices = sorted(
         {
@@ -338,7 +356,7 @@ def _load_qwen3_5_text_weights(
         hf_prefix = f"model.language_model.layers.{layer_idx}."
         input_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}input_layernorm.weight"])
         post_attn_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}post_attention_layernorm.weight"])
-        for branch_suffix in ("", "_1"):
+        for branch_suffix in branch_suffixes:
             _store_loaded(
                 flat_loaded,
                 flat_ref,
@@ -374,7 +392,7 @@ def _load_qwen3_5_text_weights(
         has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/qg_einsum/w") for key in flat_ref)
 
         if has_full:
-            for branch_suffix in ("", "_1"):
+            for branch_suffix in branch_suffixes:
                 qg_suffix = f"llm/layers_{layer_idx}/self_attn/qg_einsum{branch_suffix}/w"
                 _, qg_shape = _target_shape(flat_ref, qg_suffix)
                 _store_loaded(
@@ -424,7 +442,7 @@ def _load_qwen3_5_text_weights(
                 ("in_proj_a", "linear_attn.in_proj_a.weight"),
                 ("out_proj", "linear_attn.out_proj.weight"),
             )
-            for branch_suffix in ("", "_1"):
+            for branch_suffix in branch_suffixes:
                 for target_name, hf_name in branch_linear_weights:
                     target_suffix = f"llm/layers_{layer_idx}/self_attn/{target_name}{branch_suffix}/w"
                     target_key, target_shape = _target_shape(flat_ref, target_suffix)
@@ -642,6 +660,8 @@ def _load_qwen2_5_text_weights(
     flat_loaded: dict[str, np.ndarray],
     flat_ref: dict[str, at.Array],
     hf_tensors: dict[str, np.ndarray],
+    *,
+    branch_suffixes: tuple[str, ...] = ("", "_1"),
 ):
     embed_key = _first_present(
         hf_tensors,
@@ -669,12 +689,13 @@ def _load_qwen2_5_text_weights(
         "llm/final_norm/scale",
         _hf_norm_to_rms_scale(hf_tensors[final_norm_key]),
     )
-    _store_loaded(
-        flat_loaded,
-        flat_ref,
-        "llm/final_norm_1/scale",
-        _hf_norm_to_rms_scale(hf_tensors[final_norm_key]),
-    )
+    if "_1" in branch_suffixes:
+        _store_loaded(
+            flat_loaded,
+            flat_ref,
+            "llm/final_norm_1/scale",
+            _hf_norm_to_rms_scale(hf_tensors[final_norm_key]),
+        )
 
     if any(key.startswith("model.layers.") for key in hf_tensors):
         layer_prefix_root = "model.layers"
@@ -697,7 +718,7 @@ def _load_qwen2_5_text_weights(
         input_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}input_layernorm.weight"])
         post_attn_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}post_attention_layernorm.weight"])
 
-        for branch_suffix in ("", "_1"):
+        for branch_suffix in branch_suffixes:
             _store_loaded(
                 flat_loaded,
                 flat_ref,

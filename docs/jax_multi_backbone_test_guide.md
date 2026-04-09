@@ -299,6 +299,7 @@ Current expectation:
 - this path should exercise the HF checkpoint loader against the current JAX `qwen3_5_vl` text + vision tree
 - treat it as a real compatibility smoke, not just a structural fake-data run
 - successful execution still needs to be validated in your own JAX runtime
+- `Qwen3_5WeightLoader` initializes the VLM branch by default; the action expert remains random-init unless `load_action_expert=True`
 
 ## 4. Real-Geometry Qwen Training Smoke
 
@@ -346,6 +347,30 @@ Important notes:
 - it initializes from `Qwen/Qwen3.5-2B` through `Qwen3_5WeightLoader`
 - you must have the dataset/assets required by `fruit_classification_Aa_qwen3_5`
 - this is the most meaningful current end-to-end Qwen3.5 JAX validation path in the repo
+
+### Small Qwen-native action experts
+
+The repo now includes smaller Qwen3.5 action-expert variants that preserve the Qwen attention/KV interface while
+shrinking only the expert width/MLP capacity:
+
+- `qwen3_5_4b_action_1b`
+- `qwen3_5_2b_action_700m`
+- `qwen3_5_2b_action_400m`
+
+This follows the original OpenPI PaliGemma pattern more closely:
+
+- the VLM branch is initialized from pretrained HF weights
+- the action expert can stay randomly initialized and specialize for flow-matching control
+- layer-wise KV/cache reuse remains valid because the expert keeps the same attention geometry as its paired VLM
+
+Example:
+
+```bash
+python scripts/train.py debug_qwen3_5_pretrained \
+  --overwrite \
+  --no-wandb-enabled \
+  --model.action-expert-variant qwen3_5_2b_action_400m
+```
 
 ## 5. Recommended Test Order
 
