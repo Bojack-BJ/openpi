@@ -160,8 +160,14 @@ def _to_wandb_image_uint8(image: np.ndarray) -> np.ndarray:
         return image
 
     if np.issubdtype(image.dtype, np.floating):
-        if image.size > 0 and np.nanmin(image) >= 0.0 and np.nanmax(image) <= 1.0:
-            image = image * 255.0
+        if image.size > 0:
+            image_min = np.nanmin(image)
+            image_max = np.nanmax(image)
+            # Model inputs are typically RGB images in [-1, 1].
+            if image_min >= -1.0 and image_max <= 1.0:
+                image = (image + 1.0) * 127.5
+            elif image_min >= 0.0 and image_max <= 1.0:
+                image = image * 255.0
 
     return np.clip(image, 0, 255).astype(np.uint8)
 
