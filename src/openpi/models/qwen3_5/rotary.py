@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import openpi.shared.array_typing as at
 
 
-QWEN3_5_ROPE_THETA = 1_000_000.0
+QWEN3_5_ROPE_THETA = 10_000_000.0
 QWEN3_5_DEFAULT_PARTIAL_ROTARY_FACTOR = 0.25
 QWEN3_5_DEFAULT_MROPE_SECTION = (11, 11, 10)
 

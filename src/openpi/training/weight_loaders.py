@@ -278,6 +278,12 @@ def _hf_norm_to_rms_scale(weight: np.ndarray) -> np.ndarray:
     return np.asarray(weight) - 1.0
 
 
+def _full_attention_qg_kernel(q_weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+    num_heads, input_width, doubled_head_dim = expected_shape
+    head_dim = doubled_head_dim // 2
+    return _dense_to_kernel(q_weight).reshape(input_width, num_heads, 2 * head_dim).transpose(1, 0, 2)
+
+
 def _full_attention_head_kernel(weight: np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
     num_heads, input_width, head_dim = expected_shape
     return _dense_to_kernel(weight).reshape(input_width, num_heads, head_dim).transpose(1, 0, 2)
@@ -365,17 +371,17 @@ def _load_qwen3_5_text_weights(
             )
 
         has_linear = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/in_proj_qkv/w") for key in flat_ref)
-        has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/q_einsum/w") for key in flat_ref)
+        has_full = any(key.endswith(f"llm/layers_{layer_idx}/self_attn/qg_einsum/w") for key in flat_ref)
 
         if has_full:
             for branch_suffix in ("", "_1"):
-                q_suffix = f"llm/layers_{layer_idx}/self_attn/q_einsum{branch_suffix}/w"
-                _, q_shape = _target_shape(flat_ref, q_suffix)
+                qg_suffix = f"llm/layers_{layer_idx}/self_attn/qg_einsum{branch_suffix}/w"
+                _, qg_shape = _target_shape(flat_ref, qg_suffix)
                 _store_loaded(
                     flat_loaded,
                     flat_ref,
-                    q_suffix,
-                    _full_attention_head_kernel(hf_tensors[f"{hf_prefix}self_attn.q_proj.weight"], q_shape),
+                    qg_suffix,
+                    _full_attention_qg_kernel(hf_tensors[f"{hf_prefix}self_attn.q_proj.weight"], qg_shape),
                 )
                 head_suffixes = (
                     ("k_einsum", "self_attn.k_proj.weight"),

@@ -15,7 +15,7 @@ import openpi.training.sharding as sharding
 
 
 QWEN3_5_VOCAB_SIZE = 248_320
-QWEN3_5_ROPE_THETA = 1_000_000.0
+QWEN3_5_ROPE_THETA = 10_000_000.0
 
 
 @at.typecheck
@@ -115,12 +115,13 @@ class GatedAttention(nn.Module):
                 continue
             x = _zero_invalid_tokens(x, token_mask[:, cursor : cursor + x.shape[1]])
             cursor += x.shape[1]
-            q = lora.Einsum(
-                shape=(config.num_heads, config.width, config.head_dim),
-                name=_name("q_einsum", i),
+            qg = lora.Einsum(
+                shape=(config.num_heads, config.width, 2 * config.head_dim),
+                name=_name("qg_einsum", i),
                 init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                 lora_config=config.lora_configs.get("attn"),
             )("BTD,NDH->BTNH", x)
+            q, gate = jnp.split(qg, 2, axis=-1)
             q = RMSNorm(name=_name("q_norm", i))(q)
 
             k = lora.Einsum(
@@ -136,9 +137,9 @@ class GatedAttention(nn.Module):
                 init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                 lora_config=config.lora_configs.get("attn"),
             )("BTD,KDH->BTKH", x)
-            qkgs.append((q, k, v))
+            qkgs.append((q, k, v, gate))
 
-        q, k, v = (jnp.concatenate(y, axis=1) for y in zip(*qkgs, strict=True))
+        q, k, v, gate = (jnp.concatenate(y, axis=1) for y in zip(*qkgs, strict=True))
         q, k = qwen_rotary.apply_rotary_embedding(
             q,
             k,
@@ -168,6 +169,7 @@ class GatedAttention(nn.Module):
         probs = probs * jnp.any(mask, axis=-1, keepdims=True).astype(dtype)
 
         encoded = jnp.einsum("BNTS,BSNH->BTNH", probs, v)
+        encoded = encoded * jax.nn.sigmoid(gate).astype(encoded.dtype)
         encoded = encoded.reshape(encoded.shape[0], encoded.shape[1], -1)
 
         out = []

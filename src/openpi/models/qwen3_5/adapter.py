@@ -8,7 +8,7 @@ import openpi.models.qwen3_5.vision as _qwen3_5_vision
 
 
 QWEN3_5_VOCAB_SIZE = 248_320
-QWEN3_5_ROPE_THETA = 1_000_000.0
+QWEN3_5_ROPE_THETA = 10_000_000.0
 
 
 class Qwen3_5_VLWithExpertModel(_qwen2_5_adapter.Qwen2_5_VLWithExpertModel):
