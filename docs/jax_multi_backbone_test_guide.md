@@ -225,6 +225,26 @@ What it does **not** check:
 - real dataset loading
 - real Qwen checkpoint loading
 
+### Qwen2.5 pretrained tiny training smoke
+
+The repo now also includes a named config for loading HF Qwen2.5 text weights in JAX:
+
+```bash
+python scripts/train.py debug_qwen2_5_pretrained --overwrite --no-wandb-enabled
+```
+
+That config uses:
+
+- `model.vlm_backend=qwen2_5_vl`
+- `model.vlm_hf_model_id=Qwen/Qwen2.5-VL-3B-Instruct`
+- `weight_loader=Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct")`
+
+You can also load from a direct local directory:
+
+- `weight_loader=Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/path/to/local/qwen2.5")`
+
+Note: the JAX `qwen2_5_vl` vision path is still pragmatic, so `Qwen2_5WeightLoader` loads text-stack weights only.
+
 ### Qwen3.5 tiny training smoke
 
 Use this to validate JAX trainer integration for the new hybrid `Qwen3.5` text + vision path.
@@ -266,6 +286,12 @@ That config uses:
 - `model.action_expert_variant=qwen3_5_2b`
 - `model.vlm_hf_model_id=Qwen/Qwen3.5-2B`
 - `weight_loader=Qwen3_5WeightLoader("Qwen/Qwen3.5-2B")`
+
+You can also bypass Hugging Face cache layout and load from a direct local directory:
+
+- `weight_loader=Qwen3_5WeightLoader("Qwen/Qwen3.5-2B", local_snapshot_path="/path/to/local/qwen3.5-2b")`
+
+The directory must contain one or more `.safetensors` files (recursively).
 
 ## 4. Real-Geometry Qwen Training Smoke
 
@@ -324,9 +350,10 @@ Run tests in this order:
 4. optional structural forward smoke for `qwen3_5_vl`
 5. `debug` tiny training smoke for `paligemma`
 6. `debug` tiny training smoke for `qwen2_5_vl`
-7. optional `debug` tiny training smoke for `qwen3_5_vl`
-8. `fruit_classification_Aa_qwen` real-geometry smoke
-9. optional `fruit_classification_Aa_qwen3_5` real-geometry smoke with official loader
+7. optional `debug_qwen2_5_pretrained` tiny training smoke
+8. optional `debug` tiny training smoke for `qwen3_5_vl`
+9. `fruit_classification_Aa_qwen` real-geometry smoke
+10. optional `fruit_classification_Aa_qwen3_5` real-geometry smoke with official loader
 
 This order keeps failures easy to localize:
 
@@ -360,7 +387,7 @@ Current JAX Qwen limitations:
 
 - not HF `Qwen2.5-VL` weight-compatible yet
 - vision path is pragmatic rather than checkpoint-faithful
-- no dedicated JAX Qwen pretrained weight loader yet
+- `Qwen2_5WeightLoader` currently loads text weights only
 - this should be treated as a structural/runtime migration milestone, not final parity
 
 Current `qwen3_5_vl` limitations:

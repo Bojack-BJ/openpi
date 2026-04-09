@@ -92,16 +92,53 @@ class Qwen3_5WeightLoader(WeightLoader):
     text branches used by `Pi0`.
     """
 
+    # Hugging Face repo id (for example "Qwen/Qwen3.5-2B") or an absolute/local
+    # snapshot directory containing .safetensors files.
     model_id: str
+    # Optional explicit local directory override. If provided, loading will ignore
+    # `model_id` and read safetensors directly from this directory.
+    local_snapshot_path: str | None = None
     local_files_only: bool = False
 
     def load(self, params: at.Params) -> at.Params:
         flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
-        hf_tensors = _load_hf_safetensors_snapshot(self.model_id, local_files_only=self.local_files_only)
+        hf_tensors = _load_hf_safetensors_snapshot(
+            self.model_id,
+            local_snapshot_path=self.local_snapshot_path,
+            local_files_only=self.local_files_only,
+        )
 
         flat_loaded: dict[str, np.ndarray] = {}
         _load_qwen3_5_text_weights(flat_loaded, flat_ref, hf_tensors)
         _load_qwen3_5_vision_weights(flat_loaded, flat_ref, hf_tensors)
+
+        loaded_params = flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
+        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+
+
+@dataclasses.dataclass(frozen=True)
+class Qwen2_5WeightLoader(WeightLoader):
+    """Loads text weights from a Hugging Face Qwen2.5(-VL) checkpoint.
+
+    This loader maps Qwen2.5 language-model tensors into the JAX `qwen2_5_vl` text stack.
+    The current JAX Qwen2.5 vision stack is a pragmatic SigLIP-based path, so official HF
+    visual tensors are intentionally not loaded here.
+    """
+
+    model_id: str
+    local_snapshot_path: str | None = None
+    local_files_only: bool = False
+
+    def load(self, params: at.Params) -> at.Params:
+        flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+        hf_tensors = _load_hf_safetensors_snapshot(
+            self.model_id,
+            local_snapshot_path=self.local_snapshot_path,
+            local_files_only=self.local_files_only,
+        )
+
+        flat_loaded: dict[str, np.ndarray] = {}
+        _load_qwen2_5_text_weights(flat_loaded, flat_ref, hf_tensors)
 
         loaded_params = flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
@@ -140,7 +177,9 @@ def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex:
     return flax.traverse_util.unflatten_dict(result, sep="/")
 
 
-def _load_hf_safetensors_snapshot(model_id: str, *, local_files_only: bool) -> dict[str, np.ndarray]:
+def _load_hf_safetensors_snapshot(
+    model_id: str, *, local_snapshot_path: str | None = None, local_files_only: bool
+) -> dict[str, np.ndarray]:
     try:
         from huggingface_hub import snapshot_download
         from safetensors.numpy import load_file
@@ -150,17 +189,33 @@ def _load_hf_safetensors_snapshot(model_id: str, *, local_files_only: bool) -> d
             "to be installed in the active Python environment."
         ) from exc
 
-    snapshot_dir = pathlib.Path(
-        snapshot_download(
-            repo_id=model_id,
-            allow_patterns=["*.safetensors", "*.json"],
-            cache_dir=str(download.get_cache_dir() / "huggingface"),
-            local_files_only=local_files_only,
-        )
-    )
+    if local_snapshot_path is not None:
+        snapshot_dir = pathlib.Path(local_snapshot_path).expanduser().resolve()
+    else:
+        model_path = pathlib.Path(model_id).expanduser()
+        if model_path.exists():
+            snapshot_dir = model_path.resolve()
+        else:
+            snapshot_dir = pathlib.Path(
+                snapshot_download(
+                    repo_id=model_id,
+                    allow_patterns=["*.safetensors", "*.json"],
+                    cache_dir=str(download.get_cache_dir() / "huggingface"),
+                    local_files_only=local_files_only,
+                )
+            )
+
+    if not snapshot_dir.exists():
+        raise FileNotFoundError(f"Qwen3.5 weights snapshot directory does not exist: {snapshot_dir}")
+    if not snapshot_dir.is_dir():
+        raise ValueError(f"Qwen3.5 weights snapshot path must be a directory: {snapshot_dir}")
+
     safetensor_files = sorted(snapshot_dir.rglob("*.safetensors"))
     if not safetensor_files:
-        raise FileNotFoundError(f"No .safetensors files found in Hugging Face snapshot for {model_id}")
+        raise FileNotFoundError(
+            f"No .safetensors files found under {snapshot_dir}. "
+            "Make sure this directory contains a Hugging Face checkpoint snapshot."
+        )
 
     tensors: dict[str, np.ndarray] = {}
     for path in safetensor_files:
@@ -577,3 +632,135 @@ def _load_qwen3_5_vision_weights(
             "vision/encoder/merger/linear_fc2/bias",
             np.asarray(hf_tensors["model.visual.merger.linear_fc2.bias"]),
         )
+
+
+def _first_present(mapping: dict[str, np.ndarray], candidates: list[str]) -> str:
+    for key in candidates:
+        if key in mapping:
+            return key
+    raise KeyError(f"Could not find any of keys: {candidates}")
+
+
+def _load_qwen2_5_text_weights(
+    flat_loaded: dict[str, np.ndarray],
+    flat_ref: dict[str, at.Array],
+    hf_tensors: dict[str, np.ndarray],
+):
+    embed_key = _first_present(
+        hf_tensors,
+        [
+            "model.embed_tokens.weight",
+            "model.language_model.embed_tokens.weight",
+        ],
+    )
+    final_norm_key = _first_present(
+        hf_tensors,
+        [
+            "model.norm.weight",
+            "model.language_model.norm.weight",
+        ],
+    )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "llm/embedder/input_embedding",
+        np.asarray(hf_tensors[embed_key]),
+    )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "llm/final_norm/scale",
+        _hf_norm_to_rms_scale(hf_tensors[final_norm_key]),
+    )
+    _store_loaded(
+        flat_loaded,
+        flat_ref,
+        "llm/final_norm_1/scale",
+        _hf_norm_to_rms_scale(hf_tensors[final_norm_key]),
+    )
+
+    if any(key.startswith("model.layers.") for key in hf_tensors):
+        layer_prefix_root = "model.layers"
+    elif any(key.startswith("model.language_model.layers.") for key in hf_tensors):
+        layer_prefix_root = "model.language_model.layers"
+    else:
+        raise KeyError("Could not detect Qwen2.5 layer prefix in HF checkpoint tensors.")
+
+    layer_indices = sorted(
+        {
+            int(match.group(1))
+            for key in flat_ref
+            for match in [re.search(r"llm/layers/(\d+)/", key)]
+            if match is not None
+        }
+    )
+
+    for layer_idx in layer_indices:
+        hf_prefix = f"{layer_prefix_root}.{layer_idx}."
+        input_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}input_layernorm.weight"])
+        post_attn_norm = _hf_norm_to_rms_scale(hf_tensors[f"{hf_prefix}post_attention_layernorm.weight"])
+
+        for branch_suffix in ("", "_1"):
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers/{layer_idx}/pre_attention_norm{branch_suffix}/scale",
+                input_norm,
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers/{layer_idx}/pre_ffw_norm{branch_suffix}/scale",
+                post_attn_norm,
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers/{layer_idx}/mlp{branch_suffix}/gate_proj/w",
+                _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.gate_proj.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers/{layer_idx}/mlp{branch_suffix}/up_proj/w",
+                _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.up_proj.weight"]),
+            )
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                f"llm/layers/{layer_idx}/mlp{branch_suffix}/down_proj/w",
+                _dense_to_kernel(hf_tensors[f"{hf_prefix}mlp.down_proj.weight"]),
+            )
+
+            q_suffix = f"llm/layers/{layer_idx}/attn/q_einsum{branch_suffix}/w"
+            _, q_shape = _target_shape(flat_ref, q_suffix)
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                q_suffix,
+                _full_attention_head_kernel(hf_tensors[f"{hf_prefix}self_attn.q_proj.weight"], q_shape),
+            )
+            k_suffix = f"llm/layers/{layer_idx}/attn/k_einsum{branch_suffix}/w"
+            _, k_shape = _target_shape(flat_ref, k_suffix)
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                k_suffix,
+                _full_attention_head_kernel(hf_tensors[f"{hf_prefix}self_attn.k_proj.weight"], k_shape),
+            )
+            v_suffix = f"llm/layers/{layer_idx}/attn/v_einsum{branch_suffix}/w"
+            _, v_shape = _target_shape(flat_ref, v_suffix)
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                v_suffix,
+                _full_attention_head_kernel(hf_tensors[f"{hf_prefix}self_attn.v_proj.weight"], v_shape),
+            )
+            o_suffix = f"llm/layers/{layer_idx}/attn/o_einsum{branch_suffix}/w"
+            _, o_shape = _target_shape(flat_ref, o_suffix)
+            _store_loaded(
+                flat_loaded,
+                flat_ref,
+                o_suffix,
+                _full_attention_output_kernel(hf_tensors[f"{hf_prefix}self_attn.o_proj.weight"], o_shape),
+            )

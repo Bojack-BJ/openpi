@@ -2318,6 +2318,22 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        name="debug_qwen2_5_pretrained",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct"),
+        overwrite=True,
+        exp_name="debug_qwen2_5_pretrained",
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
         name="debug_pi05",
         model=pi0_config.Pi0Config(pi05=True, vlm_backbone_variant="dummy", action_expert_variant="dummy"),
         data=FakeDataConfig(),
