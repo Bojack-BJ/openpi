@@ -17,7 +17,7 @@ class NormStats:
 class RunningStats:
     """Compute running statistics of a batch of vectors."""
 
-    def __init__(self):
+    def __init__(self, *, compute_quantiles: bool = True, num_quantile_bins: int = 5000):
         self._count = 0
         self._mean = None
         self._mean_of_squares = None
@@ -25,7 +25,8 @@ class RunningStats:
         self._max = None
         self._histograms = None
         self._bin_edges = None
-        self._num_quantile_bins = 5000  # for computing quantiles on the fly
+        self._compute_quantiles = compute_quantiles
+        self._num_quantile_bins = num_quantile_bins  # for computing quantiles on the fly
 
     def update(self, batch: np.ndarray) -> None:
         """
@@ -39,25 +40,27 @@ class RunningStats:
         if self._count == 0:
             self._mean = np.mean(batch, axis=0)
             self._mean_of_squares = np.mean(batch**2, axis=0)
-            self._min = np.min(batch, axis=0)
-            self._max = np.max(batch, axis=0)
-            self._histograms = [np.zeros(self._num_quantile_bins) for _ in range(vector_length)]
-            self._bin_edges = [
-                np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
-                for i in range(vector_length)
-            ]
+            if self._compute_quantiles:
+                self._min = np.min(batch, axis=0)
+                self._max = np.max(batch, axis=0)
+                self._histograms = [np.zeros(self._num_quantile_bins) for _ in range(vector_length)]
+                self._bin_edges = [
+                    np.linspace(self._min[i] - 1e-10, self._max[i] + 1e-10, self._num_quantile_bins + 1)
+                    for i in range(vector_length)
+                ]
         else:
             if vector_length != self._mean.size:
                 raise ValueError("The length of new vectors does not match the initialized vector length.")
-            new_max = np.max(batch, axis=0)
-            new_min = np.min(batch, axis=0)
-            max_changed = np.any(new_max > self._max)
-            min_changed = np.any(new_min < self._min)
-            self._max = np.maximum(self._max, new_max)
-            self._min = np.minimum(self._min, new_min)
+            if self._compute_quantiles:
+                new_max = np.max(batch, axis=0)
+                new_min = np.min(batch, axis=0)
+                max_changed = np.any(new_max > self._max)
+                min_changed = np.any(new_min < self._min)
+                self._max = np.maximum(self._max, new_max)
+                self._min = np.minimum(self._min, new_min)
 
-            if max_changed or min_changed:
-                self._adjust_histograms()
+                if max_changed or min_changed:
+                    self._adjust_histograms()
 
         self._count += num_elements
 
@@ -68,7 +71,8 @@ class RunningStats:
         self._mean += (batch_mean - self._mean) * (num_elements / self._count)
         self._mean_of_squares += (batch_mean_of_squares - self._mean_of_squares) * (num_elements / self._count)
 
-        self._update_histograms(batch)
+        if self._compute_quantiles:
+            self._update_histograms(batch)
 
     def get_statistics(self) -> NormStats:
         """
@@ -82,7 +86,10 @@ class RunningStats:
 
         variance = self._mean_of_squares - self._mean**2
         stddev = np.sqrt(np.maximum(0, variance))
-        q01, q99 = self._compute_quantiles([0.01, 0.99])
+        if self._compute_quantiles:
+            q01, q99 = self._compute_quantiles_from_histograms([0.01, 0.99])
+        else:
+            q01, q99 = None, None
         return NormStats(mean=self._mean, std=stddev, q01=q01, q99=q99)
 
     def _adjust_histograms(self):
@@ -103,7 +110,7 @@ class RunningStats:
             hist, _ = np.histogram(batch[:, i], bins=self._bin_edges[i])
             self._histograms[i] += hist
 
-    def _compute_quantiles(self, quantiles):
+    def _compute_quantiles_from_histograms(self, quantiles):
         """Compute quantiles based on histograms."""
         results = []
         for q in quantiles:
