@@ -540,6 +540,7 @@ KVCache: TypeAlias = Any
 class Module(nn.Module):
     configs: Sequence[Config]
     embed_dtype: str
+    use_remat: bool = True
     vocab_size: int = QWEN3_5_VOCAB_SIZE
     rope_theta: float = qwen_rotary.QWEN3_5_ROPE_THETA
     partial_rotary_factor: float = qwen_rotary.QWEN3_5_DEFAULT_PARTIAL_ROTARY_FACTOR
@@ -565,12 +566,14 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,
             name="embedder",
         )
-        block_cls = nn.remat(
-            DecoderLayerGroup,
-            prevent_cse=False,
-            static_argnums=(5,),
-            policy=jax.checkpoint_policies.nothing_saveable,
-        )
+        block_cls = DecoderLayerGroup
+        if self.use_remat:
+            block_cls = nn.remat(
+                DecoderLayerGroup,
+                prevent_cse=False,
+                static_argnums=(5,),
+                policy=jax.checkpoint_policies.nothing_saveable,
+            )
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},

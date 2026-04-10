@@ -23,6 +23,7 @@ VLMBackend = Literal["paligemma", "qwen2_vl", "qwen2_5_vl", "qwen3_5_vl", "inter
 @dataclasses.dataclass(frozen=True)
 class Pi0Config(_model.BaseModelConfig):
     dtype: str = "bfloat16"
+    qwen3_5_use_remat: bool = True
     # Backend selection now routes prompt-tokenizer selection everywhere and dispatches the JAX/PyTorch
     # Pi0 runtime through backend factories. JAX fully supports `paligemma`; the JAX `qwen2_5_vl`
     # path includes a native vision tower, projector, and backend-owned multimodal positions; and
