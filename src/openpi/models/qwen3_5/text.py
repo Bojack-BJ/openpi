@@ -521,9 +521,12 @@ class DecoderLayerGroup(nn.Module):
             layer_cls = DecoderLayer
             if self.remat_mode == "all":
                 layer_cls = remat_layer_cls
-            elif self.remat_mode == "linear_only" and layer_type == "linear_attention":
-                layer_cls = remat_layer_cls
-            elif self.remat_mode != "off":
+            elif self.remat_mode == "linear_only":
+                if layer_type == "linear_attention":
+                    layer_cls = remat_layer_cls
+            elif self.remat_mode == "off":
+                pass
+            else:
                 raise ValueError(f"Unsupported Qwen3.5 remat_mode: {self.remat_mode}")
             return layer_cls(
                 configs=self.configs,
