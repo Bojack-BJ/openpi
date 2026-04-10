@@ -1691,8 +1691,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_4B, local_files_only=True),
         num_train_steps=60_000,
         ema_decay=None,
-        batch_size=20,
-        num_workers=20,
+        batch_size=16,
+        num_workers=64,
+        qwen3_5_remat_mode="linear_only",
     ),
     TrainConfig(
         name="fruit_classification_Aa_qwen2_5_3B_700M",

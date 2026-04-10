@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
@@ -32,4 +32,5 @@ python scripts/train.py "$cfg" \
   --project_name "umi-openpi" \
   --jax-compilation-cache-dir /root/Users/.cache/jax/openpi \
   --overwrite \
-  --fsdp_devices 4 \
+  --fsdp_devices 8 \
+
