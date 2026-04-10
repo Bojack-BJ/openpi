@@ -513,14 +513,16 @@ class RLDSDataLoader:
         *,
         sharding: Any | None = None,
         num_batches: int | None = None,
+        convert_to_jax: bool = True,
     ):
         self._dataset = dataset
         self._num_batches = num_batches
+        self._convert_to_jax = convert_to_jax
 
-        if _jax_process_count() > 1:
+        if convert_to_jax and _jax_process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if sharding is None:
+        if convert_to_jax and sharding is None:
             # Use data parallel sharding by default.
             sharding = _default_data_sharding()
 
@@ -539,7 +541,10 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
-                yield _tree_map(lambda x: _jax_make_array_from_process_local_data(self._sharding, x), batch)
+                if self._convert_to_jax:
+                    yield _tree_map(lambda x: _jax_make_array_from_process_local_data(self._sharding, x), batch)
+                else:
+                    yield batch
 
 
 class DataLoaderImpl(DataLoader):

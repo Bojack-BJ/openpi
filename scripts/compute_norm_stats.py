@@ -5,6 +5,8 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 import os
+import time
+from itertools import chain
 
 # Reduce TensorFlow/XLA startup log noise (especially with multiprocessing workers).
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -59,6 +61,7 @@ def create_torch_dataloader(
         num_workers=num_workers,
         shuffle=shuffle,
         num_batches=num_batches,
+        framework="pytorch",
     )
     return data_loader, num_batches
 
@@ -88,11 +91,12 @@ def create_rlds_dataloader(
     data_loader = _data_loader.RLDSDataLoader(
         dataset,
         num_batches=num_batches,
+        convert_to_jax=False,
     )
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, num_workers: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
     
@@ -106,14 +110,27 @@ def main(config_name: str, max_frames: int | None = None):
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )
     else:
+        effective_num_workers = min(config.num_workers, 8) if num_workers is None else num_workers
+        print(f"Using norm-stats dataloader workers: {effective_num_workers}")
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config,
+            config.model.action_horizon,
+            config.batch_size,
+            config.model,
+            effective_num_workers,
+            max_frames,
         )
 
     keys = ["state", "actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+    print("Fetching first batch for norm stats...")
+    first_batch_t0 = time.perf_counter()
+    data_iter = iter(data_loader)
+    first_batch = next(data_iter)
+    print(f"Fetched first batch in {time.perf_counter() - first_batch_t0:.1f} seconds.")
+
+    for batch in tqdm.tqdm(chain([first_batch], data_iter), total=num_batches, desc="Computing stats"):
         for key in keys:
             stats[key].update(np.asarray(batch[key]))
 
