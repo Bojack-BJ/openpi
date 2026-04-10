@@ -138,6 +138,25 @@ Conclusion:
 - the huge runtime gap was not explained by token workload
 - it came from the compute path itself
 
+## 6. First-Batch Data Loader Latency Can Be a Separate Bottleneck
+
+We also observed cases where the log appeared to "hang" before model init/compile, while the real bottleneck was:
+
+- PyTorch `DataLoader` worker startup
+- dataset shard opening
+- first-sample transform/tokenize cost
+
+Important distinction:
+
+- `Fetched first batch in ... seconds` is not model time
+- it does not reflect JAX compile or step runtime
+
+One concrete issue we fixed:
+
+- `data_loader.py` and `transforms.py` used to import JAX at module import time
+- with `num_workers > 0` and `spawn`, every data worker paid that import cost
+- we reduced that by removing top-level JAX imports from the worker-facing data path and moving JAX usage behind local helper calls in the main JAX path
+
 ## Changes We Already Made
 
 ## 1. Reduced Compile-Only Pain

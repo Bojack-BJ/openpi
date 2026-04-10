@@ -1,22 +1,22 @@
+from __future__ import annotations
+
 from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
-from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
+from typing import Any, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 import flax.traverse_util as traverse_util
-import jax
 import numpy as np
 from openpi_client import image_tools
 import torch
 from openpi.models import tokenizer as _tokenizer
-from openpi.shared import array_typing as at
 from openpi.shared import normalize as _normalize
 from dataclasses import dataclass, field
 from typing import Sequence
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-DataDict: TypeAlias = at.PyTree
+DataDict: TypeAlias = Any
 NormStats: TypeAlias = _normalize.NormStats
 
 
@@ -38,6 +38,16 @@ class DataTransformFn(Protocol):
         Returns:
             The transformed data. Could be the input `data` that was modified in place, or a new data structure.
         """
+
+
+def _tree_map(fn: Callable[..., Any], tree: Any, *rest: Any) -> Any:
+    if isinstance(tree, dict):
+        return {k: _tree_map(fn, tree[k], *(r[k] for r in rest)) for k in tree}
+    if isinstance(tree, list):
+        return [_tree_map(fn, tree[i], *(r[i] for r in rest)) for i in range(len(tree))]
+    if isinstance(tree, tuple):
+        return tuple(_tree_map(fn, tree[i], *(r[i] for r in rest)) for i in range(len(tree)))
+    return fn(tree, *rest)
 
 def _resolve_action_key(data: DataDict, action_key: str | None) -> str | None:
     if action_key is not None:
@@ -140,11 +150,11 @@ class RepackTransform(DataTransformFn):
     }
     """
 
-    structure: at.PyTree[str]
+    structure: Any
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        return _tree_map(lambda k: flat_item[k], self.structure)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,7 +169,7 @@ class InjectDefaultPrompt(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
-    norm_stats: at.PyTree[NormStats] | None
+    norm_stats: Any | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
     # If true, will raise an error if any of the keys in the norm stats are not present in the data.
@@ -193,7 +203,7 @@ class Normalize(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class Unnormalize(DataTransformFn):
-    norm_stats: at.PyTree[NormStats] | None
+    norm_stats: Any | None
     # If true, will use quantile normalization. Otherwise, normal z-score normalization will be used.
     use_quantiles: bool = False
 
@@ -389,17 +399,17 @@ class PadStatesAndActions(DataTransformFn):
         return data
 
 
-def flatten_dict(tree: at.PyTree) -> dict:
+def flatten_dict(tree: Any) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""
     return traverse_util.flatten_dict(tree, sep="/")
 
 
-def unflatten_dict(tree: dict) -> at.PyTree:
+def unflatten_dict(tree: dict) -> Any:
     """Unflatten a flattened dictionary. Assumes that '/' was used as a separator."""
     return traverse_util.unflatten_dict(tree, sep="/")
 
 
-def transform_dict(patterns: Mapping[str, str | None], tree: at.PyTree) -> at.PyTree:
+def transform_dict(patterns: Mapping[str, str | None], tree: Any) -> Any:
     """Transform the structure of a nested dictionary using a set of patterns.
 
     The transformation is defined using the `patterns` dictionary. The keys are the
@@ -454,8 +464,8 @@ def transform_dict(patterns: Mapping[str, str | None], tree: at.PyTree) -> at.Py
 
 
 def apply_tree(
-    tree: at.PyTree[T], selector: at.PyTree[S], fn: Callable[[T, S], T], *, strict: bool = False
-) -> at.PyTree[T]:
+    tree: Any, selector: Any, fn: Callable[[T, S], T], *, strict: bool = False
+) -> Any:
     tree = flatten_dict(tree)
     selector = flatten_dict(selector)
 
@@ -504,7 +514,7 @@ def make_bool_mask(*dims: int) -> tuple[bool, ...]:
     return tuple(result)
 
 
-def _assert_quantile_stats(norm_stats: at.PyTree[NormStats]) -> None:
+def _assert_quantile_stats(norm_stats: Any) -> None:
     for k, v in flatten_dict(norm_stats).items():
         if v.q01 is None or v.q99 is None:
             raise ValueError(
@@ -520,10 +530,10 @@ class ToNumpy(DataTransformFn):
                 return x.cpu().numpy()
             # 粗判 JAX 数组类型
             if hasattr(x, "__array__") and "jax" in str(type(x)).lower():
-                return np.asarray(jax.device_get(x))
+                return np.asarray(x)
             return x
 
-        return jax.tree.map(_convert, data)
+        return _tree_map(_convert, data)
 
 
 # ---------------------------
