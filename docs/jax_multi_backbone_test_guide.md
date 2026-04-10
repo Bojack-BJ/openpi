@@ -2,6 +2,9 @@
 
 This note summarizes how to test the current JAX `Pi0` runtime after the multi-backbone refactor.
 
+For performance-specific findings and the JAX Qwen compile/runtime debugging checklist, see
+[jax_qwen_performance_notes.md](/Users/lxt/Github/Lumos/openpi/docs/jax_qwen_performance_notes.md).
+
 ## Current Status
 
 ### PaliGemma

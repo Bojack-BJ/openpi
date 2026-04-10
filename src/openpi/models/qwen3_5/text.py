@@ -16,6 +16,7 @@ import openpi.training.sharding as sharding
 
 QWEN3_5_VOCAB_SIZE = 248_320
 QWEN3_5_ROPE_THETA = 10_000_000.0
+QWEN3_5_LINEAR_SCAN_UNROLL = 8
 
 
 @at.typecheck
@@ -77,9 +78,18 @@ class DepthwiseShortConv1D(nn.Module):
     def __call__(self, x, *, cache=None):
         kernel = self.param("kernel", nn.initializers.normal(stddev=0.02), (self.kernel_size, self.channels))
 
-        batch_size = x.shape[0]
         if cache is None:
-            cache = jnp.zeros((batch_size, max(self.kernel_size - 1, 0), self.channels), dtype=x.dtype)
+            rhs = jnp.transpose(kernel[::-1].astype(x.dtype), (1, 0))[:, None, :]
+            y = jax.lax.conv_general_dilated(
+                jnp.swapaxes(x, 1, 2),
+                rhs,
+                window_strides=(1,),
+                padding=((self.kernel_size - 1, 0),),
+                dimension_numbers=("NCT", "OIT", "NCT"),
+                feature_group_count=self.channels,
+            )
+            next_cache = x[:, -(self.kernel_size - 1) :, :] if self.kernel_size > 1 else x[:, :0, :]
+            return nn.silu(jnp.swapaxes(y, 1, 2)), next_cache
 
         def step(state, x_t):
             window = jnp.concatenate([state, x_t[:, None, :]], axis=1)
@@ -88,7 +98,7 @@ class DepthwiseShortConv1D(nn.Module):
             next_state = window[:, 1:, :] if self.kernel_size > 1 else state
             return next_state, y_t
 
-        next_cache, ys = jax.lax.scan(step, cache, jnp.swapaxes(x, 0, 1))
+        next_cache, ys = jax.lax.scan(step, cache, jnp.swapaxes(x, 0, 1), unroll=QWEN3_5_LINEAR_SCAN_UNROLL)
         return jnp.swapaxes(ys, 0, 1), next_cache
 
 
@@ -300,8 +310,6 @@ class GatedDeltaNet(nn.Module):
         if num_v_heads % num_k_heads != 0:
             raise ValueError(f"Qwen3.5 linear attention expects value heads to be divisible by key heads: {num_v_heads}/{num_k_heads}")
         repeat_factor = num_v_heads // num_k_heads
-        query = qwen_rotary.repeat_kv(query, repeat_factor)
-        key = qwen_rotary.repeat_kv(key, repeat_factor)
 
         decay_scale = jnp.exp(self.param("A_log", nn.initializers.zeros_init(), (num_v_heads,))).astype(dtype)
         dt_bias = self.param("dt_bias", nn.initializers.zeros_init(), (num_v_heads,)).astype(dtype)
@@ -310,10 +318,14 @@ class GatedDeltaNet(nn.Module):
         valid = token_mask[:, : qkv.shape[1]].astype(dtype)
         query = query * valid[:, :, None, None]
         key = key * valid[:, :, None, None]
-        value = value * valid[:, :, None, None]
-        z = z * valid[:, :, None, None]
-        beta = beta.astype(dtype) * valid[:, :, None]
-        g = jnp.where(valid[:, :, None].astype(bool), g, 0.0)
+        value = value.reshape(value.shape[0], value.shape[1], num_k_heads, repeat_factor, value_dim)
+        z = z.reshape(z.shape[0], z.shape[1], num_k_heads, repeat_factor, value_dim)
+        beta = beta.astype(dtype).reshape(beta.shape[0], beta.shape[1], num_k_heads, repeat_factor)
+        g = g.reshape(g.shape[0], g.shape[1], num_k_heads, repeat_factor)
+        value = value * valid[:, :, None, None, None]
+        z = z * valid[:, :, None, None, None]
+        beta = beta * valid[:, :, None, None]
+        g = jnp.where(valid[:, :, None, None].astype(bool), g, 0.0)
 
         outputs, recurrent_cache = _gated_delta_recurrence(
             query,
@@ -349,10 +361,11 @@ def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
     query = _l2_normalize(query) * (query.shape[-1] ** -0.5)
     key = _l2_normalize(key)
     batch_size, _, num_heads, key_dim = query.shape
+    repeat_factor = value.shape[3]
     value_dim = value.shape[-1]
 
     if initial_state is None:
-        initial_state = jnp.zeros((batch_size, num_heads, key_dim, value_dim), dtype=value.dtype)
+        initial_state = jnp.zeros((batch_size, num_heads, key_dim, repeat_factor, value_dim), dtype=value.dtype)
     state_dtype = initial_state.dtype
     compute_dtype = jnp.float32 if state_dtype in (jnp.bfloat16, jnp.float16) else state_dtype
 
@@ -365,10 +378,10 @@ def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
         beta_t = beta_t.astype(compute_dtype)
         g_t = g_t.astype(compute_dtype)
 
-        state_f = state_f * jnp.exp(g_t)[..., None, None]
-        kv_mem = jnp.einsum("bhkv,bhk->bhv", state_f, k_t)
-        state_f = state_f + jnp.einsum("bhk,bhv->bhkv", k_t, beta_t[..., None] * (v_t - kv_mem))
-        out_t = jnp.einsum("bhkv,bhk->bhv", state_f, q_t)
+        state_f = state_f * jnp.exp(g_t)[:, :, None, :, None]
+        kv_mem = jnp.einsum("bhdgv,bhd->bhgv", state_f, k_t)
+        state_f = state_f + jnp.einsum("bhd,bhgv->bhdgv", k_t, beta_t[..., None] * (v_t - kv_mem))
+        out_t = jnp.einsum("bhdgv,bhd->bhgv", state_f, q_t)
         return state_f.astype(state_dtype), out_t.astype(value.dtype)
 
     final_state, outputs = jax.lax.scan(
@@ -381,6 +394,7 @@ def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
             jnp.swapaxes(g, 0, 1),
             jnp.swapaxes(beta, 0, 1),
         ),
+        unroll=QWEN3_5_LINEAR_SCAN_UNROLL,
     )
     return jnp.swapaxes(outputs, 0, 1), final_state
 
