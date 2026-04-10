@@ -17,6 +17,7 @@ import openpi.training.sharding as sharding
 QWEN3_5_VOCAB_SIZE = 248_320
 QWEN3_5_ROPE_THETA = 10_000_000.0
 QWEN3_5_LINEAR_SCAN_UNROLL = 8
+QWEN3_5_LINEAR_TRAIN_SCAN_UNROLL = 16
 
 
 @at.typecheck
@@ -79,15 +80,16 @@ class DepthwiseShortConv1D(nn.Module):
         kernel = self.param("kernel", nn.initializers.normal(stddev=0.02), (self.kernel_size, self.channels))
 
         if cache is None:
-            rhs = jnp.transpose(kernel[::-1].astype(x.dtype), (1, 0))[:, None, :]
-            y = jax.lax.conv_general_dilated(
-                jnp.swapaxes(x, 1, 2),
-                rhs,
-                window_strides=(1,),
-                padding=((self.kernel_size - 1, 0),),
-                dimension_numbers=("NCT", "OIT", "NCT"),
-                feature_group_count=self.channels,
-            )
+            with jax.named_scope("short_conv_train"):
+                rhs = jnp.transpose(kernel[::-1].astype(x.dtype), (1, 0))[:, None, :]
+                y = jax.lax.conv_general_dilated(
+                    jnp.swapaxes(x, 1, 2),
+                    rhs,
+                    window_strides=(1,),
+                    padding=((self.kernel_size - 1, 0),),
+                    dimension_numbers=("NCT", "OIT", "NCT"),
+                    feature_group_count=self.channels,
+                )
             next_cache = x[:, -(self.kernel_size - 1) :, :] if self.kernel_size > 1 else x[:, :0, :]
             return nn.silu(jnp.swapaxes(y, 1, 2)), next_cache
 
@@ -275,17 +277,19 @@ class GatedDeltaNet(nn.Module):
             b_chunks.append(beta)
             a_chunks.append(alpha)
 
-        qkv = jnp.concatenate(projected, axis=1)
-        z = jnp.concatenate(z_chunks, axis=1).reshape(qkv.shape[0], qkv.shape[1], num_v_heads, value_dim)
-        beta = jax.nn.sigmoid(jnp.concatenate(b_chunks, axis=1))
-        a = jnp.concatenate(a_chunks, axis=1)
+        with jax.named_scope("linear_attention_project"):
+            qkv = jnp.concatenate(projected, axis=1)
+            z = jnp.concatenate(z_chunks, axis=1).reshape(qkv.shape[0], qkv.shape[1], num_v_heads, value_dim)
+            beta = jax.nn.sigmoid(jnp.concatenate(b_chunks, axis=1))
+            a = jnp.concatenate(a_chunks, axis=1)
 
         _, _, conv_cache, recurrent_cache = kv_cache if kv_cache is not None else (None, None, None, None)
-        qkv, conv_cache = DepthwiseShortConv1D(
-            channels=conv_hidden,
-            kernel_size=config.linear_conv_kernel_dim,
-            name="short_conv",
-        )(qkv, cache=conv_cache)
+        with jax.named_scope("linear_attention_short_conv"):
+            qkv, conv_cache = DepthwiseShortConv1D(
+                channels=conv_hidden,
+                kernel_size=config.linear_conv_kernel_dim,
+                name="short_conv",
+            )(qkv, cache=conv_cache)
 
         split_sizes = (
             num_k_heads * key_dim,
@@ -326,15 +330,17 @@ class GatedDeltaNet(nn.Module):
         z = z * valid[:, :, None, None, None]
         beta = beta * valid[:, :, None, None]
         g = jnp.where(valid[:, :, None, None].astype(bool), g, 0.0)
+        decay = jnp.exp(g).astype(dtype)
 
-        outputs, recurrent_cache = _gated_delta_recurrence(
-            query,
-            key,
-            value,
-            g,
-            beta,
-            initial_state=recurrent_cache,
-        )
+        with jax.named_scope("linear_attention_recurrence"):
+            outputs, recurrent_cache = _gated_delta_recurrence(
+                query,
+                key,
+                value,
+                decay,
+                beta,
+                initial_state=recurrent_cache,
+            )
         outputs = RMSNormGated(name="norm")(outputs, z).reshape(outputs.shape[0], outputs.shape[1], -1)
 
         out = []
@@ -357,7 +363,7 @@ class GatedDeltaNet(nn.Module):
         return out, (None, None, conv_cache, recurrent_cache)
 
 
-def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
+def _gated_delta_recurrence(query, key, value, decay, beta, *, initial_state):
     query = _l2_normalize(query) * (query.shape[-1] ** -0.5)
     key = _l2_normalize(key)
     batch_size, _, num_heads, key_dim = query.shape
@@ -370,20 +376,22 @@ def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
     compute_dtype = jnp.float32 if state_dtype in (jnp.bfloat16, jnp.float16) else state_dtype
 
     def step(state, inputs):
-        q_t, k_t, v_t, g_t, beta_t = inputs
+        q_t, k_t, v_t, decay_t, beta_t = inputs
         state_f = state.astype(compute_dtype)
         q_t = q_t.astype(compute_dtype)
         k_t = k_t.astype(compute_dtype)
         v_t = v_t.astype(compute_dtype)
+        decay_t = decay_t.astype(compute_dtype)
         beta_t = beta_t.astype(compute_dtype)
-        g_t = g_t.astype(compute_dtype)
-
-        state_f = state_f * jnp.exp(g_t)[:, :, None, :, None]
-        kv_mem = jnp.einsum("bhdgv,bhd->bhgv", state_f, k_t)
-        state_f = state_f + jnp.einsum("bhd,bhgv->bhdgv", k_t, beta_t[..., None] * (v_t - kv_mem))
-        out_t = jnp.einsum("bhdgv,bhd->bhgv", state_f, q_t)
+        state_f = state_f * decay_t[:, :, None, :, None]
+        k_t = k_t[:, :, :, None, None]
+        kv_mem = jnp.sum(state_f * k_t, axis=2)
+        delta = (beta_t[..., None] * (v_t - kv_mem))[:, :, None, :, :]
+        state_f = state_f + k_t * delta
+        out_t = jnp.sum(state_f * q_t[:, :, :, None, None], axis=2)
         return state_f.astype(state_dtype), out_t.astype(value.dtype)
 
+    scan_unroll = QWEN3_5_LINEAR_SCAN_UNROLL if query.shape[1] == 1 else QWEN3_5_LINEAR_TRAIN_SCAN_UNROLL
     final_state, outputs = jax.lax.scan(
         step,
         initial_state,
@@ -391,16 +399,17 @@ def _gated_delta_recurrence(query, key, value, g, beta, *, initial_state):
             jnp.swapaxes(query, 0, 1),
             jnp.swapaxes(key, 0, 1),
             jnp.swapaxes(value, 0, 1),
-            jnp.swapaxes(g, 0, 1),
+            jnp.swapaxes(decay, 0, 1),
             jnp.swapaxes(beta, 0, 1),
         ),
-        unroll=QWEN3_5_LINEAR_SCAN_UNROLL,
+        unroll=scan_unroll,
     )
     return jnp.swapaxes(outputs, 0, 1), final_state
 
 
 def _l2_normalize(x, eps: float = 1e-6):
-    return x / jnp.maximum(jnp.linalg.norm(x.astype(jnp.float32), axis=-1, keepdims=True), eps)
+    inv_norm = jax.lax.rsqrt(jnp.maximum(jnp.sum(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True), eps * eps))
+    return x * inv_norm.astype(x.dtype)
 
 
 @at.typecheck

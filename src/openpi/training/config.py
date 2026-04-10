@@ -979,6 +979,8 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # If true, compute grad/param global norms on log steps. Disable to reduce logging overhead on large models.
+    log_param_and_grad_norms: bool = True
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.

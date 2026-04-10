@@ -168,11 +168,29 @@ Current change in [text.py](/Users/lxt/Github/Lumos/openpi/src/openpi/models/qwe
 - removed unnecessary `repeat_kv`-style materialization in the linear-attention path
 - restructured recurrence state into grouped shape
 - added `unroll=8` to the recurrent scan
+- moved `exp(g)` outside the recurrent scan
+- replaced inner-step `einsum` contractions with simpler broadcast + reduction updates
+- switched normalization to a lighter `rsqrt(sum(square(x)))` form
+- added named scopes around projection, short-conv, and recurrence hotspots for profiling
 
 Why this matters:
 
 - it reduces unnecessary tensor expansion
 - it keeps the reference recurrence but makes it less wasteful
+- it gives the training path a more runtime-friendly scan body without changing weight layout
+
+## 4. Tuned the Training Scan for Runtime
+
+Current change in [text.py](/Users/lxt/Github/Lumos/openpi/src/openpi/models/qwen3_5/text.py):
+
+- decode/incremental cache path still uses the smaller scan unroll
+- training/prefill recurrence now uses a larger scan unroll than decode
+
+Why this matters:
+
+- training sequence lengths are much larger than decode
+- a slightly larger unroll can improve GPU utilization on the hot recurrent path
+- we keep the decode path conservative to avoid unnecessary compile bloat there
 
 ## Screening Checklist for Future Backbones
 
@@ -299,4 +317,3 @@ Most promising next steps:
   - full attention
 - benchmark forward-only vs backward-inclusive step time
 - consider a more specialized recurrent implementation if `qwen3.5` will remain a primary training target
-

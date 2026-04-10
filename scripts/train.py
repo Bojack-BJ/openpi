@@ -19,7 +19,6 @@ os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
 
 import etils.epath as epath
 import flax.nnx as nnx
-from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.experimental
@@ -281,6 +280,7 @@ def init_train_state(
 def train_step(
     config: _config.TrainConfig,
     rng: at.KeyArrayLike,
+    compute_norms: at.Bool[at.Array, ""] | np.bool_,
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
@@ -318,19 +318,31 @@ def train_step(
             ),
         )
 
-    # Filter out params that aren't kernels.
-    kernel_params = nnx.state(
-        model,
-        nnx.All(
-            nnx.Param,
-            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
-            lambda _, x: x.value.ndim > 1,
-        ),
-    )
+    def _metrics_enabled(_):
+        kernel_params = nnx.state(
+            model,
+            nnx.All(
+                nnx.Param,
+                nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+                lambda _, x: x.value.ndim > 1,
+            ),
+        )
+        return {
+            "grad_norm": optax.global_norm(grads),
+            "param_norm": optax.global_norm(kernel_params),
+        }
+
+    def _metrics_disabled(_):
+        nan_value = jnp.asarray(jnp.nan, dtype=loss.dtype)
+        return {
+            "grad_norm": nan_value,
+            "param_norm": nan_value,
+        }
+
+    metrics = jax.lax.cond(compute_norms, _metrics_enabled, _metrics_disabled, operand=None)
     info = {
         "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
+        **metrics,
     }
     return new_state, info
 
@@ -392,9 +404,9 @@ def main(config: _config.TrainConfig):
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
-        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        in_shardings=(replicated_sharding, replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
+        donate_argnums=(2,),
     )
 
     start_step = int(train_state.step)
@@ -405,9 +417,11 @@ def main(config: _config.TrainConfig):
         dynamic_ncols=True,
     )
 
-    infos = []
+    losses = []
     for step in pbar:
         is_first_step = step == start_step
+        should_log = step % config.log_interval == 0
+        should_compute_norms = should_log and config.log_param_and_grad_norms
         if is_first_step:
             logging.info(
                 "First train step started: compiling train_step JIT for current model/sharding (this may take minutes)."
@@ -419,7 +433,7 @@ def main(config: _config.TrainConfig):
             )
         try:
             with sharding.set_mesh(mesh):
-                train_state, info = ptrain_step(train_rng, train_state, batch)
+                train_state, info = ptrain_step(train_rng, np.bool_(should_compute_norms), train_state, batch)
             if is_first_step:
                 # Ensure compile + first execution time is fully materialized for accurate logging.
                 train_state = jax.block_until_ready(train_state)
@@ -435,14 +449,18 @@ def main(config: _config.TrainConfig):
             if is_first_step:
                 compile_log_stop.set()
                 compile_log_thread.join(timeout=1.0)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+        losses.append(info["loss"])
+        if should_log:
+            reduced_info = {
+                "loss": float(jax.device_get(jnp.mean(jnp.stack(losses)))),
+            }
+            if config.log_param_and_grad_norms:
+                reduced_info["grad_norm"] = float(jax.device_get(info["grad_norm"]))
+                reduced_info["param_norm"] = float(jax.device_get(info["param_norm"]))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
-            infos = []
+            losses = []
         batch = next(data_iter)
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
