@@ -366,8 +366,11 @@ def main(config: _config.TrainConfig):
         sharding=data_sharding,
         shuffle=True,
     )
+    logging.info("Fetching first batch from data loader...")
+    first_batch_t0 = time.perf_counter()
     data_iter = iter(data_loader)
     batch = next(data_iter)
+    logging.info("Fetched first batch in %.1f seconds.", time.perf_counter() - first_batch_t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
