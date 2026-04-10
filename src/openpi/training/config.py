@@ -1026,6 +1026,9 @@ class TrainConfig:
     log_train_state_details: bool = False
     # Directory for JAX persistent compilation cache. Set to None to disable caching.
     jax_compilation_cache_dir: str | None = "~/.cache/jax/openpi"
+    # Backward-compatible alias for wiring Qwen3.5 remat mode from TrainConfig-level presets/CLI.
+    # New code should prefer `model.qwen3_5_remat_mode`.
+    qwen3_5_remat_mode: Literal["all", "linear_only", "off"] | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1047,6 +1050,12 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.qwen3_5_remat_mode is not None and isinstance(self.model, pi0_config.Pi0Config):
+            object.__setattr__(
+                self,
+                "model",
+                dataclasses.replace(self.model, qwen3_5_remat_mode=self.qwen3_5_remat_mode),
+            )
 
 LOCAL_QWEN_2_5_3B = "/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"
 LOCAL_QWEN_3_5_2B = "/root/Users/lixiaotong/Qwen3.5-2B"
