@@ -504,20 +504,38 @@ GroupCache: TypeAlias = tuple[LayerCache, LayerCache, LayerCache, LayerCache]
 class DecoderLayerGroup(nn.Module):
     configs: tuple[Config, ...]
     layer_types: tuple[str, str, str, str]
+    remat_mode: str = "all"
     rope_theta: float = qwen_rotary.QWEN3_5_ROPE_THETA
     partial_rotary_factor: float = qwen_rotary.QWEN3_5_DEFAULT_PARTIAL_ROTARY_FACTOR
     mrope_section: tuple[int, int, int] | None = None
 
     def setup(self):
-        self.layers = tuple(
-            DecoderLayer(
+        remat_layer_cls = nn.remat(
+            DecoderLayer,
+            prevent_cse=False,
+            static_argnums=(5,),
+            policy=jax.checkpoint_policies.nothing_saveable,
+        )
+
+        def make_layer(layer_type: str, index: int):
+            layer_cls = DecoderLayer
+            if self.remat_mode == "all":
+                layer_cls = remat_layer_cls
+            elif self.remat_mode == "linear_only" and layer_type == "linear_attention":
+                layer_cls = remat_layer_cls
+            elif self.remat_mode != "off":
+                raise ValueError(f"Unsupported Qwen3.5 remat_mode: {self.remat_mode}")
+            return layer_cls(
                 configs=self.configs,
                 layer_type=layer_type,
                 rope_theta=self.rope_theta,
                 partial_rotary_factor=self.partial_rotary_factor,
                 mrope_section=self.mrope_section,
-                name=f"layers_{i}",
+                name=f"layers_{index}",
             )
+
+        self.layers = tuple(
+            make_layer(layer_type, i)
             for i, layer_type in enumerate(self.layer_types)
         )
 
@@ -540,7 +558,7 @@ KVCache: TypeAlias = Any
 class Module(nn.Module):
     configs: Sequence[Config]
     embed_dtype: str
-    use_remat: bool = True
+    remat_mode: str = "all"
     vocab_size: int = QWEN3_5_VOCAB_SIZE
     rope_theta: float = qwen_rotary.QWEN3_5_ROPE_THETA
     partial_rotary_factor: float = qwen_rotary.QWEN3_5_DEFAULT_PARTIAL_ROTARY_FACTOR
@@ -566,14 +584,9 @@ class Module(nn.Module):
             embed_dim=self.configs[0].width,
             name="embedder",
         )
+        if self.remat_mode not in ("all", "linear_only", "off"):
+            raise ValueError(f"Unsupported Qwen3.5 remat_mode: {self.remat_mode}")
         block_cls = DecoderLayerGroup
-        if self.use_remat:
-            block_cls = nn.remat(
-                DecoderLayerGroup,
-                prevent_cse=False,
-                static_argnums=(5,),
-                policy=jax.checkpoint_policies.nothing_saveable,
-            )
         self.layers = nn.scan(
             block_cls,
             variable_axes={"params": 0},
@@ -583,6 +596,7 @@ class Module(nn.Module):
         )(
             configs=tuple(self.configs),
             layer_types=layer_group_types,
+            remat_mode=self.remat_mode,
             rope_theta=self.rope_theta,
             partial_rotary_factor=self.partial_rotary_factor,
             mrope_section=self.mrope_section,

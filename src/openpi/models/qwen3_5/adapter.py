@@ -31,7 +31,7 @@ class Qwen3_5_VLWithExpertModel(_qwen2_5_adapter.Qwen2_5_VLWithExpertModel):
         image_example,
         rngs: nnx.Rngs,
         hf_model_id: str | None = None,
-        use_remat: bool = True,
+        remat_mode: str = "all",
     ):
         self.hf_model_id = hf_model_id
         if any(use_adarms):
@@ -66,7 +66,7 @@ class Qwen3_5_VLWithExpertModel(_qwen2_5_adapter.Qwen2_5_VLWithExpertModel):
             _qwen3_5_text.Module(
                 configs=[vlm_config, action_expert_config],
                 embed_dtype=precision,
-                use_remat=use_remat,
+                remat_mode=remat_mode,
                 vocab_size=vlm_config.vocab_size or QWEN3_5_VOCAB_SIZE,
                 rope_theta=vlm_config.rope_theta or QWEN3_5_ROPE_THETA,
                 partial_rotary_factor=vlm_config.partial_rotary_factor

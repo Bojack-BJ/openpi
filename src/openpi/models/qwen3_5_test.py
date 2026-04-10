@@ -111,6 +111,18 @@ def test_qwen3_5_small_action_expert_model_builds():
     )
 
 
+def test_qwen3_5_linear_only_remat_mode_builds():
+    config = _pi0_config.Pi0Config(
+        vlm_backend="qwen3_5_vl",
+        vlm_backbone_variant="qwen3_5_2b",
+        action_expert_variant="qwen3_5_2b_action_400m",
+        qwen3_5_remat_mode="linear_only",
+    )
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    flat_state = nnx.state(abstract_model, nnx.Param).flat_state()
+    assert flat_state
+
+
 def test_qwen3_5_resolves_mrope_sections_for_mixed_rotary_widths():
     assert _qwen3_5_rotary.resolve_mrope_section(64, (11, 11, 10)) == (11, 11, 10)
     assert _qwen3_5_rotary.resolve_mrope_section(32, (11, 11, 10)) == (6, 5, 5)

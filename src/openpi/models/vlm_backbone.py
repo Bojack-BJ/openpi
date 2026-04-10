@@ -135,7 +135,7 @@ def create_vlm_with_expert_model(
     image_example,
     rngs: nnx.Rngs,
     hf_model_id: str | None = None,
-    use_remat: bool = True,
+    qwen3_5_remat_mode: str = "all",
 ) -> VLMWithExpertModel:
     if vlm_backend == "paligemma":
         return PaliGemmaWithExpertModel(
@@ -166,7 +166,7 @@ def create_vlm_with_expert_model(
             image_example=image_example,
             rngs=rngs,
             hf_model_id=hf_model_id,
-            use_remat=use_remat,
+            remat_mode=qwen3_5_remat_mode,
         )
 
     if vlm_backend == "internvl3":
