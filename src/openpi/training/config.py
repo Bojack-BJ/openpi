@@ -1646,6 +1646,33 @@ _CONFIGS = [
         num_workers = 32
         ),
     TrainConfig(
+        name="20260309K055Aa_Make_a_sandwich",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
         name="fruit_classification_Aa_qwen",
         model=pi0_config.Pi0Config(
             vlm_backend="qwen2_5_vl",
@@ -1693,8 +1720,8 @@ _CONFIGS = [
         weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_4B, local_files_only=True),
         num_train_steps=60_000,
         ema_decay=None,
-        batch_size=16,
-        num_workers=64,
+        batch_size=32,
+        num_workers=16,
         qwen3_5_remat_mode="linear_only",
     ),
     TrainConfig(
@@ -1794,7 +1821,35 @@ _CONFIGS = [
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
         batch_size = 32,
-        num_workers = 32
+        num_workers = 16
+        ),
+    TrainConfig(
+        name="Waste_sorting_Aa_qwen2_5",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/Waste_sorting_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/Waste_sorting_Aa",
+                asset_id="fastumi/Waste_sorting_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=16,
         ),
     TrainConfig(
         name="toy_block_placement_Aa",
