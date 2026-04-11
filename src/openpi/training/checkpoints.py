@@ -4,6 +4,8 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+from typing import Any
+from collections.abc import Mapping
 from typing import Protocol
 
 from etils import epath
@@ -11,6 +13,7 @@ import jax
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
+import openpi.models.vlm_backbone as _vlm_backbone
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
@@ -97,13 +100,31 @@ def restore_state(
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        restored = checkpoint_manager.restore(
-            step,
-            items={
-                "train_state": train_state,
-                "params": {"params": params},
-            },
-        )
+        try:
+            restored = checkpoint_manager.restore(
+                step,
+                items={
+                    "train_state": train_state,
+                    "params": {"params": params},
+                },
+            )
+        except ValueError as exc:
+            if not _looks_like_legacy_vlm_root_mismatch(exc, params):
+                raise
+            logging.info(
+                "Retrying checkpoint restore with legacy VLM root remap compatibility for params item."
+            )
+            restored = checkpoint_manager.restore(
+                step,
+                args=ocp.args.Composite(
+                    train_state=ocp.args.PyTreeRestore(item=train_state),
+                    params=ocp.args.PyTreeRestore(),
+                ),
+            )
+            restored = {
+                "train_state": restored["train_state"],
+                "params": _remap_restored_params_item(restored["params"], params),
+            }
     return _merge_params(restored["train_state"], restored["params"])
 
 
@@ -167,3 +188,25 @@ def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.P
     if train_state.params:
         return dataclasses.replace(train_state, ema_params=params["params"])
     return dataclasses.replace(train_state, params=params["params"])
+
+
+def _looks_like_legacy_vlm_root_mismatch(exc: ValueError, reference_params: Mapping[str, Any]) -> bool:
+    msg = str(exc)
+    if "tree structures do not match" not in msg:
+        return False
+    if _vlm_backbone.RUNTIME_VLM_ROOT not in reference_params:
+        return False
+    return _vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT in msg
+
+
+def _remap_restored_params_item(
+    restored_params_item: Mapping[str, Any], reference_params: Mapping[str, Any]
+) -> dict[str, Any]:
+    if "params" not in restored_params_item:
+        return dict(restored_params_item)
+
+    remapped = dict(restored_params_item)
+    remapped["params"] = _vlm_backbone.remap_legacy_vlm_checkpoint_root_for_reference(
+        remapped["params"], reference_params
+    )
+    return remapped
