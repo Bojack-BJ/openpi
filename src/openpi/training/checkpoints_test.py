@@ -33,3 +33,26 @@ def test_looks_like_legacy_vlm_root_mismatch_only_triggers_for_runtime_qwen_para
     assert not _checkpoints._looks_like_legacy_vlm_root_mismatch(
         exc, {_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT: {"llm": {}}}
     )
+
+
+def test_remap_legacy_vlm_roots_in_tree_handles_nested_optimizer_slots():
+    tree = {
+        "opt_state": [
+            None,
+            [
+                {
+                    "mu": {_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT: {"llm": {"embedder": {"value": 1}}}},
+                    "nu": {_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT: {"llm": {"embedder": {"value": 2}}}},
+                }
+            ],
+        ]
+    }
+
+    remapped = _checkpoints._remap_legacy_vlm_roots_in_tree(tree)
+
+    mu = remapped["opt_state"][1][0]["mu"]
+    nu = remapped["opt_state"][1][0]["nu"]
+    assert _vlm_backbone.RUNTIME_VLM_ROOT in mu
+    assert _vlm_backbone.RUNTIME_VLM_ROOT in nu
+    assert _vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT not in mu
+    assert _vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT not in nu

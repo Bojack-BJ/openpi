@@ -390,8 +390,6 @@ def main(config: _config.TrainConfig):
         wandb.Image(_to_wandb_image_uint8(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1)))
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
-    wandb.log({"camera_views": images_to_log}, step=0)
-
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     if config.log_train_state_details:
@@ -401,6 +399,8 @@ def main(config: _config.TrainConfig):
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    wandb.log({"camera_views": images_to_log}, step=int(train_state.step))
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),

@@ -112,17 +112,17 @@ def restore_state(
             if not _looks_like_legacy_vlm_root_mismatch(exc, params):
                 raise
             logging.info(
-                "Retrying checkpoint restore with legacy VLM root remap compatibility for params item."
+                "Retrying checkpoint restore with legacy VLM root remap compatibility for train_state and params."
             )
             restored = checkpoint_manager.restore(
                 step,
                 args=ocp.args.Composite(
-                    train_state=ocp.args.PyTreeRestore(item=train_state),
+                    train_state=ocp.args.PyTreeRestore(),
                     params=ocp.args.PyTreeRestore(),
                 ),
             )
             restored = {
-                "train_state": restored["train_state"],
+                "train_state": _restore_legacy_train_state_item(restored["train_state"], train_state),
                 "params": _remap_restored_params_item(restored["params"], params),
             }
     return _merge_params(restored["train_state"], restored["params"])
@@ -200,13 +200,45 @@ def _looks_like_legacy_vlm_root_mismatch(exc: ValueError, reference_params: Mapp
 
 
 def _remap_restored_params_item(
-    restored_params_item: Mapping[str, Any], reference_params: Mapping[str, Any]
+    restored_params_item: Mapping[str, Any], _reference_params: Mapping[str, Any]
 ) -> dict[str, Any]:
     if "params" not in restored_params_item:
         return dict(restored_params_item)
 
     remapped = dict(restored_params_item)
-    remapped["params"] = _vlm_backbone.remap_legacy_vlm_checkpoint_root_for_reference(
-        remapped["params"], reference_params
-    )
+    remapped["params"] = _remap_legacy_vlm_roots_in_tree(remapped["params"])
     return remapped
+
+
+def _restore_legacy_train_state_item(
+    restored_train_state_item: Any, reference_train_state: training_utils.TrainState
+) -> training_utils.TrainState:
+    remapped = _remap_legacy_vlm_roots_in_tree(restored_train_state_item)
+    return dataclasses.replace(
+        reference_train_state,
+        step=_get_tree_attr(remapped, "step", reference_train_state.step),
+        params=_get_tree_attr(remapped, "params", reference_train_state.params),
+        model_def=_get_tree_attr(remapped, "model_def", reference_train_state.model_def),
+        opt_state=_get_tree_attr(remapped, "opt_state", reference_train_state.opt_state),
+        ema_params=_get_tree_attr(remapped, "ema_params", reference_train_state.ema_params),
+    )
+
+
+def _get_tree_attr(tree: Any, key: str, default: Any) -> Any:
+    if isinstance(tree, Mapping):
+        return tree.get(key, default)
+    return getattr(tree, key, default)
+
+
+def _remap_legacy_vlm_roots_in_tree(tree: Any) -> Any:
+    if isinstance(tree, Mapping):
+        remapped: dict[Any, Any] = {}
+        for key, value in tree.items():
+            remapped_key = _vlm_backbone.RUNTIME_VLM_ROOT if key == _vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT else key
+            remapped[remapped_key] = _remap_legacy_vlm_roots_in_tree(value)
+        return remapped
+    if isinstance(tree, list):
+        return [_remap_legacy_vlm_roots_in_tree(value) for value in tree]
+    if isinstance(tree, tuple):
+        return tuple(_remap_legacy_vlm_roots_in_tree(value) for value in tree)
+    return tree
