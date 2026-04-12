@@ -269,11 +269,13 @@ def _swap_vlm_root_in_tree(tree: Any, *, source_root: str, target_root: str) -> 
 
 def _make_restore_args_tree(item: Any, sharding_tree: Any) -> Any:
     item_leaves, item_treedef = jax.tree_util.tree_flatten(item)
-    sharding_leaves, _ = jax.tree_util.tree_flatten(sharding_tree)
+    try:
+        sharding_leaves = item_treedef.flatten_up_to(sharding_tree)
+    except ValueError as exc:
+        raise ValueError("Sharding tree is not structurally compatible with restore item.") from exc
+
     if len(item_leaves) != len(sharding_leaves):
-        raise ValueError(
-            f"Item and sharding trees have different leaf counts: {len(item_leaves)} vs {len(sharding_leaves)}"
-        )
+        raise ValueError(f"Item and sharding trees have different leaf counts: {len(item_leaves)} vs {len(sharding_leaves)}")
 
     restore_args_leaves = []
     for value, shard in zip(item_leaves, sharding_leaves, strict=True):
