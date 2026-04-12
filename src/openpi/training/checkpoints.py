@@ -291,6 +291,16 @@ def _device_put_like_tree(item: Any, sharding_tree: Any) -> Any:
     return jax.tree_util.tree_unflatten(item_treedef, placed_leaves)
 
 
+def _materialize_shape_tree(item: Any, sharding_tree: Any | None = None) -> Any:
+    materialized = jax.tree.map(
+        lambda value: np.zeros(value.shape, dtype=value.dtype) if isinstance(value, jax.ShapeDtypeStruct) else value,
+        item,
+    )
+    if sharding_tree is None:
+        return materialized
+    return _device_put_like_tree(materialized, sharding_tree)
+
+
 def _restore_train_state_and_params(
     checkpoint_manager: ocp.CheckpointManager,
     *,
@@ -346,6 +356,7 @@ def _restore_params_only_state(
     legacy_root: bool,
 ) -> training_utils.TrainState:
     restore_step = _resolve_restore_step(checkpoint_manager, step)
+    base_state = _materialize_shape_tree(state, state_sharding)
     restored_params_pure = _restore_params_pure_dict(
         checkpoint_manager.directory / str(restore_step) / "params",
         legacy_root=legacy_root,
@@ -353,7 +364,7 @@ def _restore_params_only_state(
     params_sharding = state_sharding.params.to_pure_dict() if hasattr(state_sharding.params, "to_pure_dict") else state_sharding.params
     restored_params_pure = _device_put_like_tree(restored_params_pure, params_sharding)
     restored_params_state = _rehydrate_params_like_reference(params, restored_params_pure)
-    restored_state = _merge_params(state, {"params": restored_params_state})
+    restored_state = _merge_params(base_state, {"params": restored_params_state})
     return dataclasses.replace(restored_state, step=np.asarray(restore_step, dtype=np.int32))
 
 
