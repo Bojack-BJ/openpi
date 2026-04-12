@@ -268,9 +268,18 @@ def _swap_vlm_root_in_tree(tree: Any, *, source_root: str, target_root: str) -> 
 
 
 def _make_restore_args_tree(item: Any, sharding_tree: Any) -> Any:
-    def _to_restore_args(value: Any, shard: Any) -> ocp.RestoreArgs:
-        if hasattr(value, "shape") and hasattr(value, "dtype"):
-            return ocp.ArrayRestoreArgs(sharding=shard, restore_type=jax.Array, dtype=value.dtype)
-        return ocp.RestoreArgs()
+    item_leaves, item_treedef = jax.tree_util.tree_flatten(item)
+    sharding_leaves, _ = jax.tree_util.tree_flatten(sharding_tree)
+    if len(item_leaves) != len(sharding_leaves):
+        raise ValueError(
+            f"Item and sharding trees have different leaf counts: {len(item_leaves)} vs {len(sharding_leaves)}"
+        )
 
-    return jax.tree.map(_to_restore_args, item, sharding_tree)
+    restore_args_leaves = []
+    for value, shard in zip(item_leaves, sharding_leaves, strict=True):
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            restore_args_leaves.append(ocp.ArrayRestoreArgs(sharding=shard, restore_type=jax.Array, dtype=value.dtype))
+        else:
+            restore_args_leaves.append(ocp.RestoreArgs())
+
+    return jax.tree_util.tree_unflatten(item_treedef, restore_args_leaves)
