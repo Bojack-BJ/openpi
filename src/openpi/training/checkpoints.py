@@ -258,6 +258,11 @@ def _swap_vlm_root_in_tree(tree: Any, *, source_root: str, target_root: str) -> 
             opt_state=_swap_vlm_root_in_tree(tree.opt_state, source_root=source_root, target_root=target_root),
             ema_params=_swap_vlm_root_in_tree(tree.ema_params, source_root=source_root, target_root=target_root),
         )
+    if hasattr(tree, "to_pure_dict") and hasattr(tree, "replace_by_pure_dict"):
+        remapped_pure = _swap_vlm_root_in_tree(tree.to_pure_dict(), source_root=source_root, target_root=target_root)
+        remapped_tree = jax.tree_util.tree_map(lambda x: x, tree)
+        remapped_tree.replace_by_pure_dict(remapped_pure)
+        return remapped_tree
     if isinstance(tree, Mapping):
         remapped: dict[Any, Any] = {}
         for key, value in tree.items():
