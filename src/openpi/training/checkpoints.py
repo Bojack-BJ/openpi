@@ -13,6 +13,7 @@ import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
+from flax import traverse_util
 
 import openpi.models.vlm_backbone as _vlm_backbone
 from openpi.shared import array_typing as at
@@ -126,32 +127,17 @@ def restore_state(
                 )
             if not _looks_like_legacy_vlm_root_mismatch(exc, params):
                 raise
-            logging.info(
-                "Retrying checkpoint restore with legacy VLM root reference compatibility for train_state and params."
+            logging.warning(
+                "Checkpoint uses legacy VLM root layout; restoring params only and reinitializing optimizer state."
             )
-            try:
-                restored = _restore_train_state_and_params(
-                    checkpoint_manager,
-                    train_state=train_state,
-                    params=params,
-                    step=step,
-                    legacy_root=True,
-                )
-            except ValueError as legacy_exc:
-                if not _looks_like_opt_state_structure_mismatch(legacy_exc):
-                    raise
-                logging.warning(
-                    "Legacy checkpoint optimizer state structure is incompatible with current code; "
-                    "restoring params only and reinitializing optimizer state."
-                )
-                return _restore_params_only_state(
-                    checkpoint_manager,
-                    state,
-                    state_sharding,
-                    params=params,
-                    step=step,
-                    legacy_root=True,
-                )
+            return _restore_params_only_state(
+                checkpoint_manager,
+                state,
+                state_sharding,
+                params=params,
+                step=step,
+                legacy_root=True,
+            )
         restored = {
             "train_state": _device_put_like_tree(restored["train_state"], state_sharding),
             "params": _device_put_like_tree(restored["params"], {"params": state_sharding.params}),
@@ -359,26 +345,15 @@ def _restore_params_only_state(
     step: int | None,
     legacy_root: bool,
 ) -> training_utils.TrainState:
-    restore_params_ref = params
-    if legacy_root:
-        restore_params_ref = _swap_vlm_root_in_tree(
-            params,
-            source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
-            target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
-        )
-    restored_params_item = checkpoint_manager.restore(
-        step,
-        args=ocp.args.Composite(
-            params=ocp.args.PyTreeRestore(
-                item={"params": restore_params_ref},
-                restore_args={"params": _make_host_restore_args_tree(restore_params_ref)},
-            ),
-        ),
-    )["params"]
-    restored_params = _remap_restored_params_item(restored_params_item, params)
-    restored_params = _device_put_like_tree(restored_params, {"params": state_sharding.params})
-    restored_state = _merge_params(state, restored_params)
     restore_step = _resolve_restore_step(checkpoint_manager, step)
+    restored_params_pure = _restore_params_pure_dict(
+        checkpoint_manager.directory / str(restore_step) / "params",
+        legacy_root=legacy_root,
+    )
+    params_sharding = state_sharding.params.to_pure_dict() if hasattr(state_sharding.params, "to_pure_dict") else state_sharding.params
+    restored_params_pure = _device_put_like_tree(restored_params_pure, params_sharding)
+    restored_params_state = _rehydrate_params_like_reference(params, restored_params_pure)
+    restored_state = _merge_params(state, {"params": restored_params_state})
     return dataclasses.replace(restored_state, step=np.asarray(restore_step, dtype=np.int32))
 
 
@@ -389,3 +364,37 @@ def _resolve_restore_step(checkpoint_manager: ocp.CheckpointManager, step: int |
     if not steps:
         return 0
     return int(max(steps))
+
+
+def _restore_params_pure_dict(params_path: epath.Path | str, *, legacy_root: bool) -> Any:
+    with ocp.PyTreeCheckpointer() as ckptr:
+        metadata = ckptr.metadata(params_path)
+        item = {"params": metadata["params"]}
+        restored = ckptr.restore(
+            params_path,
+            ocp.args.PyTreeRestore(
+                item=item,
+                restore_args=jax.tree.map(lambda _: ocp.RestoreArgs(restore_type=np.ndarray), item),
+            ),
+        )["params"]
+
+    flat_params = traverse_util.flatten_dict(restored)
+    if flat_params and all(kp[-1] == "value" for kp in flat_params):
+        flat_params = {kp[:-1]: v for kp, v in flat_params.items()}
+        restored = traverse_util.unflatten_dict(flat_params)
+
+    if legacy_root:
+        restored = _swap_vlm_root_in_tree(
+            restored,
+            source_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+            target_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+        )
+    return restored
+
+
+def _rehydrate_params_like_reference(reference_params: Any, restored_params_pure: Any) -> Any:
+    if hasattr(reference_params, "replace_by_pure_dict"):
+        restored_params_state = jax.tree_util.tree_map(lambda x: x, reference_params)
+        restored_params_state.replace_by_pure_dict(restored_params_pure)
+        return restored_params_state
+    return restored_params_pure
