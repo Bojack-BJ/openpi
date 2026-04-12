@@ -354,11 +354,10 @@ def _restore_params_only_state(
     step: int | None,
     legacy_root: bool,
 ) -> training_utils.TrainState:
-    params_pure = params.to_pure_dict() if hasattr(params, "to_pure_dict") else params
-    restore_params_ref = params_pure
+    restore_params_ref = params
     if legacy_root:
         restore_params_ref = _swap_vlm_root_in_tree(
-            params_pure,
+            params,
             source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
             target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
         )
@@ -371,11 +370,9 @@ def _restore_params_only_state(
             ),
         ),
     )["params"]
-    restored_params = _remap_restored_params_item(restored_params_item, params_pure)
-    params_sharding = state_sharding.params.to_pure_dict() if hasattr(state_sharding.params, "to_pure_dict") else state_sharding.params
-    restored_params_pure = _device_put_like_tree(restored_params["params"], params_sharding)
-    restored_params_state = _rehydrate_params_like_reference(params, restored_params_pure)
-    restored_state = _merge_params(state, {"params": restored_params_state})
+    restored_params = _remap_restored_params_item(restored_params_item, params)
+    restored_params = _device_put_like_tree(restored_params, {"params": state_sharding.params})
+    restored_state = _merge_params(state, restored_params)
     restore_step = _resolve_restore_step(checkpoint_manager, step)
     return dataclasses.replace(restored_state, step=np.asarray(restore_step, dtype=np.int32))
 
@@ -387,11 +384,3 @@ def _resolve_restore_step(checkpoint_manager: ocp.CheckpointManager, step: int |
     if not steps:
         return 0
     return int(max(steps))
-
-
-def _rehydrate_params_like_reference(reference_params: Any, restored_params_pure: Any) -> Any:
-    if hasattr(reference_params, "replace_by_pure_dict"):
-        restored_params_state = jax.tree_util.tree_map(lambda x: x, reference_params)
-        restored_params_state.replace_by_pure_dict(restored_params_pure)
-        return restored_params_state
-    return restored_params_pure
