@@ -7,11 +7,11 @@ conda activate pi0_suzhou
 REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=Waste_sorting_Aa_qwen2_5
+cfg=Waste_sorting_Aa_qwen3_5
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp=qwen2_5_3b_700M   # 可单独覆写，默认与cfg一致
+exp=qwen3_5_4b_400M   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
 export HF_DATASETS_CACHE="/root/Users/.cache/"

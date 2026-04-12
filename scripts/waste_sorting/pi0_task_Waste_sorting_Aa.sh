@@ -29,5 +29,5 @@ python scripts/train.py "$cfg" \
   --project_name "umi-openpi" \
   --jax-compilation-cache-dir /root/Users/.cache/jax/openpi \
   --fsdp_devices 8 \
-  --resume
+  --overwrite
 

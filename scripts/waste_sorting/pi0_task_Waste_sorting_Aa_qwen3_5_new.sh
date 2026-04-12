@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
 REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=Waste_sorting_Aa_qwen2_5
+cfg=Waste_sorting_Aa_qwen3_5_4b_1b
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp=qwen2_5_3b_700M   # 可单独覆写，默认与cfg一致
+exp=qwen3_5_4b_1b   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
 export HF_DATASETS_CACHE="/root/Users/.cache/"
@@ -29,5 +29,5 @@ python scripts/train.py "$cfg" \
   --project_name "umi-openpi" \
   --jax-compilation-cache-dir /root/Users/.cache/jax/openpi \
   --overwrite \
-  --fsdp_devices 4 \
+  --fsdp_devices 8 \
 

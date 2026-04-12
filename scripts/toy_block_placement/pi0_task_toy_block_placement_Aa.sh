@@ -26,5 +26,5 @@ python scripts/compute_norm_stats.py --config-name "$exp"
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py "$cfg" \
   --exp-name "$exp" \
-  --overwrite
+  --resume
 
