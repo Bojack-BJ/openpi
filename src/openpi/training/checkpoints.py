@@ -103,61 +103,55 @@ def restore_state(
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
         try:
-            restored = checkpoint_manager.restore(
-                step,
-                args=ocp.args.Composite(
-                    train_state=ocp.args.PyTreeRestore(
-                        item=train_state,
-                        restore_args=_make_host_restore_args_tree(train_state),
-                    ),
-                    params=ocp.args.PyTreeRestore(
-                        item={"params": params},
-                        restore_args={"params": _make_host_restore_args_tree(params)},
-                    ),
-                ),
+            restored = _restore_train_state_and_params(
+                checkpoint_manager,
+                train_state=train_state,
+                params=params,
+                step=step,
+                legacy_root=False,
             )
         except ValueError as exc:
+            if _looks_like_opt_state_structure_mismatch(exc):
+                logging.warning(
+                    "Checkpoint optimizer state structure is incompatible with current code; "
+                    "restoring params only and reinitializing optimizer state."
+                )
+                return _restore_params_only_state(
+                    checkpoint_manager,
+                    state,
+                    state_sharding,
+                    params=params,
+                    step=step,
+                    legacy_root=False,
+                )
             if not _looks_like_legacy_vlm_root_mismatch(exc, params):
                 raise
             logging.info(
                 "Retrying checkpoint restore with legacy VLM root reference compatibility for train_state and params."
             )
-            legacy_train_state = _swap_vlm_root_in_tree(
-                train_state,
-                source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
-                target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
-            )
-            legacy_params = _swap_vlm_root_in_tree(
-                params,
-                source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
-                target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
-            )
-            legacy_state_sharding = _swap_vlm_root_in_tree(
-                state_sharding,
-                source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
-                target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
-            )
-            restored = checkpoint_manager.restore(
-                step,
-                args=ocp.args.Composite(
-                    train_state=ocp.args.PyTreeRestore(
-                        item=legacy_train_state,
-                        restore_args=_make_host_restore_args_tree(legacy_train_state),
-                    ),
-                    params=ocp.args.PyTreeRestore(
-                        item={"params": legacy_params},
-                        restore_args={"params": _make_host_restore_args_tree(legacy_params)},
-                    ),
-                ),
-            )
-            restored = {
-                "train_state": _swap_vlm_root_in_tree(
-                    restored["train_state"],
-                    source_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
-                    target_root=_vlm_backbone.RUNTIME_VLM_ROOT,
-                ),
-                "params": _remap_restored_params_item(restored["params"], params),
-            }
+            try:
+                restored = _restore_train_state_and_params(
+                    checkpoint_manager,
+                    train_state=train_state,
+                    params=params,
+                    step=step,
+                    legacy_root=True,
+                )
+            except ValueError as legacy_exc:
+                if not _looks_like_opt_state_structure_mismatch(legacy_exc):
+                    raise
+                logging.warning(
+                    "Legacy checkpoint optimizer state structure is incompatible with current code; "
+                    "restoring params only and reinitializing optimizer state."
+                )
+                return _restore_params_only_state(
+                    checkpoint_manager,
+                    state,
+                    state_sharding,
+                    params=params,
+                    step=step,
+                    legacy_root=True,
+                )
         restored = {
             "train_state": _device_put_like_tree(restored["train_state"], state_sharding),
             "params": _device_put_like_tree(restored["params"], {"params": state_sharding.params}),
@@ -236,6 +230,11 @@ def _looks_like_legacy_vlm_root_mismatch(exc: ValueError, reference_params: Mapp
     return _vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT in msg
 
 
+def _looks_like_opt_state_structure_mismatch(exc: ValueError) -> bool:
+    msg = str(exc)
+    return "tree structures do not match" in msg and "opt_state" in msg
+
+
 def _remap_restored_params_item(
     restored_params_item: Mapping[str, Any], _reference_params: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -299,3 +298,89 @@ def _device_put_like_tree(item: Any, sharding_tree: Any) -> Any:
             placed_leaves.append(value)
 
     return jax.tree_util.tree_unflatten(item_treedef, placed_leaves)
+
+
+def _restore_train_state_and_params(
+    checkpoint_manager: ocp.CheckpointManager,
+    *,
+    train_state: training_utils.TrainState,
+    params: at.Params,
+    step: int | None,
+    legacy_root: bool,
+) -> dict[str, Any]:
+    if legacy_root:
+        train_state = _swap_vlm_root_in_tree(
+            train_state,
+            source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+            target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+        )
+        params = _swap_vlm_root_in_tree(
+            params,
+            source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+            target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+        )
+
+    restored = checkpoint_manager.restore(
+        step,
+        args=ocp.args.Composite(
+            train_state=ocp.args.PyTreeRestore(
+                item=train_state,
+                restore_args=_make_host_restore_args_tree(train_state),
+            ),
+            params=ocp.args.PyTreeRestore(
+                item={"params": params},
+                restore_args={"params": _make_host_restore_args_tree(params)},
+            ),
+        ),
+    )
+    if legacy_root:
+        restored = {
+            "train_state": _swap_vlm_root_in_tree(
+                restored["train_state"],
+                source_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+                target_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+            ),
+            "params": _remap_restored_params_item(restored["params"], params),
+        }
+    return restored
+
+
+def _restore_params_only_state(
+    checkpoint_manager: ocp.CheckpointManager,
+    state: training_utils.TrainState,
+    state_sharding: Any,
+    *,
+    params: at.Params,
+    step: int | None,
+    legacy_root: bool,
+) -> training_utils.TrainState:
+    restore_params_ref = params
+    if legacy_root:
+        restore_params_ref = _swap_vlm_root_in_tree(
+            params,
+            source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+            target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+        )
+    restored_params_item = checkpoint_manager.restore(
+        step,
+        args=ocp.args.Composite(
+            params=ocp.args.PyTreeRestore(
+                item={"params": restore_params_ref},
+                restore_args={"params": _make_host_restore_args_tree(restore_params_ref)},
+            ),
+        ),
+    )["params"]
+    restored_params = _remap_restored_params_item(restored_params_item, params)
+    restored_params = _device_put_like_tree(restored_params, {"params": state_sharding.params})
+    restored_state = _merge_params(state, restored_params)
+    restore_step = _resolve_restore_step(checkpoint_manager, step)
+    return dataclasses.replace(restored_state, step=np.asarray(restore_step, dtype=np.int32))
+
+
+def _resolve_restore_step(checkpoint_manager: ocp.CheckpointManager, step: int | None) -> int:
+    if step is not None:
+        return int(step)
+    steps = tuple(checkpoint_manager.all_steps())
+    if not steps:
+        return 0
+    return int(max(steps))

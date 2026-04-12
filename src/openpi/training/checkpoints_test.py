@@ -35,6 +35,14 @@ def test_looks_like_legacy_vlm_root_mismatch_only_triggers_for_runtime_qwen_para
     )
 
 
+def test_looks_like_opt_state_structure_mismatch():
+    exc = ValueError(
+        "User-provided restore item and on-disk value metadata tree structures do not match: "
+        "{'opt_state': [None, [Diff(lhs=<class \\'list\\'>, rhs=<class \\'dict\\'>)]]}"
+    )
+    assert _checkpoints._looks_like_opt_state_structure_mismatch(exc)
+
+
 def test_swap_vlm_root_in_tree_handles_nested_optimizer_slots():
     tree = {
         "opt_state": [
