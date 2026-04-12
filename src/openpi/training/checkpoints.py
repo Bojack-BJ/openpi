@@ -268,21 +268,9 @@ def _swap_vlm_root_in_tree(tree: Any, *, source_root: str, target_root: str) -> 
 
 
 def _make_restore_args_tree(item: Any, sharding_tree: Any) -> Any:
-    if isinstance(item, training_utils.TrainState):
-        return dataclasses.replace(
-            item,
-            step=_make_restore_args_tree(item.step, sharding_tree.step),
-            params=_make_restore_args_tree(item.params, sharding_tree.params),
-            model_def=_make_restore_args_tree(item.model_def, sharding_tree.model_def),
-            opt_state=_make_restore_args_tree(item.opt_state, sharding_tree.opt_state),
-            ema_params=_make_restore_args_tree(item.ema_params, sharding_tree.ema_params),
-        )
-    if isinstance(item, Mapping):
-        return {key: _make_restore_args_tree(value, sharding_tree[key]) for key, value in item.items()}
-    if isinstance(item, list):
-        return [_make_restore_args_tree(value, shard) for value, shard in zip(item, sharding_tree, strict=True)]
-    if isinstance(item, tuple):
-        return tuple(_make_restore_args_tree(value, shard) for value, shard in zip(item, sharding_tree, strict=True))
-    if hasattr(item, "shape") and hasattr(item, "dtype"):
-        return ocp.ArrayRestoreArgs(sharding=sharding_tree, restore_type=jax.Array, dtype=item.dtype)
-    return ocp.RestoreArgs()
+    def _to_restore_args(value: Any, shard: Any) -> ocp.RestoreArgs:
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            return ocp.ArrayRestoreArgs(sharding=shard, restore_type=jax.Array, dtype=value.dtype)
+        return ocp.RestoreArgs()
+
+    return jax.tree.map(_to_restore_args, item, sharding_tree)
