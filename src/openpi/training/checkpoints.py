@@ -92,6 +92,7 @@ def save_state(
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
+    state_sharding: Any,
     data_loader: _data_loader.DataLoader,
     step: int | None = None,
 ) -> training_utils.TrainState:
@@ -103,10 +104,16 @@ def restore_state(
         try:
             restored = checkpoint_manager.restore(
                 step,
-                items={
-                    "train_state": train_state,
-                    "params": {"params": params},
-                },
+                args=ocp.args.Composite(
+                    train_state=ocp.args.PyTreeRestore(
+                        item=train_state,
+                        restore_args=_make_restore_args_tree(train_state, state_sharding),
+                    ),
+                    params=ocp.args.PyTreeRestore(
+                        item={"params": params},
+                        restore_args={"params": _make_restore_args_tree(params, state_sharding.params)},
+                    ),
+                ),
             )
         except ValueError as exc:
             if not _looks_like_legacy_vlm_root_mismatch(exc, params):
@@ -124,12 +131,23 @@ def restore_state(
                 source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
                 target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
             )
+            legacy_state_sharding = _swap_vlm_root_in_tree(
+                state_sharding,
+                source_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+                target_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+            )
             restored = checkpoint_manager.restore(
                 step,
-                items={
-                    "train_state": legacy_train_state,
-                    "params": {"params": legacy_params},
-                },
+                args=ocp.args.Composite(
+                    train_state=ocp.args.PyTreeRestore(
+                        item=legacy_train_state,
+                        restore_args=_make_restore_args_tree(legacy_train_state, legacy_state_sharding),
+                    ),
+                    params=ocp.args.PyTreeRestore(
+                        item={"params": legacy_params},
+                        restore_args={"params": _make_restore_args_tree(legacy_params, legacy_state_sharding.params)},
+                    ),
+                ),
             )
             restored = {
                 "train_state": _swap_vlm_root_in_tree(
@@ -247,3 +265,24 @@ def _swap_vlm_root_in_tree(tree: Any, *, source_root: str, target_root: str) -> 
     if isinstance(tree, tuple):
         return tuple(_swap_vlm_root_in_tree(value, source_root=source_root, target_root=target_root) for value in tree)
     return tree
+
+
+def _make_restore_args_tree(item: Any, sharding_tree: Any) -> Any:
+    if isinstance(item, training_utils.TrainState):
+        return dataclasses.replace(
+            item,
+            step=_make_restore_args_tree(item.step, sharding_tree.step),
+            params=_make_restore_args_tree(item.params, sharding_tree.params),
+            model_def=_make_restore_args_tree(item.model_def, sharding_tree.model_def),
+            opt_state=_make_restore_args_tree(item.opt_state, sharding_tree.opt_state),
+            ema_params=_make_restore_args_tree(item.ema_params, sharding_tree.ema_params),
+        )
+    if isinstance(item, Mapping):
+        return {key: _make_restore_args_tree(value, sharding_tree[key]) for key, value in item.items()}
+    if isinstance(item, list):
+        return [_make_restore_args_tree(value, shard) for value, shard in zip(item, sharding_tree, strict=True)]
+    if isinstance(item, tuple):
+        return tuple(_make_restore_args_tree(value, shard) for value, shard in zip(item, sharding_tree, strict=True))
+    if hasattr(item, "shape") and hasattr(item, "dtype"):
+        return ocp.ArrayRestoreArgs(sharding=sharding_tree, restore_type=jax.Array, dtype=item.dtype)
+    return ocp.RestoreArgs()

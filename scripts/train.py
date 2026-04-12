@@ -398,7 +398,7 @@ def main(config: _config.TrainConfig):
         logging.info("Initialized train state summary: %s", _summarize_param_tree(train_state.params))
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, train_state_sharding, data_loader)
 
     wandb.log({"camera_views": images_to_log}, step=int(train_state.step))
 
