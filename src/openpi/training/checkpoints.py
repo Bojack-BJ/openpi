@@ -10,6 +10,7 @@ from typing import Protocol
 
 from etils import epath
 import jax
+import numpy as np
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -107,11 +108,11 @@ def restore_state(
                 args=ocp.args.Composite(
                     train_state=ocp.args.PyTreeRestore(
                         item=train_state,
-                        restore_args=_make_restore_args_tree(train_state, state_sharding),
+                        restore_args=_make_host_restore_args_tree(train_state),
                     ),
                     params=ocp.args.PyTreeRestore(
                         item={"params": params},
-                        restore_args={"params": _make_restore_args_tree(params, state_sharding.params)},
+                        restore_args={"params": _make_host_restore_args_tree(params)},
                     ),
                 ),
             )
@@ -141,11 +142,11 @@ def restore_state(
                 args=ocp.args.Composite(
                     train_state=ocp.args.PyTreeRestore(
                         item=legacy_train_state,
-                        restore_args=_make_restore_args_tree(legacy_train_state, legacy_state_sharding),
+                        restore_args=_make_host_restore_args_tree(legacy_train_state),
                     ),
                     params=ocp.args.PyTreeRestore(
                         item={"params": legacy_params},
-                        restore_args={"params": _make_restore_args_tree(legacy_params, legacy_state_sharding.params)},
+                        restore_args={"params": _make_host_restore_args_tree(legacy_params)},
                     ),
                 ),
             )
@@ -157,6 +158,10 @@ def restore_state(
                 ),
                 "params": _remap_restored_params_item(restored["params"], params),
             }
+        restored = {
+            "train_state": _device_put_like_tree(restored["train_state"], state_sharding),
+            "params": _device_put_like_tree(restored["params"], {"params": state_sharding.params}),
+        }
     return _merge_params(restored["train_state"], restored["params"])
 
 
@@ -267,21 +272,30 @@ def _swap_vlm_root_in_tree(tree: Any, *, source_root: str, target_root: str) -> 
     return tree
 
 
-def _make_restore_args_tree(item: Any, sharding_tree: Any) -> Any:
+def _make_host_restore_args_tree(item: Any) -> Any:
     item_leaves, item_treedef = jax.tree_util.tree_flatten(item)
-    try:
-        sharding_leaves = item_treedef.flatten_up_to(sharding_tree)
-    except ValueError as exc:
-        raise ValueError("Sharding tree is not structurally compatible with restore item.") from exc
-
-    if len(item_leaves) != len(sharding_leaves):
-        raise ValueError(f"Item and sharding trees have different leaf counts: {len(item_leaves)} vs {len(sharding_leaves)}")
-
     restore_args_leaves = []
-    for value, shard in zip(item_leaves, sharding_leaves, strict=True):
+    for value in item_leaves:
         if hasattr(value, "shape") and hasattr(value, "dtype"):
-            restore_args_leaves.append(ocp.ArrayRestoreArgs(sharding=shard, restore_type=jax.Array, dtype=value.dtype))
+            restore_args_leaves.append(ocp.RestoreArgs(restore_type=np.ndarray))
         else:
             restore_args_leaves.append(ocp.RestoreArgs())
 
     return jax.tree_util.tree_unflatten(item_treedef, restore_args_leaves)
+
+
+def _device_put_like_tree(item: Any, sharding_tree: Any) -> Any:
+    item_leaves, item_treedef = jax.tree_util.tree_flatten(item)
+    try:
+        sharding_leaves = item_treedef.flatten_up_to(sharding_tree)
+    except ValueError as exc:
+        raise ValueError("Sharding tree is not structurally compatible with restored item.") from exc
+
+    placed_leaves = []
+    for value, shard in zip(item_leaves, sharding_leaves, strict=True):
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            placed_leaves.append(jax.device_put(value, shard))
+        else:
+            placed_leaves.append(value)
+
+    return jax.tree_util.tree_unflatten(item_treedef, placed_leaves)
