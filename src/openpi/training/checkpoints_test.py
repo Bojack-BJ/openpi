@@ -35,7 +35,7 @@ def test_looks_like_legacy_vlm_root_mismatch_only_triggers_for_runtime_qwen_para
     )
 
 
-def test_remap_legacy_vlm_roots_in_tree_handles_nested_optimizer_slots():
+def test_swap_vlm_root_in_tree_handles_nested_optimizer_slots():
     tree = {
         "opt_state": [
             None,
@@ -48,7 +48,11 @@ def test_remap_legacy_vlm_roots_in_tree_handles_nested_optimizer_slots():
         ]
     }
 
-    remapped = _checkpoints._remap_legacy_vlm_roots_in_tree(tree)
+    remapped = _checkpoints._swap_vlm_root_in_tree(
+        tree,
+        source_root=_vlm_backbone.LEGACY_VLM_CHECKPOINT_ROOT,
+        target_root=_vlm_backbone.RUNTIME_VLM_ROOT,
+    )
 
     mu = remapped["opt_state"][1][0]["mu"]
     nu = remapped["opt_state"][1][0]["nu"]
