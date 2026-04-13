@@ -1,14 +1,55 @@
 import logging
 import os
+from typing import Protocol
+from typing import runtime_checkable
 
 import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
 from transformers import AutoProcessor
+from transformers import AutoTokenizer
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
+
+
+@runtime_checkable
+class PromptTokenizer(Protocol):
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]: ...
+
+
+def _pad_or_truncate_tokens(
+    tokens: list[int],
+    max_len: int,
+    *,
+    pad_token_id: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    tokens_len = len(tokens)
+    if tokens_len < max_len:
+        pad_len = max_len - tokens_len
+        mask = [True] * tokens_len + [False] * pad_len
+        tokens = tokens + [pad_token_id] * pad_len
+    else:
+        if tokens_len > max_len:
+            logging.warning(
+                f"Token length ({tokens_len}) exceeds max length ({max_len}), truncating. "
+                "Consider increasing the `max_token_len` in your model config if this happens frequently."
+            )
+        tokens = tokens[:max_len]
+        mask = [True] * max_len
+
+    return np.asarray(tokens), np.asarray(mask)
+
+
+def _build_pi_prompt_text(prompt: str, state: np.ndarray | None = None) -> str:
+    cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+    if state is None:
+        return cleaned_text
+
+    discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+    state_str = " ".join(map(str, discretized_state))
+    return f"Task: {cleaned_text}, State: {state_str};"
 
 
 class PaligemmaTokenizer:
@@ -20,32 +61,73 @@ class PaligemmaTokenizer:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
     def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
-            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-            state_str = " ".join(map(str, discretized_state))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            full_prompt = f"{_build_pi_prompt_text(prompt, state)}\nAction: "
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
             # tokenize "\n" separately as the "start of answer" token
-            tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
-        tokens_len = len(tokens)
-        if tokens_len < self._max_len:
-            padding = [False] * (self._max_len - tokens_len)
-            mask = [True] * tokens_len + padding
-            tokens = tokens + padding
-        else:
-            if len(tokens) > self._max_len:
-                logging.warning(
-                    f"Token length ({len(tokens)}) exceeds max length ({self._max_len}), truncating. "
-                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
-                )
-            tokens = tokens[: self._max_len]
-            mask = [True] * self._max_len
+            tokens = self._tokenizer.encode(_build_pi_prompt_text(prompt), add_bos=True) + self._tokenizer.encode("\n")
 
-        return np.asarray(tokens), np.asarray(mask)
+        return _pad_or_truncate_tokens(tokens, self._max_len)
+
+
+class Qwen2VLTokenizer:
+    """Minimal prompt tokenizer for the OpenPI-style Qwen adapter.
+
+    This remains a text-only fallback/token-budget helper. The PyTorch Qwen backend now
+    prefers to keep the raw prompt and assemble text tokens inside the backend before
+    concatenating them into the OpenPI prefix, while still avoiding Qwen's full official
+    multimodal chat-template path.
+    """
+
+    def __init__(self, max_len: int = 48, model_id: str = "Qwen/Qwen2.5-VL-7B-Instruct"):
+        self._max_len = max_len
+        self._model_id = model_id
+
+        try:
+            processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+            self._tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        except Exception:
+            self._tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+        if self._tokenizer.pad_token_id is None:
+            if self._tokenizer.eos_token is not None:
+                self._tokenizer.pad_token = self._tokenizer.eos_token
+            else:
+                self._tokenizer.add_special_tokens({"pad_token": "<|endoftext|>"})
+        self._pad_token_id = self._tokenizer.pad_token_id
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        user_text = _build_pi_prompt_text(prompt, state)
+
+        if hasattr(self._tokenizer, "apply_chat_template"):
+            # TODO: if we later need a more faithful Qwen multimodal input path, move prompt
+            # assembly fully into the backend-specific processor/template logic.
+            rendered = self._tokenizer.apply_chat_template(
+                [{"role": "user", "content": user_text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            tokens = self._tokenizer.encode(rendered, add_special_tokens=False)
+        else:
+            tokens = self._tokenizer.encode(f"{user_text}\n", add_special_tokens=True)
+
+        return _pad_or_truncate_tokens(tokens, self._max_len, pad_token_id=self._pad_token_id)
+
+
+def create_prompt_tokenizer(model_config) -> PromptTokenizer:
+    vlm_backend = getattr(model_config, "vlm_backend", "paligemma")
+    max_len = getattr(model_config, "max_token_len")
+
+    if vlm_backend in ("qwen2_vl", "qwen2_5_vl", "qwen3_5_vl"):
+        return Qwen2VLTokenizer(
+            max_len=max_len,
+            model_id=getattr(model_config, "vlm_hf_model_id", "Qwen/Qwen2.5-VL-7B-Instruct"),
+        )
+
+    return PaligemmaTokenizer(max_len=max_len)
 
 
 class FASTTokenizer:
@@ -59,6 +141,8 @@ class FASTTokenizer:
 
         # Instantiate FAST tokenizer
         self._fast_tokenizer = AutoProcessor.from_pretrained(fast_tokenizer_path, trust_remote_code=True)
+        # TODO: add a backend-aware action tokenizer path for Qwen/other VLM vocabularies. FAST is
+        # still mapped into the PaliGemma token space today.
         self._fast_skip_tokens = 128  # Skip last 128 tokens in PaliGemma vocab since they are special tokens
 
     def tokenize(

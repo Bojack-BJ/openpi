@@ -1,20 +1,24 @@
+from __future__ import annotations
+
 from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import TYPE_CHECKING, Any
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
-import openpi.models.model as _model
-import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.training.lerobot_dataset as lerobot_dataset
 import openpi.transforms as _transforms
+
+if TYPE_CHECKING:
+    import jax
+    import openpi.models.model as _model
+    import openpi.training.config as _config
 
 T_co = TypeVar("T_co", covariant=True)
 
@@ -82,13 +86,13 @@ class IterableTransformedDataset(IterableDataset[T_co]):
                 batch_size = next(v.shape[0] for v in sample.values())
 
                 # Split batch into individual samples using tree_map
-                individual_samples = [jax.tree.map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
+                individual_samples = [_tree_map(lambda x: x[i], sample) for i in range(batch_size)]  # noqa: B023
 
                 # Transform each sample
                 transformed = [self._transform(s) for s in individual_samples]
 
                 # Recombine batch with tree_map
-                yield jax.tree.map(lambda *x: np.stack(x, axis=0), *transformed)
+                yield _tree_map(lambda *x: np.stack(x, axis=0), transformed[0], *transformed[1:])
             else:
                 yield self._transform(sample)
 
@@ -102,6 +106,9 @@ class FakeDataset(Dataset):
         self._observation_spec, self._action_spec = model_config.inputs_spec()
 
     def __getitem__(self, index: SupportsIndex) -> dict:
+        import jax
+        import jax.numpy as jnp
+
         rng = jax.random.key(index.__index__())
 
         def make_from_spec(spec: jax.ShapeDtypeStruct):
@@ -115,8 +122,8 @@ class FakeDataset(Dataset):
                 return jax.random.randint(data_rng, shape=shape, minval=0, maxval=2048)
             return jnp.zeros(shape=shape, dtype=spec.dtype)
 
-        observation = jax.tree.map(make_from_spec, self._observation_spec)
-        action = jax.tree.map(make_from_spec, self._action_spec)
+        observation = _tree_map(make_from_spec, self._observation_spec)
+        action = _tree_map(make_from_spec, self._action_spec)
 
         return {
             **observation.to_dict(),
@@ -223,7 +230,7 @@ def transform_iterable_dataset(
 def create_data_loader(
     config: _config.TrainConfig,
     *,
-    sharding: jax.sharding.Sharding | None = None,
+    sharding: Any | None = None,
     shuffle: bool = False,
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
@@ -274,7 +281,7 @@ def create_torch_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
-    sharding: jax.sharding.Sharding | None = None,
+    sharding: Any | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
@@ -319,7 +326,7 @@ def create_torch_data_loader(
         else:
             local_batch_size = batch_size
     else:
-        local_batch_size = batch_size // jax.process_count()
+        local_batch_size = batch_size // _jax_process_count()
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
@@ -342,7 +349,7 @@ def create_rlds_data_loader(
     action_horizon: int,
     batch_size: int,
     *,
-    sharding: jax.sharding.Sharding | None = None,
+    sharding: Any | None = None,
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
@@ -386,7 +393,7 @@ class TorchDataLoader:
         dataset,
         local_batch_size: int,
         *,
-        sharding: jax.sharding.Sharding | None = None,
+        sharding: Any | None = None,
         shuffle: bool = False,
         sampler: torch.utils.data.Sampler | None = None,
         num_batches: int | None = None,
@@ -409,7 +416,7 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
+        if _jax_process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
@@ -419,10 +426,7 @@ class TorchDataLoader:
         self._sharding = sharding
         if sharding is None and framework == "jax":
             # Use data parallel sharding by default for JAX only.
-            self._sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
+            self._sharding = _default_data_sharding()
         self._num_batches = num_batches
 
         mp_context = None
@@ -463,16 +467,30 @@ class TorchDataLoader:
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                    batch = _drop_backend_only_fields(batch)
+                    yield _tree_map(lambda x: _jax_make_array_from_process_local_data(self._sharding, x), batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    yield _tree_map(_torchify_leaf, batch)
 
 
 def _collate_fn(items):
     """Collate the batch elements into batched numpy arrays."""
     # Make sure to convert to numpy arrays before stacking since some of the incoming elements
     # may be JAX arrays.
-    return jax.tree.map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), *items)
+    return _tree_map(lambda *xs: np.stack([np.asarray(x) for x in xs], axis=0), items[0], *items[1:])
+
+
+def _drop_backend_only_fields(batch):
+    if not isinstance(batch, dict):
+        return batch
+    return {k: v for k, v in batch.items() if k != "raw_prompt"}
+
+
+def _torchify_leaf(x):
+    array = np.asarray(x)
+    if array.dtype.kind in {"U", "S", "O"}:
+        return array
+    return torch.as_tensor(x)
 
 
 def _worker_init_fn(worker_id: int) -> None:
@@ -493,21 +511,20 @@ class RLDSDataLoader:
         self,
         dataset: DroidRldsDataset,
         *,
-        sharding: jax.sharding.Sharding | None = None,
+        sharding: Any | None = None,
         num_batches: int | None = None,
+        convert_to_jax: bool = True,
     ):
         self._dataset = dataset
         self._num_batches = num_batches
+        self._convert_to_jax = convert_to_jax
 
-        if jax.process_count() > 1:
+        if convert_to_jax and _jax_process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if sharding is None:
+        if convert_to_jax and sharding is None:
             # Use data parallel sharding by default.
-            sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
+            sharding = _default_data_sharding()
 
         self._sharding = sharding
         self._num_batches = num_batches
@@ -524,7 +541,10 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                if self._convert_to_jax:
+                    yield _tree_map(lambda x: _jax_make_array_from_process_local_data(self._sharding, x), batch)
+                else:
+                    yield batch
 
 
 class DataLoaderImpl(DataLoader):
@@ -536,5 +556,38 @@ class DataLoaderImpl(DataLoader):
         return self._data_config
 
     def __iter__(self):
+        import openpi.models.model as _model
+
         for batch in self._data_loader:
             yield _model.Observation.from_dict(batch), batch["actions"]
+
+
+def _tree_map(fn, tree, *rest):
+    if isinstance(tree, dict):
+        return {k: _tree_map(fn, tree[k], *(r[k] for r in rest)) for k in tree}
+    if isinstance(tree, list):
+        return [_tree_map(fn, tree[i], *(r[i] for r in rest)) for i in range(len(tree))]
+    if isinstance(tree, tuple):
+        return tuple(_tree_map(fn, tree[i], *(r[i] for r in rest)) for i in range(len(tree)))
+    return fn(tree, *rest)
+
+
+def _jax_process_count() -> int:
+    import jax
+
+    return jax.process_count()
+
+
+def _default_data_sharding():
+    import jax
+
+    return jax.sharding.NamedSharding(
+        jax.sharding.Mesh(jax.devices(), ("B",)),
+        jax.sharding.PartitionSpec("B"),
+    )
+
+
+def _jax_make_array_from_process_local_data(sharding, x):
+    import jax
+
+    return jax.make_array_from_process_local_data(sharding, x)

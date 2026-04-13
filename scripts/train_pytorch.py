@@ -24,12 +24,21 @@ Multi-Node Training:
 """
 
 import dataclasses
+import datetime
+import faulthandler
 import gc
+import inspect
 import logging
 import os
 import platform
+import pathlib
 import shutil
 import time
+
+# Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+os.environ.setdefault("GLOG_minloglevel", "3")
 
 import jax
 import numpy as np
@@ -79,34 +88,57 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
     if not ckpt_dir.exists():
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
 
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+    run_id_path = ckpt_dir / "wandb_id.txt"
+    if resuming and run_id_path.exists():
+        run_id = run_id_path.read_text().strip()
+        if run_id:
+            logging.info("Resuming wandb run %s with resume='allow'", run_id)
+            wandb.init(id=run_id, resume="allow", project=config.project_name)
+        else:
+            logging.warning("Found empty wandb run id in %s. Starting a new wandb run.", run_id_path)
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                project=config.project_name,
+            )
+            run_id_path.write_text(wandb.run.id)
     else:
+        if resuming:
+            logging.warning("No wandb run id found in %s. Starting a new wandb run.", run_id_path)
         wandb.init(
             name=config.exp_name,
             config=dataclasses.asdict(config),
             project=config.project_name,
         )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+        run_id_path.write_text(wandb.run.id)
 
 
-def setup_ddp():
+def _ddp_debug_artifacts_enabled() -> bool:
+    return os.environ.get("OPENPI_DDP_DEBUG_ARTIFACTS", "0").lower() not in ("", "0", "false")
+
+
+def setup_device_and_ddp_flags(config: _config.TrainConfig):
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
-    if use_ddp and not torch.distributed.is_initialized():
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
-
-        # Set up debugging environment variables for DDP issues
-        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
-            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
-
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
     local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     if torch.cuda.is_available():
         torch.cuda.set_device(device)
-    return use_ddp, local_rank, device
+    return use_ddp, local_rank, device, backend
+
+
+def init_process_group_if_needed(config: _config.TrainConfig, backend: str, use_ddp: bool) -> None:
+    if use_ddp and not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=datetime.timedelta(seconds=config.ddp_timeout_sec),
+        )
+
+        # Set up debugging environment variables for DDP issues
+        if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
+            os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
 
 def cleanup_ddp():
@@ -122,10 +154,259 @@ def set_seed(seed: int, local_rank: int):
         torch.cuda.manual_seed_all(seed + local_rank)
 
 
+def write_rank_stage_marker(rank: int, stage: str) -> None:
+    """Persist the latest trainer stage for each rank to aid debugging hard hangs/crashes."""
+    if not _ddp_debug_artifacts_enabled():
+        return
+    marker_path = pathlib.Path("/tmp") / f"openpi_train_rank_{rank}.stage"
+    marker_path.write_text(f"{time.time():.3f} {stage}\n")
+
+
+def write_rank_param_signature(rank: int, model: torch.nn.Module) -> None:
+    """Persist a per-rank parameter signature so DDP mismatches can be compared offline."""
+    if not _ddp_debug_artifacts_enabled():
+        return
+    lines = []
+    total_numel = 0
+    trainable_numel = 0
+    for name, param in model.named_parameters():
+        total_numel += param.numel()
+        if param.requires_grad:
+            trainable_numel += param.numel()
+        lines.append(
+            f"{name}\tshape={tuple(param.shape)}\tdtype={param.dtype}\trequires_grad={param.requires_grad}\tnumel={param.numel()}"
+        )
+
+    signature_path = pathlib.Path("/tmp") / f"openpi_params_rank_{rank}.txt"
+    signature_path.write_text(
+        "\n".join(
+            [
+                f"total_tensors={len(lines)}",
+                f"total_numel={total_numel}",
+                f"trainable_numel={trainable_numel}",
+                *lines,
+            ]
+        )
+        + "\n"
+    )
+
+
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
     data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
     return data_loader, data_loader.data_config()
+
+
+def resolve_ddp_static_graph(config: _config.TrainConfig, world_size: int) -> bool:
+    if config.ddp_static_graph == "on":
+        return True
+    if config.ddp_static_graph == "off":
+        return False
+    return world_size >= 8
+
+
+def resolve_ddp_options(config: _config.TrainConfig, world_size: int) -> dict[str, bool]:
+    options = {
+        "find_unused_parameters": config.ddp_find_unused_parameters,
+        "gradient_as_bucket_view": config.ddp_gradient_as_bucket_view,
+        "broadcast_buffers": config.ddp_broadcast_buffers,
+        "init_sync": config.ddp_init_sync,
+        "static_graph": resolve_ddp_static_graph(config, world_size),
+    }
+    if config.ddp_safe_mode:
+        options.update(
+            {
+                "find_unused_parameters": False,
+                "gradient_as_bucket_view": False,
+                "broadcast_buffers": False,
+                "init_sync": True,
+                "static_graph": False,
+            }
+        )
+    return options
+
+
+def filter_supported_ddp_kwargs(ddp_kwargs: dict[str, object]) -> tuple[dict[str, object], list[str]]:
+    supported = inspect.signature(torch.nn.parallel.DistributedDataParallel.__init__).parameters
+    filtered = {name: value for name, value in ddp_kwargs.items() if name in supported}
+    unsupported = [name for name in ddp_kwargs if name not in supported]
+    return filtered, unsupported
+
+
+def run_ddp_preflight_collective(rank: int, device: torch.device) -> None:
+    if not dist.is_initialized():
+        return
+
+    tensor_dtype = torch.float32 if device.type == "cuda" else torch.int64
+    probe = torch.ones(1, device=device, dtype=tensor_dtype)
+    logging.info("Rank %s running DDP preflight all_reduce on %s", rank, device)
+    dist.all_reduce(probe)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    expected = float(dist.get_world_size()) if probe.is_floating_point() else dist.get_world_size()
+    actual = probe.item()
+    if actual != expected:
+        raise RuntimeError(f"DDP preflight collective returned {actual}, expected {expected}")
+    logging.info("Rank %s finished DDP preflight all_reduce: value=%s", rank, actual)
+
+
+def get_model_param_stats(model: torch.nn.Module) -> tuple[int, int, int, int]:
+    total_tensors = 0
+    trainable_tensors = 0
+    total_numel = 0
+    trainable_numel = 0
+    for param in model.parameters():
+        total_tensors += 1
+        total_numel += param.numel()
+        if param.requires_grad:
+            trainable_tensors += 1
+            trainable_numel += param.numel()
+    return total_tensors, trainable_tensors, total_numel, trainable_numel
+
+
+def wait_for_local_model_params(
+    model: torch.nn.Module,
+    *,
+    rank: int,
+    backend_name: str,
+    timeout_sec: int,
+    poll_interval_sec: float = 5.0,
+    stable_polls: int = 2,
+) -> tuple[int, int, int, int]:
+    deadline = time.monotonic() + timeout_sec
+    last_stats: tuple[int, int, int, int] | None = None
+    stable_count = 0
+    warned = False
+
+    while True:
+        stats = get_model_param_stats(model)
+        total_tensors, trainable_tensors, total_numel, trainable_numel = stats
+        params_ready = total_tensors > 0 and trainable_tensors > 0 and total_numel > 0 and trainable_numel > 0
+
+        if params_ready:
+            if stats == last_stats:
+                stable_count += 1
+            else:
+                last_stats = stats
+                stable_count = 1
+
+            if stable_count >= stable_polls:
+                logging.info(
+                    "Rank %s local model params ready for %s: total_tensors=%s trainable_tensors=%s total_numel=%s trainable_numel=%s",
+                    rank,
+                    backend_name,
+                    total_tensors,
+                    trainable_tensors,
+                    total_numel,
+                    trainable_numel,
+                )
+                return stats
+        else:
+            last_stats = stats
+            stable_count = 0
+            if not warned:
+                logging.warning(
+                    "Rank %s model construction returned before parameters were fully registered for %s. "
+                    "Waiting up to %ss for local params to appear. Current stats: total_tensors=%s trainable_tensors=%s total_numel=%s trainable_numel=%s",
+                    rank,
+                    backend_name,
+                    timeout_sec,
+                    total_tensors,
+                    trainable_tensors,
+                    total_numel,
+                    trainable_numel,
+                )
+                warned = True
+
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                "Timed out while waiting for local model parameters to become ready before DDP. "
+                f"Rank {rank}, backend={backend_name}, stats={stats}"
+            )
+
+        time.sleep(poll_interval_sec)
+
+
+def format_model_param_stats(stats_by_rank: list[tuple[int, int, int, int]]) -> str:
+    return "; ".join(
+        (
+            f"rank {rank}: total_tensors={total_tensors}, trainable_tensors={trainable_tensors}, "
+            f"total_numel={total_numel}, trainable_numel={trainable_numel}"
+        )
+        for rank, (total_tensors, trainable_tensors, total_numel, trainable_numel) in enumerate(stats_by_rank)
+    )
+
+
+def gather_model_param_stats_across_ranks(
+    model: torch.nn.Module, rank: int, world_size: int, device: torch.device
+) -> list[tuple[int, int, int, int]]:
+    if not dist.is_initialized() or world_size <= 1:
+        return [get_model_param_stats(model)]
+
+    stats = torch.tensor(get_model_param_stats(model), device=device, dtype=torch.int64)
+    gathered = [torch.zeros_like(stats) for _ in range(world_size)]
+    dist.all_gather(gathered, stats)
+    stats_by_rank = [tuple(int(v) for v in item.detach().cpu().tolist()) for item in gathered]
+    logging.info("Rank %s pre-DDP model stats: %s", rank, format_model_param_stats(stats_by_rank))
+    return stats_by_rank
+
+
+def enable_gradients_for_all_params(model: torch.nn.Module) -> int:
+    changed = 0
+    for param in model.parameters():
+        if not param.requires_grad:
+            param.requires_grad_(True)
+            changed += 1
+    return changed
+
+
+def ensure_ddp_model_readiness(
+    model: torch.nn.Module,
+    *,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+) -> None:
+    if not dist.is_initialized() or world_size <= 1:
+        return
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    write_rank_stage_marker(rank, "before_pre_ddp_barrier")
+    barrier_kwargs = {"device_ids": [device.index]} if device.type == "cuda" and device.index is not None else {}
+    dist.barrier(**barrier_kwargs)
+    write_rank_stage_marker(rank, "after_pre_ddp_barrier")
+
+    stats_by_rank = gather_model_param_stats_across_ranks(model, rank, world_size, device)
+    unique_stats = set(stats_by_rank)
+    all_have_trainable_params = all(trainable_tensors > 0 for _, trainable_tensors, _, _ in stats_by_rank)
+    all_have_registered_params = all(total_tensors > 0 for total_tensors, _, _, _ in stats_by_rank)
+    if len(unique_stats) == 1 and all_have_trainable_params and all_have_registered_params:
+        return
+
+    if all_have_registered_params and not all_have_trainable_params:
+        logging.warning(
+            "Rank %s detected zero trainable parameters on at least one rank before DDP. "
+            "Enabling gradients for all parameters on every rank and retrying.",
+            rank,
+        )
+        changed = enable_gradients_for_all_params(model)
+        logging.info("Rank %s restored requires_grad=True on %s parameter tensors before DDP", rank, changed)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        dist.barrier(**barrier_kwargs)
+        stats_by_rank = gather_model_param_stats_across_ranks(model, rank, world_size, device)
+        unique_stats = set(stats_by_rank)
+        all_have_trainable_params = all(trainable_tensors > 0 for _, trainable_tensors, _, _ in stats_by_rank)
+        all_have_registered_params = all(total_tensors > 0 for total_tensors, _, _, _ in stats_by_rank)
+        if len(unique_stats) == 1 and all_have_trainable_params and all_have_registered_params:
+            return
+
+    raise RuntimeError(
+        "Model parameters are inconsistent across ranks before DDP wrap. "
+        f"{format_model_param_stats(stats_by_rank)}"
+    )
 
 
 def get_model_state_dict(model):
@@ -146,7 +427,11 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
+def move_observation_to_device(observation, device):
+    return jax.tree.map(lambda x: x.to(device) if hasattr(x, "to") else x, observation)
+
+
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, wandb_enabled: bool):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
@@ -190,7 +475,7 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
         # Log checkpoint to wandb
-        if config.wandb_enabled:
+        if wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
@@ -307,9 +592,17 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
-    use_ddp, local_rank, device = setup_ddp()
-    is_main = (not use_ddp) or (dist.get_rank() == 0)
+    os.environ["OPENPI_DDP_DEBUG_ARTIFACTS"] = "1" if config.ddp_debug_artifacts else "0"
+
+    use_ddp, local_rank, device, ddp_backend = setup_device_and_ddp_flags(config)
+    env_rank = int(os.environ.get("RANK", "0"))
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    is_main = (not use_ddp) or (env_rank == 0)
     set_seed(config.seed, local_rank)
+    rank = env_rank
+    wandb_mode = os.environ.get("WANDB_MODE", "").lower()
+    wandb_enabled = config.wandb_enabled and wandb_mode != "disabled"
+    debug_artifacts = config.ddp_debug_artifacts
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -329,37 +622,177 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
     # Initialize wandb (only on main process)
     if is_main:
-        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+        write_rank_stage_marker(rank, "before_wandb_init")
+        if debug_artifacts:
+            logging.info(
+                "Rank %s entering wandb init (enabled=%s, mode=%s)", rank, wandb_enabled, wandb_mode or "default"
+            )
+        if wandb_enabled:
+            init_wandb(config, resuming=resuming, enabled=True)
+        if debug_artifacts:
+            logging.info("Rank %s finished wandb init", rank)
+        write_rank_stage_marker(rank, "after_wandb_init")
+
+    # Build model
+    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+        # Convert dataclass to Pi0Config if needed
+        model_cfg = openpi.models.pi0_config.Pi0Config(
+            dtype=config.pytorch_training_precision,
+            action_dim=config.model.action_dim,
+            action_horizon=config.model.action_horizon,
+            max_token_len=config.model.max_token_len,
+            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
+            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
+            pi05=getattr(config.model, "pi05", False),
+        )
+    else:
+        model_cfg = config.model
+        # Update dtype to match pytorch_training_precision
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+
+    write_rank_stage_marker(rank, "before_model_construction")
+    if debug_artifacts:
+        logging.info("Rank %s entering model construction", rank)
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    if debug_artifacts:
+        logging.info("Rank %s finished model construction", rank)
+    write_rank_stage_marker(rank, "after_model_construction")
+
+    if use_ddp and getattr(model_cfg, "vlm_backend", "paligemma") in ("qwen2_vl", "qwen2_5_vl"):
+        write_rank_stage_marker(rank, "before_wait_for_local_model_params")
+        wait_for_local_model_params(
+            model,
+            rank=rank,
+            backend_name=model_cfg.vlm_backend,
+            timeout_sec=max(config.ddp_timeout_sec * 3, 1800),
+        )
+        write_rank_stage_marker(rank, "after_wait_for_local_model_params")
+
+    init_process_group_if_needed(config, ddp_backend, use_ddp)
+    if use_ddp:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        is_main = rank == 0
+    else:
+        world_size = 1
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        enable_gradient_checkpointing = True
+        if debug_artifacts:
+            logging.info("Rank %s enabling gradient checkpointing", rank)
+        model.gradient_checkpointing_enable()
+        logging.info("Enabled gradient checkpointing for memory optimization")
+    else:
+        enable_gradient_checkpointing = False
+        logging.info("Gradient checkpointing is not supported for this model")
+    write_rank_stage_marker(rank, "after_gradient_checkpointing")
+
+    # Enable memory optimizations for large-scale training
+    if world_size >= 8:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        # Set memory allocation configuration
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
+        logging.info("Enabled memory optimizations for 8+ GPU training")
+    write_rank_stage_marker(rank, "after_memory_optimizations")
+
+    if use_ddp:
+        ensure_ddp_model_readiness(model, rank=rank, world_size=world_size, device=device)
+    write_rank_stage_marker(rank, "after_ddp_model_readiness")
+
+    if debug_artifacts:
+        param_count, trainable_param_count, _, _ = get_model_param_stats(model)
+        logging.info(
+            "Rank %s model parameter tensors before DDP: total=%s trainable=%s",
+            dist.get_rank() if use_ddp else 0,
+            param_count,
+            trainable_param_count,
+        )
+        write_rank_param_signature(rank, model)
+        write_rank_stage_marker(rank, "after_param_signature")
+
+    if use_ddp:
+        resolved_ddp_options = resolve_ddp_options(config, world_size)
+        ddp_kwargs = {
+            "device_ids": [device.index] if device.type == "cuda" else None,
+            **resolved_ddp_options,
+        }
+        ddp_kwargs, unsupported_ddp_kwargs = filter_supported_ddp_kwargs(ddp_kwargs)
+        if unsupported_ddp_kwargs:
+            logging.warning(
+                "Rank %s torch.nn.parallel.DistributedDataParallel does not support kwargs: %s",
+                rank,
+                ", ".join(sorted(unsupported_ddp_kwargs)),
+            )
+
+        ddp_log_values = {
+            name: ddp_kwargs.get(name, "unsupported")
+            for name in (
+                "static_graph",
+                "find_unused_parameters",
+                "gradient_as_bucket_view",
+                "broadcast_buffers",
+                "init_sync",
+            )
+        }
+        logging.info(
+            "Rank %s DDP config: backend=%s timeout_sec=%s static_graph=%s find_unused_parameters=%s gradient_as_bucket_view=%s broadcast_buffers=%s init_sync=%s",
+            rank,
+            ddp_backend,
+            config.ddp_timeout_sec,
+            ddp_log_values["static_graph"],
+            ddp_log_values["find_unused_parameters"],
+            ddp_log_values["gradient_as_bucket_view"],
+            ddp_log_values["broadcast_buffers"],
+            ddp_log_values["init_sync"],
+        )
+
+        if config.ddp_preflight_collective:
+            write_rank_stage_marker(rank, "before_ddp_preflight")
+            run_ddp_preflight_collective(rank, device)
+            write_rank_stage_marker(rank, "after_ddp_preflight")
+
+        write_rank_stage_marker(rank, "before_ddp_wrap")
+        model = torch.nn.parallel.DistributedDataParallel(model, **ddp_kwargs)
+        write_rank_stage_marker(rank, "after_ddp_wrap")
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
-    world_size = torch.distributed.get_world_size() if use_ddp else 1
     effective_batch_size = config.batch_size // world_size
     logging.info(
         f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
+    write_rank_stage_marker(rank, "before_build_datasets")
+    if debug_artifacts:
+        logging.info("Rank %s entering build_datasets on device %s", rank, device)
     loader, data_config = build_datasets(config)
+    if debug_artifacts:
+        logging.info("Rank %s finished build_datasets", rank)
+    write_rank_stage_marker(rank, "after_build_datasets")
 
     # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
+    if is_main and wandb_enabled and not resuming and not use_ddp:
         # Create a separate data loader for sample batch to avoid consuming the main loader
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
@@ -389,54 +822,9 @@ def train_loop(config: _config.TrainConfig):
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
 
-    # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
-        model_cfg = openpi.models.pi0_config.Pi0Config(
-            dtype=config.pytorch_training_precision,
-            action_dim=config.model.action_dim,
-            action_horizon=config.model.action_horizon,
-            max_token_len=config.model.max_token_len,
-            paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
-            action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
-            pi05=getattr(config.model, "pi05", False),
-        )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
-
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
-        model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing for memory optimization")
-    else:
-        enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
-
-    # Log initial memory usage after model creation
+    # Log initial memory usage after model creation / DDP wrapping.
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
-
-    # Enable memory optimizations for large-scale training
-    if world_size >= 8:
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
-        logging.info("Enabled memory optimizations for 8+ GPU training")
-
-    if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
-        )
 
     # Load weights from weight_loader if specified (for fine-tuning)
     if config.pytorch_weight_path is not None:
@@ -517,7 +905,7 @@ def train_loop(config: _config.TrainConfig):
                 break
 
             # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+            observation = move_observation_to_device(observation, device)  # noqa: PLW2901
             actions = actions.to(torch.float32)  # noqa: PLW2901
             actions = actions.to(device)  # noqa: PLW2901
 
@@ -586,7 +974,7 @@ def train_loop(config: _config.TrainConfig):
                 )
 
                 # Log to wandb
-                if config.wandb_enabled and len(infos) > 0:
+                if wandb_enabled and len(infos) > 0:
                     log_payload = {
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
@@ -602,7 +990,7 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, wandb_enabled)
 
             # Update progress bar
             if pbar is not None:
@@ -616,7 +1004,7 @@ def train_loop(config: _config.TrainConfig):
         pbar.close()
 
     # Finish wandb run
-    if is_main and config.wandb_enabled:
+    if is_main and wandb_enabled:
         wandb.finish()
 
     cleanup_ddp()
@@ -624,8 +1012,19 @@ def train_loop(config: _config.TrainConfig):
 
 def main():
     init_logging()
+    faulthandler.enable()
     config = _config.cli()
-    train_loop(config)
+    rank = int(os.environ.get("RANK", "0"))
+    try:
+        train_loop(config)
+    except BaseException:
+        logging.exception("Rank %s failed during PyTorch training", rank)
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            logging.exception("Rank %s failed while destroying the process group", rank)
+        raise
 
 
 if __name__ == "__main__":

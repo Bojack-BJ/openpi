@@ -76,7 +76,7 @@ def put_along_last_axis(arr, indices, values):
 @dataclasses.dataclass(frozen=True)
 class Pi0FASTConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
-    paligemma_variant: _gemma.Variant = "gemma_2b"
+    vlm_backbone_variant: _gemma.Variant = "gemma_2b"
 
     # Set the model specific defaults.
     action_dim: int = 32
@@ -126,7 +126,7 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 
     def get_freeze_filter(self) -> nnx.filterlib.Filter:
         """Returns the freeze filter based on the model config."""
-        if "lora" in self.paligemma_variant:
+        if "lora" in self.vlm_backbone_variant:
             return nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*lora.*")))
         return nnx.Nothing
 
@@ -134,11 +134,11 @@ class Pi0FASTConfig(_model.BaseModelConfig):
 class Pi0FAST(_model.BaseModel):
     def __init__(self, config: Pi0FASTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
+        vlm_backbone_config = _gemma.get_config(config.vlm_backbone_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
-                **paligemma_config,
+                **vlm_backbone_config,
                 embed_dtype=config.dtype,
                 cache_dtype=config.dtype,
             )
@@ -146,7 +146,7 @@ class Pi0FAST(_model.BaseModel):
         llm.lazy_init(rngs=rngs, method="init")
         img = nnx_bridge.ToNNX(
             _siglip.Module(
-                num_classes=paligemma_config.width,
+                num_classes=vlm_backbone_config.width,
                 variant="So400m/14",
                 pool_type="none",
                 scan=True,

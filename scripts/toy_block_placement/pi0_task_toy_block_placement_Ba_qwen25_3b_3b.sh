@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICE=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
 REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=fruit_classification_Aa
+cfg=toy_block_placement_Ba_qwen2_5_3b_3b
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp=${exp:-$cfg}   # override via env; default equals cfg
+exp=3b_3b   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
-export HF_DATASETS_CACHE="/root/.cache/"
-# export WANDB_MODE=offline
+export HF_DATASETS_CACHE="/root/Users/.cache/"
+export WANDB_MODE=online
 
 cd /root/Users/lixiaotong/openpi
 
@@ -26,4 +26,7 @@ cd /root/Users/lixiaotong/openpi
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 \
 python scripts/train.py "$cfg" \
   --exp-name "$exp" \
+  --project_name "umi-openpi" \
+  --fsdp_devices 4 \
   --overwrite
+

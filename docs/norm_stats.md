@@ -1,5 +1,7 @@
 # Normalization statistics
 
+Performance notes for `scripts/compute_norm_stats.py` live in [norm_stats_performance_notes.md](/Users/lxt/Github/Lumos/openpi/docs/norm_stats_performance_notes.md).
+
 Following common practice, our models normalize the proprioceptive state inputs and action targets during policy training and inference. The statistics used for normalization are computed over the training data and stored alongside the model checkpoint.
 
 ## Reloading normalization statistics

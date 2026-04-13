@@ -110,6 +110,10 @@ class ModelTransformFactory(GroupFactory):
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
 
+    @staticmethod
+    def _preserve_raw_prompt(model_config: _model.BaseModelConfig) -> bool:
+        return getattr(model_config, "vlm_backend", "paligemma") in ("qwen2_vl", "qwen2_5_vl", "qwen3_5_vl")
+
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
             case _model.ModelType.PI0:
@@ -118,7 +122,8 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.create_prompt_tokenizer(model_config),
+                            preserve_raw_prompt=self._preserve_raw_prompt(model_config),
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -130,8 +135,9 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.create_prompt_tokenizer(model_config),
                             discrete_state_input=model_config.discrete_state_input,
+                            preserve_raw_prompt=self._preserve_raw_prompt(model_config),
                         ),
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
@@ -973,6 +979,8 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # If true, compute grad/param global norms on log steps. Disable to reduce logging overhead on large models.
+    log_param_and_grad_norms: bool = True
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -986,6 +994,25 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # If true, overrides DDP options with a more conservative configuration to help isolate startup issues.
+    ddp_safe_mode: bool = False
+    # If true, runs a tiny collective before DDP wrapping to separate communicator/bootstrap failures from DDP sync.
+    ddp_preflight_collective: bool = False
+    # If true, emits extra per-rank debug logs and `/tmp/openpi_*` diagnostic artifacts.
+    ddp_debug_artifacts: bool = False
+    # Timeout used when initializing the process group and waiting on DDP collectives during setup.
+    ddp_timeout_sec: int = 600
+    # Controls the DDP `static_graph` option. `auto` keeps the previous behavior.
+    ddp_static_graph: Literal["auto", "on", "off"] = "auto"
+    # Controls the DDP `find_unused_parameters` option.
+    ddp_find_unused_parameters: bool = True
+    # Controls the DDP `gradient_as_bucket_view` option.
+    ddp_gradient_as_bucket_view: bool = True
+    # Controls the DDP `broadcast_buffers` option.
+    ddp_broadcast_buffers: bool = True
+    # Controls the DDP `init_sync` option when supported by the installed torch version.
+    ddp_init_sync: bool = True
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -994,6 +1021,16 @@ class TrainConfig:
     # eg. if total device is 4 and fsdp devices is 2; then the model will shard to 2 devices and run
     # data parallel between 2 groups of devices.
     fsdp_devices: int = 1
+    # If true, print per-parameter FSDP sharding decisions during initialization.
+    log_sharding: bool = False
+    # If true, print the full train-state parameter tree (all tensor shapes) after init.
+    # By default we only print a compact summary to avoid overwhelming logs.
+    log_train_state_details: bool = False
+    # Directory for JAX persistent compilation cache. Set to None to disable caching.
+    jax_compilation_cache_dir: str | None = "~/.cache/jax/openpi"
+    # Backward-compatible alias for wiring Qwen3.5 remat mode from TrainConfig-level presets/CLI.
+    # New code should prefer `model.qwen3_5_remat_mode`.
+    qwen3_5_remat_mode: Literal["all", "linear_only", "off"] | None = None
 
     @property
     def assets_dirs(self) -> pathlib.Path:
@@ -1015,8 +1052,16 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.qwen3_5_remat_mode is not None and isinstance(self.model, pi0_config.Pi0Config):
+            object.__setattr__(
+                self,
+                "model",
+                dataclasses.replace(self.model, qwen3_5_remat_mode=self.qwen3_5_remat_mode),
+            )
 
-
+LOCAL_QWEN_2_5_3B = "/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"
+LOCAL_QWEN_3_5_2B = "/root/Users/lixiaotong/Qwen3.5-2B"
+LOCAL_QWEN_3_5_4B = "/root/Users/lixiaotong/Qwen3.5-4B"
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -1139,7 +1184,7 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
-        model=pi0_config.Pi0Config(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
+        model=pi0_config.Pi0Config(vlm_backbone_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
             base_config=DataConfig(prompt_from_task=True),
@@ -1152,7 +1197,7 @@ _CONFIGS = [
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # you chose above.
         freeze_filter=pi0_config.Pi0Config(
-            paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
+            vlm_backbone_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
@@ -1184,7 +1229,7 @@ _CONFIGS = [
         # Here is an example of loading a pi0-FAST model for LoRA finetuning.
         # For setting action_dim, action_horizon, and max_token_len, see the comments above.
         model=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+            action_dim=7, action_horizon=10, max_token_len=180, vlm_backbone_variant="gemma_2b_lora"
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -1196,7 +1241,7 @@ _CONFIGS = [
         # Again, make sure to match the model config above when extracting the freeze filter
         # that specifies which parameters should be frozen during LoRA finetuning.
         freeze_filter=pi0_fast.Pi0FASTConfig(
-            action_dim=7, action_horizon=10, max_token_len=180, paligemma_variant="gemma_2b_lora"
+            action_dim=7, action_horizon=10, max_token_len=180, vlm_backbone_variant="gemma_2b_lora"
         ).get_freeze_filter(),
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
@@ -1577,7 +1622,6 @@ _CONFIGS = [
         batch_size = 32,
         num_workers = 32
         ),
-    
     TrainConfig(
         name="task_20251231O001_10d",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
@@ -1601,7 +1645,142 @@ _CONFIGS = [
         batch_size = 32,
         num_workers = 32
         ),
-        
+    TrainConfig(
+        name="20260309K055Aa_Make_a_sandwich",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
+        name="fruit_classification_Aa_qwen",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
+        name="fruit_classification_Aa_qwen3_5_4B_400M",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_4B,
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_400m",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_4B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=16,
+        qwen3_5_remat_mode="linear_only",
+    ),
+    TrainConfig(
+        name="fruit_classification_Aa_qwen2_5_3B_700M",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(LOCAL_QWEN_2_5_3B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
+        name="fruit_classification_Aa_torch",
+        # PyTorch-only Qwen fine-tuning config. The current Qwen adapter requires matching
+        # prefix/expert geometry, so use the 3B VL backbone together with a 3B action expert.
+        model=pi0_config.Pi0Config(
+            # vlm_backend="qwen2_5_vl",
+            # vlm_hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            # vlm_backbone_variant="qwen2_5_3b",
+            # action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/fruit_classification_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/fruit_classification_Aa",
+                asset_id="fastumi/fruit_classification_Aa",
+            ),
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        # `train_pytorch.py` initializes Qwen weights from `vlm_hf_model_id`; JAX checkpoint
+        # loaders are not consumed on the PyTorch path.
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        num_train_steps=60_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
     TrainConfig(
         name="fruit_classification_Aa",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
@@ -1641,8 +1820,88 @@ _CONFIGS = [
         # for the given model config for LoRA finetuning. Just make sure it matches the model config
         # Turn off EMA for LoRA finetuning.
         ema_decay=None,
-        batch_size = 32,
-        num_workers = 32
+        batch_size = 64,
+        num_workers = 16
+        ),
+    TrainConfig(
+        name="Waste_sorting_Aa_qwen2_5",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_700m",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/Waste_sorting_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/Waste_sorting_Aa",
+                asset_id="fastumi/Waste_sorting_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        ),
+    TrainConfig(
+        name="Waste_sorting_Aa_qwen3_5",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_4B,
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_400m",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/Waste_sorting_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/Waste_sorting_Aa",
+                asset_id="fastumi/Waste_sorting_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_4B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=16,
+        num_workers=32,
+        qwen3_5_remat_mode="linear_only",
+        ),
+    TrainConfig(
+        name="Waste_sorting_Aa_qwen3_5_4b_1b",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_4B,
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_1b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/Waste_sorting_Aa",
+            assets=AssetsConfig(
+                assets_dir="./assets/Waste_sorting_Aa",
+                asset_id="fastumi/Waste_sorting_Aa",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_4B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        qwen3_5_remat_mode="linear_only",
         ),
     TrainConfig(
         name="toy_block_placement_Aa",
@@ -1664,6 +1923,130 @@ _CONFIGS = [
         ema_decay=None,
         batch_size = 32,
         num_workers = 32
+        ),
+    TrainConfig(
+        name="toy_block_placement_Ab_on_Aa",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ab_toy_block",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=120_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
+        name="toy_block_placement_Ba",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=60_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
+        name="toy_block_placement_Ba_qwen2_5_3b_3b",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            assets=AssetsConfig(
+                assets_dir="./assets/20260312H081Ba_toy_block",
+                asset_id="fastumi/20260312H081Ba_toy_block",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        ),
+    TrainConfig(
+        name="toy_block_placement_Ba_qwen2_5_3b_700m",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_700m",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            assets=AssetsConfig(
+                assets_dir="./assets/20260312H081Ba_toy_block",
+                asset_id="fastumi/20260312H081Ba_toy_block",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            LOCAL_QWEN_2_5_3B,
+            local_files_only=True,
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        ),
+    TrainConfig(
+        name="toy_block_placement_Ba_qwen3_5_2b_400m",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_2B,
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        data=FastUMIdualData14DRPYConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            assets=AssetsConfig(
+                assets_dir="./assets/20260312H081Ba_toy_block",
+                asset_id="fastumi/20260312H081Ba_toy_block",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_2B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        qwen3_5_remat_mode="linear_only",
         ),
     TrainConfig(
         name="unplug_network_cable",
@@ -2113,7 +2496,7 @@ _CONFIGS = [
         name="debug",
         data=FakeDataConfig(),
         batch_size=8,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(vlm_backbone_variant="dummy", action_expert_variant="dummy"),
         save_interval=100,
         overwrite=True,
         exp_name="debug",
@@ -2124,7 +2507,7 @@ _CONFIGS = [
         name="debug_restore",
         data=FakeDataConfig(),
         batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(vlm_backbone_variant="dummy", action_expert_variant="dummy"),
         weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
         overwrite=True,
         exp_name="debug",
@@ -2132,8 +2515,141 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     TrainConfig(
+        name="debug_qwen3_5",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b",
+        ),
+        overwrite=True,
+        exp_name="debug_qwen3_5",
+        num_train_steps=10,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_pretrained",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-4B",
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_1b",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-4B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-4B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_pretrained",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_4B_400M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-4B",
+            vlm_backbone_variant="qwen3_5_4b",
+            action_expert_variant="qwen3_5_4b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-4B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-4B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_4B_400M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_2B_700M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_700m",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-2B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_2B_700M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_2B_400M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader("Qwen/Qwen3.5-2B", local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-2B"),
+        overwrite=True,
+        exp_name="debug_qwen3_5_2B_400M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_pretrained",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
+        overwrite=True,
+        exp_name="debug_qwen2_5_pretrained",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_3B_700M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-3B",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_700m",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
+        overwrite=True,
+        exp_name="debug_qwen2_5_3B_700M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_3B_400M",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-3B",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
+        overwrite=True,
+        exp_name="debug_qwen2_5_3B_400M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
         name="debug_pi05",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
+        model=pi0_config.Pi0Config(pi05=True, vlm_backbone_variant="dummy", action_expert_variant="dummy"),
         data=FakeDataConfig(),
         batch_size=2,
         num_train_steps=10,

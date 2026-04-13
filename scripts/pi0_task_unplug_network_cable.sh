@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICE=0,1,2,3,4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
@@ -14,7 +14,7 @@ cfg=unplug_network_cable
 exp=${exp:-$cfg}   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
-export HF_DATASETS_CACHE="/root/.cache/"
+export HF_DATASETS_CACHE="/root/Users/.cache/"
 export WANDB_MODE=offline
 
 cd /root/Users/lixiaotong/openpi
