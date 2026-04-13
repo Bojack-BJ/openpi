@@ -4,7 +4,7 @@ Example:
 600秒检查一次指定PID是否结束，结束后自动执行pi0_task_Waste_sorting_Aa_qwen3_5.sh脚本。
 bash wait_then_run.sh 755448 pi0_task_Waste_sorting_Aa_qwen3_5.sh 600
 保存log版（推荐）：
-bash /root/Users/lixiaotong/openpi/scripts/wait_then_run.sh 2462510 /root/Users/lixiaotong/openpi/scripts/waste_sorting/pi0_task_Waste_sorting_Aa_qwen3_5.sh 600 2>&1 | tee -a /root/Users/lixiaotong/openpi/scripts/wait_then_run_c.log
+bash /root/Users/lixiaotong/openpi/scripts/wait_then_run.sh 1119132 /root/Users/lixiaotong/openpi/scripts/test.sh 300 2>&1 | tee -a /root/Users/lixiaotong/openpi/scripts/wait_then_run_f.log
 后台运行版：
 nohup bash /root/Users/lixiaotong/openpi/scripts/wait_then_run.sh <当前训练PID> \
 /root/Users/lixiaotong/openpi/scripts/waste_sorting/pi0_task_Waste_sorting_Aa_qwen3_5.sh \

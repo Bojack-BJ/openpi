@@ -7,11 +7,11 @@ conda activate pi0_suzhou
 REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=toy_block_placement_Aa
+cfg=toy_block_placement_Ba_qwen2_5_3b_3b
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp=${exp:-$cfg}   # 可单独覆写，默认与cfg一致
+exp=3b_3b   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
 export HF_DATASETS_CACHE="/root/Users/.cache/"

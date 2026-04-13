@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -e
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 source /root/Users/miniconda3/etc/profile.d/conda.sh
 conda activate pi0_suzhou
 
 REPO=/root/Users/lixiaotong/openpi
 export PYTHONPATH="$REPO/src:$REPO/packages/openpi-client/src:$PYTHONPATH"
 
-cfg=toy_block_placement_Aa
+cfg=toy_block_placement_Ba_qwen2_5_3b_700m
 
 # cp /home/liyang/.cache/openpi/big_vision/* /root/.cache/openpi/big_vision/
 
-exp=${exp:-$cfg}   # 可单独覆写，默认与cfg一致
+exp=3b_700m   # 可单独覆写，默认与cfg一致
 
 export HF_LEROBOT_HOME='/root/Users/dataset/lerobot_home'
 export HF_DATASETS_CACHE="/root/Users/.cache/"
