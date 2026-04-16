@@ -34,8 +34,6 @@ class Qwen3_5_VLWithExpertModel(_qwen2_5_adapter.Qwen2_5_VLWithExpertModel):
         remat_mode: str = "all",
     ):
         self.hf_model_id = hf_model_id
-        if any(use_adarms):
-            raise NotImplementedError("JAX Qwen3.5 adapter does not support pi05/AdaRMS conditioning yet.")
         if vlm_config.depth != action_expert_config.depth:
             raise ValueError(
                 "JAX Qwen3.5 adapter currently requires matching prefix/expert depth: "

@@ -25,12 +25,17 @@ class RMSNorm(nn.Module):
     eps: float = 1e-6
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, cond=None):
         dtype = x.dtype
         var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
         normed = x * jnp.reciprocal(jnp.sqrt(var + self.eps))
-        scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1],))
-        return (normed * (1 + scale)).astype(dtype)
+        if cond is None:
+            scale = self.param("scale", nn.initializers.zeros_init(), (x.shape[-1],))
+            return (normed * (1 + scale)).astype(dtype), None
+
+        modulation = nn.Dense(x.shape[-1] * 3, kernel_init=nn.initializers.zeros, dtype=dtype)(cond)
+        scale, shift, gate = jnp.split(modulation[:, None, :], 3, axis=-1)
+        return (normed * (1 + scale) + shift).astype(dtype), gate
 
 
 @at.typecheck
@@ -134,7 +139,7 @@ class GatedAttention(nn.Module):
                 lora_config=config.lora_configs.get("attn"),
             )("BTD,NDH->BTNH", x)
             q, gate = jnp.split(qg, 2, axis=-1)
-            q = RMSNorm(name=_name("q_norm", i))(q)
+            q = RMSNorm(name=_name("q_norm", i))(q)[0]
 
             k = lora.Einsum(
                 shape=(config.num_kv_heads, config.width, config.head_dim),
@@ -142,7 +147,7 @@ class GatedAttention(nn.Module):
                 init_fn=nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                 lora_config=config.lora_configs.get("attn"),
             )("BTD,KDH->BTKH", x)
-            k = RMSNorm(name=_name("k_norm", i))(k)
+            k = RMSNorm(name=_name("k_norm", i))(k)[0]
             v = lora.Einsum(
                 shape=(config.num_kv_heads, config.width, config.head_dim),
                 name=_name("v_einsum", i),
@@ -457,11 +462,17 @@ class DecoderLayer(nn.Module):
     @nn.compact
     def __call__(self, xs, kv_cache, positions, attn_mask, adarms_cond, deterministic=True):  # noqa: FBT002
         del deterministic
-        if any(cond is not None for cond in adarms_cond):
-            raise NotImplementedError("JAX Qwen3.5 text blocks do not support pi05/AdaRMS conditioning yet.")
-
         xs = sharding.activation_sharding_constraint(xs)
-        pre_attn = [RMSNorm(name=_name("pre_attention_norm", i))(x) if x is not None else None for i, x in enumerate(xs)]
+        pre_attn = []
+        attn_gates = []
+        for i, x in enumerate(xs):
+            if x is None:
+                pre_attn.append(None)
+                attn_gates.append(None)
+                continue
+            normed, gate = RMSNorm(name=_name("pre_attention_norm", i))(x, adarms_cond[i])
+            pre_attn.append(normed)
+            attn_gates.append(gate)
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
 
         if self.layer_type == "full_attention":
@@ -483,15 +494,20 @@ class DecoderLayer(nn.Module):
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer_type: {self.layer_type}")
 
-        xs = [x + y if x is not None else None for x, y in zip(xs, post_attn, strict=True)]
+        xs = [
+            _gated_residual(x, y, gate)
+            for x, y, gate in zip(xs, post_attn, attn_gates, strict=True)
+        ]
         xs = sharding.activation_sharding_constraint(xs)
 
         out = []
+        ffw_gates = []
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is None:
                 out.append(None)
+                ffw_gates.append(None)
                 continue
-            normed = RMSNorm(name=_name("pre_ffw_norm", i))(x)
+            normed, gate = RMSNorm(name=_name("pre_ffw_norm", i))(x, adarms_cond[i])
             ff_out = FeedForward(
                 features=config.width,
                 hidden_dim=config.mlp_dim,
@@ -499,9 +515,13 @@ class DecoderLayer(nn.Module):
                 lora_config=config.lora_configs.get("ffn"),
             )(normed)
             out.append(ff_out)
+            ffw_gates.append(gate)
 
         out = sharding.activation_sharding_constraint(out)
-        xs = [x + y if x is not None else None for x, y in zip(xs, out, strict=True)]
+        xs = [
+            _gated_residual(x, y, gate)
+            for x, y, gate in zip(xs, out, ffw_gates, strict=True)
+        ]
         xs = sharding.activation_sharding_constraint(xs)
         return xs, kv_cache
 
@@ -636,18 +656,18 @@ class Module(nn.Module):
             adarms_cond = [None] * len(self.configs)
 
         xs, kv_cache = self.layers(list(embedded), kv_cache, positions, mask, adarms_cond, deterministic)
-        return [f(e) if e is not None else e for f, e in zip(self.final_norms, xs, strict=True)], kv_cache
+        return [
+            f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, xs, adarms_cond, strict=True)
+        ], kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
-        if any(use_adarms):
-            raise NotImplementedError("JAX Qwen3.5 text blocks do not support pi05/AdaRMS conditioning yet.")
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
         total_tokens = len(self.configs)
         self(
             [jnp.zeros((1, 1, c.width), dtype=jnp.dtype(self.embed_dtype)) for c in self.configs],
             jnp.broadcast_to(jnp.arange(total_tokens, dtype=jnp.int32)[None, :], (1, total_tokens)),
             jnp.ones((1, total_tokens, total_tokens), dtype=bool),
-            adarms_cond=[None for _ in self.configs],
+            adarms_cond=[jnp.zeros((1, c.width), dtype=jnp.dtype(self.embed_dtype)) if u else None for u, c in zip(use_adarms, self.configs, strict=True)],
         )
 
 
@@ -655,6 +675,15 @@ def _name(name, i):
     if i == 0:
         return name
     return f"{name}_{i}"
+
+
+def _gated_residual(x, y, gate):
+    assert (x is None) == (y is None)
+    if x is None:
+        return None
+    if gate is None:
+        return x + y
+    return x + y * gate
 
 
 __all__ = [

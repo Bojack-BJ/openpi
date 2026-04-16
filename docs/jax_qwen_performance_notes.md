@@ -211,6 +211,23 @@ Why this matters:
 - a slightly larger unroll can improve GPU utilization on the hot recurrent path
 - we keep the decode path conservative to avoid unnecessary compile bloat there
 
+## 5. Added Qwen Pi05 AdaRMS Support
+
+Current changes in the Qwen text stacks:
+
+- Qwen2.5 and Qwen3.5 action experts now accept `use_adarms=[False, True]`
+- regular RMSNorm still uses the original `scale` param when no condition is provided
+- the action-expert branch creates adaptive scale/shift/gate params when a timestep condition is provided
+- gated residuals are applied around attention and FFN in the action expert
+- final norm also supports adaptive conditioning for the action expert
+
+Important interpretation:
+
+- this is required for Pi05 correctness, not primarily a speed optimization
+- the Pi05 state path is prefix/tokenizer-side discrete state, not a continuous suffix token
+- action-expert AdaRMS params are new trainable params and should remain randomly initialized under VLM-only HF loading
+- old Pi0 Qwen full train states should not be treated as Pi05-compatible full train states
+
 ## Screening Checklist for Future Backbones
 
 Before claiming a new JAX backbone is "working", always check these points.
