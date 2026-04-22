@@ -38,3 +38,4 @@ dist/
 /wandb/
 
 /exp_intermediate
+dataprocess_new/test/
