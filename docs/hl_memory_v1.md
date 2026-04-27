@@ -1,0 +1,332 @@
+# HL Memory V1
+
+V1 在仓库中新增一个独立的 `src/openpi/hl_memory/` 子系统，用于做高层 memory/subtask 训练和离线 rollout 评估。
+
+当前范围：
+
+- `language memory` 更新
+- `current_subtask` 预测
+- MemER 风格 `episodic keyframe memory`
+
+当前不包含：
+
+- segmentation
+- target selection
+- LL/action 接入
+- online runtime wrapper
+
+## 核心接口
+
+- `HLMemoryConfig`
+- `HLMemoryPrediction`
+- `EpisodicKeyframeMemory`
+- `ExportedHLMemorySample`
+
+## 标注 JSONL
+
+V1 导出脚本读取的标注格式为一行一个 JSON 对象，最小字段：
+
+```json
+{
+  "episode_index": 0,
+  "frame_index": 42,
+  "current_subtask": "pick apple"
+}
+```
+
+可选字段：
+
+```json
+{
+  "instruction": "sort all fruits into the basket",
+  "phase": "pick",
+  "target_query": "apple",
+  "goal_query": "basket",
+  "event_type": "success",
+  "event_text": "Completed pick apple."
+}
+```
+
+`event_type` 支持：
+
+- `none`
+- `subtask_boundary`
+- `success`
+- `failure`
+- `progress`
+- `discovery`
+
+## 导出
+
+先基于现有训练 config 复用数据集和基础 transforms，再导出 HL 样本：
+
+```bash
+python scripts/export_hl_memory_dataset.py \
+  --source-config-name <train_config_name> \
+  --annotations-jsonl <annotations.jsonl> \
+  --output-dir <out_dir>
+```
+
+导出物：
+
+- `samples.jsonl`
+- `metadata.json`
+- `frames/frame_XXXXXXXX.png`
+
+每个样本包含：
+
+- instruction
+- previous language memory
+- updated language memory
+- recent frame paths
+- historical keyframe paths
+- target `HLMemoryPrediction`
+
+## 训练
+
+```bash
+python scripts/train_hl_memory.py \
+  --dataset-dir <out_dir> \
+  --output-dir <ckpt_dir> \
+  --vlm-backend qwen2_5_vl
+```
+
+当前 V1 runtime backend：
+
+- `paligemma`
+- `qwen2_5_vl`
+
+`qwen3_5_vl` 在 V1 里只保留配置名，不提供 HF runtime adapter。
+
+## 离线 rollout 评估
+
+```bash
+python scripts/eval_hl_memory_rollout.py \
+  --dataset-dir <out_dir> \
+  --model-path <ckpt_dir/checkpoint-step-XXXXXX> \
+  --vlm-backend qwen2_5_vl
+```
+
+评估会自动跑四个 ablation：
+
+- `no_memory`
+- `language_memory_only`
+- `keyframe_memory_only`
+- `full`
+
+主要指标：
+
+- `subtask_exact_match`
+- `subtask_normalized_match`
+- `phase_accuracy`
+- `target_query_accuracy`
+- `goal_query_accuracy`
+- `keyframe_precision`
+- `keyframe_recall`
+- `language_memory_similarity`
+- `memory_drift`
+- `event_accuracy`
+- `episode_sequence_accuracy`
+
+## CrossTask 快速起步
+
+先用 CrossTask 做 action-free HL 验证时，建议只用 **18 个 primary tasks**，也就是 `tasks_primary.txt` 加带边界标注的 `annotations/`。
+
+CrossTask 官方 README 说明：
+
+- 数据集包含 **83 个任务**
+- 其中 **18 个 primary tasks** 有手工 temporal step boundary
+- `videos_val.csv` 是论文里的验证划分
+- 2022 年后视频不再依赖 YouTube，改为单独的视频打包下载
+
+参考：
+
+- CrossTask README: https://github.com/DmZhukov/CrossTask
+- `crosstask_release.zip`: `https://www.di.ens.fr/~dzhukov/crosstask/crosstask_release.zip`
+- 视频包: `https://www.rocq.inria.fr/cluster-willow/dzhukov/missing_videos.tar.gz`
+- 可选 subtitles: `https://www.rocq.inria.fr/cluster-willow/dzhukov/crosstask-subtitles.tar.gz`
+
+### CrossTask 导出脚本
+
+新增脚本：
+
+```bash
+python scripts/export_hl_memory_crosstask.py --help
+```
+
+它会：
+
+- 读取 `tasks_primary.txt`
+- 读取 `videos.csv` / `videos_val.csv`
+- 读取 `annotations/<task_id>_<video_id>.csv`
+- 直接从视频里按秒抽帧
+- 自动生成 `instruction / current_subtask / updated_language_memory / keyframe_positions`
+- 导出标准 `samples.jsonl`
+
+当前 CrossTask V1 约定：
+
+- `instruction` = task title
+- `current_subtask` = 当前 step 文本
+- `phase` = 当前 step 文本
+- `target_query` / `goal_query` 暂时留空
+- `subtask_boundary` / `success` 事件由 segment 起止时间自动伪标注
+
+### 开发机下载与训练指令
+
+下面这组命令假设你的开发机已经有：
+
+- `python >= 3.11`
+- `opencv-python`
+- `torch`
+- `transformers`
+- 当前仓库代码
+
+准备数据目录：
+
+```bash
+export DATA_ROOT=/path/to/data
+mkdir -p "$DATA_ROOT/crosstask"
+cd "$DATA_ROOT/crosstask"
+```
+
+下载 CrossTask 标注和视频：
+
+```bash
+wget https://www.di.ens.fr/~dzhukov/crosstask/crosstask_release.zip
+wget https://www.rocq.inria.fr/cluster-willow/dzhukov/missing_videos.tar.gz
+unzip crosstask_release.zip
+tar -xzf missing_videos.tar.gz
+```
+
+建议先做一个 smoke export，只跑少量视频：
+
+```bash
+cd /path/to/openpi
+
+python scripts/export_hl_memory_crosstask.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --split train \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_train_smoke" \
+  --max-videos 8 \
+  --recent-frames-length 8 \
+  --frame-subsample 1 \
+  --memory-length 8 \
+  --merge-distance 1 \
+  --overwrite
+```
+
+验证集也导一份：
+
+```bash
+python scripts/export_hl_memory_crosstask.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --split val \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_val_smoke" \
+  --max-videos 8 \
+  --recent-frames-length 8 \
+  --frame-subsample 1 \
+  --memory-length 8 \
+  --merge-distance 1 \
+  --overwrite
+```
+
+如果 smoke 没问题，再导完整 train / val：
+
+```bash
+python scripts/export_hl_memory_crosstask.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --split train \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_train" \
+  --recent-frames-length 8 \
+  --frame-subsample 1 \
+  --memory-length 8 \
+  --merge-distance 1 \
+  --overwrite
+
+python scripts/export_hl_memory_crosstask.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --split val \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_val" \
+  --recent-frames-length 8 \
+  --frame-subsample 1 \
+  --memory-length 8 \
+  --merge-distance 1 \
+  --overwrite
+```
+
+训练：
+
+```bash
+python scripts/train_hl_memory.py \
+  --dataset-dir "$DATA_ROOT/crosstask/hl_memory_train" \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_ckpts_qwen25" \
+  --vlm-backend qwen2_5_vl \
+  --vlm-hf-model-id Qwen/Qwen2.5-VL-3B-Instruct \
+  --device cuda \
+  --batch-size 1 \
+  --grad-accum-steps 4 \
+  --num-train-steps 1000 \
+  --save-interval 200 \
+  --log-interval 20
+```
+
+评估：
+
+```bash
+python scripts/eval_hl_memory_rollout.py \
+  --dataset-dir "$DATA_ROOT/crosstask/hl_memory_val" \
+  --model-path "$DATA_ROOT/crosstask/hl_memory_ckpts_qwen25/checkpoint-step-001000" \
+  --vlm-backend qwen2_5_vl \
+  --device cuda \
+  --output-json "$DATA_ROOT/crosstask/hl_memory_val_metrics.json"
+```
+
+如果你只想先验证链路，不想一开始跑大模型，也可以先改成：
+
+```bash
+--vlm-backend paligemma
+--vlm-hf-model-id google/paligemma2-3b-mix-224
+```
+
+### CrossTask 一键 smoke
+
+如果开发机已经把 CrossTask 数据下载并解压到同一个目录下，可以直接跑：
+
+```bash
+cd /path/to/openpi
+
+DATA_ROOT=/path/to/data/crosstask \
+DEVICE=cuda \
+MODEL_BACKEND=qwen2_5_vl \
+MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct \
+TRAIN_STEPS=20 \
+scripts/hl_memory_crosstask_smoke.sh
+```
+
+默认目录约定：
+
+- `$DATA_ROOT/crosstask_release`
+- `$DATA_ROOT/missing_videos`
+
+默认输出：
+
+- `$DATA_ROOT/hl_memory_train_smoke`
+- `$DATA_ROOT/hl_memory_val_smoke`
+- `$DATA_ROOT/hl_memory_ckpts_smoke`
+- `$DATA_ROOT/hl_memory_val_smoke_metrics.json`
+
+常用覆写参数：
+
+```bash
+SMOKE_VIDEOS=4
+BATCH_SIZE=1
+GRAD_ACCUM_STEPS=2
+RECENT_FRAMES_LENGTH=8
+FRAME_SUBSAMPLE=1
+MEMORY_LENGTH=8
+MERGE_DISTANCE=1
+```

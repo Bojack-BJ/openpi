@@ -53,6 +53,12 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
+## HL Memory Experiments
+
+This repo also contains a standalone high-level memory / subtask pipeline under [`src/openpi/hl_memory`](src/openpi/hl_memory), separate from the existing LL action models.
+
+- Overview and dataset/export/train/eval instructions: [docs/hl_memory_v1.md](docs/hl_memory_v1.md)
+- CrossTask smoke workflow: [`scripts/hl_memory_crosstask_smoke.sh`](scripts/hl_memory_crosstask_smoke.sh)
 
 
 
