@@ -10,6 +10,7 @@ import torch
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
 from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.hf_adapter import create_hf_adapter
@@ -19,8 +20,10 @@ from openpi.hl_memory.hf_adapter import create_hf_adapter
 class TrainArgs:
     dataset_dir: pathlib.Path
     output_dir: pathlib.Path
+    config_yaml: pathlib.Path | None = None
     vlm_backend: str = "qwen2_5_vl"
     vlm_hf_model_id: str | None = None
+    local_vlm_ckpt_path: pathlib.Path | None = None
     precision: str = "bfloat16"
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
@@ -47,7 +50,10 @@ def main(args: TrainArgs) -> None:
         precision=args.precision,
     )
     adapter = create_hf_adapter(hl_config)
-    loaded = adapter.load(device=args.device)
+    loaded = adapter.load(
+        model_path=None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
+        device=args.device,
+    )
     loaded.model.train()
     optimizer = torch.optim.AdamW(
         loaded.model.parameters(),
@@ -111,4 +117,4 @@ def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryCon
 
 
 if __name__ == "__main__":
-    main(tyro.cli(TrainArgs))
+    main(resolve_cli_args_with_yaml(TrainArgs, tyro))

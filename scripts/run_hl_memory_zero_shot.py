@@ -8,6 +8,7 @@ import torch
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
 from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.zero_shot import build_zero_shot_clips_from_video
 from openpi.hl_memory.zero_shot import build_zero_shot_sample
@@ -19,7 +20,9 @@ from openpi.hl_memory.zero_shot import save_zero_shot_debug_frames
 class ZeroShotArgs:
     video_path: pathlib.Path
     instruction: str
+    config_yaml: pathlib.Path | None = None
     model_path: str | None = None
+    local_vlm_ckpt_path: pathlib.Path | None = None
     output_json: pathlib.Path | None = None
     debug_dir: pathlib.Path | None = None
     language_memory: str = ""
@@ -53,7 +56,10 @@ def main(args: ZeroShotArgs) -> None:
         max_new_tokens=args.max_new_tokens,
     )
     adapter = create_hf_adapter(config)
-    loaded = adapter.load(model_path=args.model_path, device=args.device)
+    resolved_model_path = args.model_path
+    if args.local_vlm_ckpt_path is not None:
+        resolved_model_path = str(args.local_vlm_ckpt_path)
+    loaded = adapter.load(model_path=resolved_model_path, device=args.device)
 
     clips, selection = build_zero_shot_clips_from_video(
         args.video_path,
@@ -76,7 +82,8 @@ def main(args: ZeroShotArgs) -> None:
     payload = {
         "video_path": str(args.video_path),
         "model_path": args.model_path,
-        "resolved_model_id": config.resolved_model_id if args.model_path is None else args.model_path,
+        "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
+        "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
         "instruction": args.instruction,
         "language_memory": args.language_memory,
         "duration_sec": selection.duration_sec,
@@ -98,4 +105,4 @@ def main(args: ZeroShotArgs) -> None:
 
 
 if __name__ == "__main__":
-    main(tyro.cli(ZeroShotArgs))
+    main(resolve_cli_args_with_yaml(ZeroShotArgs, tyro))

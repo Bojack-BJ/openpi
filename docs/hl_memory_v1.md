@@ -120,6 +120,34 @@ python scripts/train_hl_memory.py \
   --vlm-backend qwen2_5_vl
 ```
 
+也支持从 YAML 读取参数：
+
+```bash
+python scripts/train_hl_memory.py --config-yaml <train_hl_memory.yaml>
+```
+
+最小示例：
+
+```yaml
+dataset_dir: /path/to/hl_memory_train_local
+output_dir: /path/to/hl_memory_ckpts
+vlm_backend: qwen2_5_vl
+local_vlm_ckpt_path: /path/to/local/qwen-vl-checkpoint
+device: cuda
+batch_size: 1
+grad_accum_steps: 4
+num_train_steps: 1000
+```
+
+如果你已经把 VLM 权重提前下载到本地路径，也可以显式传：
+
+```bash
+python scripts/train_hl_memory.py \
+  --dataset-dir <out_dir> \
+  --output-dir <ckpt_dir> \
+  --local-vlm-ckpt-path </path/to/local/qwen-vl-checkpoint>
+```
+
 当前 V1 runtime backend：
 
 - `qwen2_5_vl`
@@ -138,6 +166,34 @@ python scripts/eval_hl_memory_rollout.py \
   --model-path <ckpt_dir/checkpoint-step-XXXXXX> \
   --vlm-backend qwen2_5_vl
 ```
+
+如果评估时你更想显式写本地 checkpoint 路径，也可以用：
+
+```bash
+python scripts/eval_hl_memory_rollout.py \
+  --dataset-dir <out_dir> \
+  --local-vlm-ckpt-path </path/to/local/hl-memory-checkpoint>
+```
+
+同样支持：
+
+```bash
+python scripts/eval_hl_memory_rollout.py --config-yaml <eval_hl_memory.yaml>
+```
+
+最小示例：
+
+```yaml
+dataset_dir: /path/to/hl_memory_val_local
+local_vlm_ckpt_path: /path/to/local/hl-memory-checkpoint
+vlm_backend: qwen2_5_vl
+device: cuda
+```
+
+说明：
+
+- `--config-yaml` 依赖当前环境安装 `pyyaml`
+- CLI 显式传入的参数会覆盖 YAML 里的默认值
 
 评估会自动跑四个 ablation：
 
