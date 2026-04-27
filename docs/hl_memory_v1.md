@@ -307,10 +307,10 @@ tar -xzf missing_videos.tar.gz
 cd /path/to/openpi
 
 python scripts/export_hl_memory_crosstask.py \
-  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
-  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
+  --videos-root "cross_task_datasets/missing_videos" \
   --split train \
-  --output-dir "$DATA_ROOT/crosstask/hl_memory_train_smoke" \
+  --output-dir "cross_task_datasets/hl_memory_train_smoke" \
   --max-videos 8 \
   --recent-frames-length 8 \
   --frame-subsample 1 \
