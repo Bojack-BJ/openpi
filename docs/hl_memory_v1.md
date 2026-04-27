@@ -222,6 +222,7 @@ CrossTask 标注要点：
 
 ```bash
 python scripts/check_crosstask_video_coverage.py \
+<<<<<<< HEAD
   --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
   --videos-root "$DATA_ROOT/crosstask/missing_videos" \
   --split train \
@@ -235,12 +236,20 @@ python scripts/check_crosstask_video_coverage.py \
 - `corrupt_matched_records`: 名字匹配到但解码失败的视频
 
 如果决定只在本地可用交集上做小规模实验，可以先重新切分：
+=======
+  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
+  --videos-root "cross_task_datasets/missing_videos" \
+  --split train
+```
+
+如果决定只在本地可用交集上做小规模实验，可以先重新切分:
+>>>>>>> 6b31df6 (local adjustment in hl_memory_v1.md)
 
 ```bash
 python scripts/split_crosstask_matched_videos.py \
-  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
-  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
-  --output-dir "$DATA_ROOT/crosstask/matched_split" \
+  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
+  --videos-root "cross_task_datasets/missing_videos" \
+  --output-dir "cross_task_datasets/crosstask/matched_split" \
   --val-ratio 0.2 \
   --seed 0
 ```
@@ -257,10 +266,10 @@ python scripts/split_crosstask_matched_videos.py \
 
 ```bash
 python scripts/export_hl_memory_crosstask.py \
-  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
-  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
-  --records-csv "$DATA_ROOT/crosstask/matched_split/train_records.csv" \
-  --output-dir "$DATA_ROOT/crosstask/hl_memory_train_local" \
+  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
+  --videos-root "cross_task_datasets/missing_videos" \
+  --records-csv "cross_task_datasets/crosstask/matched_split/train_records.csv" \
+  --output-dir "cross_task_datasets/crosstask/hl_memory_train_local" \
   --recent-frames-length 8 \
   --frame-subsample 1 \
   --memory-length 8 \
@@ -272,10 +281,10 @@ python scripts/export_hl_memory_crosstask.py \
 
 ```bash
 python scripts/export_hl_memory_crosstask.py \
-  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
-  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
-  --records-csv "$DATA_ROOT/crosstask/matched_split/val_records.csv" \
-  --output-dir "$DATA_ROOT/crosstask/hl_memory_val_local" \
+  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
+  --videos-root "cross_task_datasets/missing_videos" \
+  --records-csv "cross_task_datasets/crosstask/matched_split/val_records.csv" \
+  --output-dir "cross_task_datasets/crosstask/hl_memory_val_local" \
   --recent-frames-length 8 \
   --frame-subsample 1 \
   --memory-length 8 \
