@@ -222,9 +222,8 @@ CrossTask 标注要点：
 
 ```bash
 python scripts/check_crosstask_video_coverage.py \
-<<<<<<< HEAD
-  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
-  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
+  --videos-root "cross_task_datasets/missing_videos" \
   --split train \
   --verify-decodable
 ```
@@ -236,14 +235,6 @@ python scripts/check_crosstask_video_coverage.py \
 - `corrupt_matched_records`: 名字匹配到但解码失败的视频
 
 如果决定只在本地可用交集上做小规模实验，可以先重新切分：
-=======
-  --crosstask-release-dir "cross_task_datasets/crosstask_release" \
-  --videos-root "cross_task_datasets/missing_videos" \
-  --split train
-```
-
-如果决定只在本地可用交集上做小规模实验，可以先重新切分:
->>>>>>> 6b31df6 (local adjustment in hl_memory_v1.md)
 
 ```bash
 python scripts/split_crosstask_matched_videos.py \
