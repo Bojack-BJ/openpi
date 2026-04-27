@@ -209,18 +209,44 @@ def load_video_clips_for_sample(
     dataset_dir = pathlib.Path(dataset_dir)
     memory_frames = [_load_rgb_image(path) for path in sample.resolve_memory_frame_paths(dataset_dir)]
     recent_frames = [_load_rgb_image(path) for path in sample.resolve_recent_frame_paths(dataset_dir)]
-    memory_valid_length = min(sample.memory_valid_length, len(memory_frames), config.memory_length)
-    recent_valid_length = min(sample.recent_valid_length, len(recent_frames), config.recent_frames_length)
+    return build_loaded_video_clips_from_frames(
+        memory_frames,
+        recent_frames,
+        config=config,
+        memory_valid_length=sample.memory_valid_length,
+        recent_valid_length=sample.recent_valid_length,
+    )
 
+
+def build_loaded_video_clips_from_frames(
+    memory_frames: Iterable[Image.Image],
+    recent_frames: Iterable[Image.Image],
+    *,
+    config: HLMemoryConfig,
+    memory_valid_length: int | None = None,
+    recent_valid_length: int | None = None,
+) -> LoadedVideoClips:
+    memory_frames = list(memory_frames)
+    recent_frames = list(recent_frames)
+    resolved_memory_valid_length = min(
+        len(memory_frames) if memory_valid_length is None else memory_valid_length,
+        len(memory_frames),
+        config.memory_length,
+    )
+    resolved_recent_valid_length = min(
+        len(recent_frames) if recent_valid_length is None else recent_valid_length,
+        len(recent_frames),
+        config.recent_frames_length,
+    )
     padded_memory_frames = _pad_clip_frames(
-        memory_frames[:memory_valid_length],
+        memory_frames[:resolved_memory_valid_length],
         target_length=config.memory_length,
         frame_width=config.frame_width,
         frame_height=config.frame_height,
         allow_single_frame_fallback=config.allow_single_frame_fallback,
     )
     padded_recent_frames = _pad_clip_frames(
-        recent_frames[:recent_valid_length],
+        recent_frames[:resolved_recent_valid_length],
         target_length=config.recent_frames_length,
         frame_width=config.frame_width,
         frame_height=config.frame_height,
@@ -229,8 +255,8 @@ def load_video_clips_for_sample(
     return LoadedVideoClips(
         memory_frames=tuple(padded_memory_frames),
         recent_frames=tuple(padded_recent_frames),
-        memory_valid_length=memory_valid_length,
-        recent_valid_length=recent_valid_length,
+        memory_valid_length=resolved_memory_valid_length,
+        recent_valid_length=resolved_recent_valid_length,
     )
 
 

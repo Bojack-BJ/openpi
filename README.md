@@ -64,6 +64,8 @@ This repo also contains a standalone high-level memory / subtask pipeline under 
   - updated language memory
   - current subtask
   - recent-window keyframe candidate positions
+- A zero-shot inference entrypoint for your own videos is available at
+  [`scripts/run_hl_memory_zero_shot.py`](scripts/run_hl_memory_zero_shot.py)
 - Overview and dataset/export/train/eval instructions: [docs/hl_memory_v1.md](docs/hl_memory_v1.md)
 - CrossTask smoke workflow: [`scripts/hl_memory_crosstask_smoke.sh`](scripts/hl_memory_crosstask_smoke.sh)
 

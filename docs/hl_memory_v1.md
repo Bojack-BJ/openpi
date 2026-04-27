@@ -160,6 +160,44 @@ python scripts/eval_hl_memory_rollout.py \
 - `event_accuracy`
 - `episode_sequence_accuracy`
 
+## Zero-shot 自定义视频推理
+
+如果你想先不训练，直接看 HL zero-shot 在自己视频上的输出，可以用：
+
+```bash
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /path/to/video.mp4 \
+  --instruction "Put all the cans into the basket." \
+  --language-memory "One can has already been placed into the basket." \
+  --recent-end-sec 42 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen2_5_vl \
+  --vlm-hf-model-id Qwen/Qwen2.5-VL-3B-Instruct \
+  --device cuda \
+  --debug-dir /tmp/hl_zero_shot_debug
+```
+
+常用方式：
+
+- 自动 recent clip：
+  - 用 `--recent-end-sec` 和 `--recent-step-sec`
+- 手工 recent clip：
+  - `--recent-seconds "35,36,37,38,39,40,41,42"`
+- 手工 memory keyframes：
+  - `--memory-seconds "5,10,15,20"`
+- 自动 memory keyframes：
+  - 不传 `--memory-seconds`，默认从 recent clip 之前均匀抽样
+
+输出是一个 JSON，包含：
+
+- 选中的 `memory_seconds`
+- 选中的 `recent_seconds`
+- `prediction.updated_language_memory`
+- `prediction.current_subtask`
+- `prediction.keyframe_candidate_positions`
+
+如果传了 `--debug-dir`，脚本会把实际送入模型的 memory/recent 帧保存出来，方便你直接肉眼检查。
+
 ## CrossTask 快速起步
 
 先用 CrossTask 做 action-free HL 验证时，建议只用 **18 个 primary tasks**，也就是 `tasks_primary.txt` 加带边界标注的 `annotations/`。
