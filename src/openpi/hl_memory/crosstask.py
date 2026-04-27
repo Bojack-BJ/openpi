@@ -54,6 +54,21 @@ class CrossTaskCoverageReport:
         return len(self.missing_local_video_records)
 
 
+@dataclasses.dataclass(frozen=True)
+class CrossTaskDecodabilityReport:
+    decodable_video_index: dict[str, pathlib.Path]
+    corrupt_video_index: dict[str, pathlib.Path]
+    corrupt_reasons: dict[str, str]
+
+    @property
+    def decodable_count(self) -> int:
+        return len(self.decodable_video_index)
+
+    @property
+    def corrupt_count(self) -> int:
+        return len(self.corrupt_video_index)
+
+
 def read_task_info(path: pathlib.Path | str) -> dict[str, CrossTaskTaskInfo]:
     path = pathlib.Path(path)
     tasks: dict[str, CrossTaskTaskInfo] = {}
@@ -215,3 +230,76 @@ def build_coverage_report(
         missing_annotation_records=tuple(missing_annotations),
         missing_local_video_records=tuple(missing_local_videos),
     )
+
+
+def probe_video_index_decodability(
+    video_index: dict[str, pathlib.Path],
+    *,
+    num_probe_positions: int = 5,
+) -> CrossTaskDecodabilityReport:
+    decodable: dict[str, pathlib.Path] = {}
+    corrupt: dict[str, pathlib.Path] = {}
+    corrupt_reasons: dict[str, str] = {}
+    for video_id, path in video_index.items():
+        ok, reason = probe_video_decodability(path, num_probe_positions=num_probe_positions)
+        if ok:
+            decodable[video_id] = path
+        else:
+            corrupt[video_id] = path
+            corrupt_reasons[video_id] = reason
+    return CrossTaskDecodabilityReport(
+        decodable_video_index=decodable,
+        corrupt_video_index=corrupt,
+        corrupt_reasons=corrupt_reasons,
+    )
+
+
+def probe_video_decodability(
+    path: pathlib.Path | str,
+    *,
+    num_probe_positions: int = 5,
+) -> tuple[bool, str]:
+    try:
+        import cv2
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("CrossTask video decodability checks require `opencv-python`.") from exc
+
+    path = pathlib.Path(path)
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        capture.release()
+        return False, "cannot_open"
+
+    try:
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        duration_sec = frame_count / fps if frame_count > 0 and fps > 0 else None
+
+        probe_points = _build_probe_positions(duration_sec, num_probe_positions=num_probe_positions)
+        for position_sec in probe_points:
+            capture.set(cv2.CAP_PROP_POS_MSEC, float(position_sec) * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None or getattr(frame, "size", 0) == 0:
+                return False, f"decode_failed_at_{position_sec:.2f}s"
+    finally:
+        capture.release()
+    return True, "ok"
+
+
+def _build_probe_positions(duration_sec: float | None, *, num_probe_positions: int) -> list[float]:
+    if num_probe_positions <= 0:
+        raise ValueError("num_probe_positions must be positive.")
+    if duration_sec is None or duration_sec <= 0.0:
+        return [0.0]
+    if duration_sec <= 1.0:
+        return [0.0, max(duration_sec - 1e-3, 0.0)]
+
+    fractions = [index / max(num_probe_positions - 1, 1) for index in range(num_probe_positions)]
+    positions: list[float] = []
+    for fraction in fractions:
+        position = min(max(fraction * duration_sec, 0.0), max(duration_sec - 1e-3, 0.0))
+        if not positions or abs(position - positions[-1]) > 1e-6:
+            positions.append(position)
+    if positions[0] != 0.0:
+        positions.insert(0, 0.0)
+    return positions

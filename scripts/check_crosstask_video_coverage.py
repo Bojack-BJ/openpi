@@ -8,6 +8,7 @@ import tyro
 
 from openpi.hl_memory.crosstask import build_coverage_report
 from openpi.hl_memory.crosstask import index_local_videos
+from openpi.hl_memory.crosstask import probe_video_index_decodability
 from openpi.hl_memory.crosstask import read_task_info
 from openpi.hl_memory.crosstask import read_video_records
 
@@ -22,9 +23,12 @@ class CoverageArgs:
     val_videos_csv: str = "videos_val.csv"
     annotations_dir: str = "annotations"
     max_show_missing: int = 20
+    verify_decodable: bool = False
+    num_probe_positions: int = 5
     output_json: pathlib.Path | None = None
     dump_missing_video_ids: pathlib.Path | None = None
     dump_matched_video_ids: pathlib.Path | None = None
+    dump_corrupt_video_ids: pathlib.Path | None = None
 
 
 def main(args: CoverageArgs) -> None:
@@ -58,14 +62,33 @@ def main(args: CoverageArgs) -> None:
         video_index=video_index,
     )
 
+    decodable_report = None
+    decodable_matched_records = list(report.matched_records)
+    corrupt_matched_records = []
+    if args.verify_decodable:
+        decodable_report = probe_video_index_decodability(
+            video_index,
+            num_probe_positions=args.num_probe_positions,
+        )
+        decodable_ids = set(decodable_report.decodable_video_index)
+        corrupt_ids = set(decodable_report.corrupt_video_index)
+        decodable_matched_records = [record for record in report.matched_records if record.video_id in decodable_ids]
+        corrupt_matched_records = [record for record in report.matched_records if record.video_id in corrupt_ids]
+
     payload = {
         "split": args.split,
         "candidate_records": report.total_records,
         "matched_local_records": report.matched_count,
+        "decodable_matched_records": len(decodable_matched_records),
+        "corrupt_matched_records": len(corrupt_matched_records),
         "missing_annotations": report.missing_annotations,
         "missing_local_videos": report.missing_local_videos,
         "indexed_local_video_files": len(video_index),
+        "indexed_decodable_video_files": None if decodable_report is None else decodable_report.decodable_count,
+        "indexed_corrupt_video_files": None if decodable_report is None else decodable_report.corrupt_count,
         "matched_video_ids": [record.video_id for record in report.matched_records],
+        "decodable_matched_video_ids": [record.video_id for record in decodable_matched_records],
+        "corrupt_matched_video_ids": [record.video_id for record in corrupt_matched_records],
         "missing_video_ids": [record.video_id for record in report.missing_local_video_records],
     }
 
@@ -73,12 +96,21 @@ def main(args: CoverageArgs) -> None:
     print(f"  indexed_local_video_files: {payload['indexed_local_video_files']}")
     print(f"  candidate_records:         {payload['candidate_records']}")
     print(f"  matched_local_records:     {payload['matched_local_records']}")
+    if args.verify_decodable:
+        print(f"  decodable_matched_records: {payload['decodable_matched_records']}")
+        print(f"  corrupt_matched_records:   {payload['corrupt_matched_records']}")
+        print(f"  indexed_decodable_files:   {payload['indexed_decodable_video_files']}")
+        print(f"  indexed_corrupt_files:     {payload['indexed_corrupt_video_files']}")
     print(f"  missing_annotations:       {payload['missing_annotations']}")
     print(f"  missing_local_videos:      {payload['missing_local_videos']}")
 
     if report.missing_local_video_records and args.max_show_missing > 0:
         print("  first_missing_video_ids:")
         for record in report.missing_local_video_records[: args.max_show_missing]:
+            print(f"    - {record.task_id}/{record.video_id}")
+    if corrupt_matched_records and args.max_show_missing > 0:
+        print("  first_corrupt_video_ids:")
+        for record in corrupt_matched_records[: args.max_show_missing]:
             print(f"    - {record.task_id}/{record.video_id}")
 
     if args.output_json is not None:
@@ -89,6 +121,8 @@ def main(args: CoverageArgs) -> None:
         )
     if args.dump_matched_video_ids is not None:
         args.dump_matched_video_ids.write_text("\n".join(record.video_id for record in report.matched_records) + "\n")
+    if args.dump_corrupt_video_ids is not None:
+        args.dump_corrupt_video_ids.write_text("\n".join(record.video_id for record in corrupt_matched_records) + "\n")
 
 
 if __name__ == "__main__":

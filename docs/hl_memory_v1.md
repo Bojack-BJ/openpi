@@ -224,8 +224,15 @@ CrossTask 标注要点：
 python scripts/check_crosstask_video_coverage.py \
   --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
   --videos-root "$DATA_ROOT/crosstask/missing_videos" \
-  --split train
+  --split train \
+  --verify-decodable
 ```
+
+这里会区分三类：
+
+- `matched_local_records`: 文件名能匹配到
+- `decodable_matched_records`: 真正能读帧的视频
+- `corrupt_matched_records`: 名字匹配到但解码失败的视频
 
 如果决定只在本地可用交集上做小规模实验，可以先重新切分：
 
@@ -237,6 +244,8 @@ python scripts/split_crosstask_matched_videos.py \
   --val-ratio 0.2 \
   --seed 0
 ```
+
+默认会先做视频可解码检查，只基于 `decodable` 的本地视频做 split。
 
 它会生成：
 
