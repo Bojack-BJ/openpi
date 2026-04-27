@@ -22,6 +22,7 @@ class TrainArgs:
     output_dir: pathlib.Path
     config_yaml: pathlib.Path | None = None
     vlm_backend: str = "qwen2_5_vl"
+    vlm_variant: str | None = None
     vlm_hf_model_id: str | None = None
     local_vlm_ckpt_path: pathlib.Path | None = None
     precision: str = "bfloat16"
@@ -46,6 +47,7 @@ def main(args: TrainArgs) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     hl_config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
+        vlm_variant=args.vlm_variant,
         vlm_hf_model_id=args.vlm_hf_model_id,
         precision=args.precision,
     )

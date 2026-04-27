@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import dataclasses
+import difflib
 import pathlib
+import re
 
 from PIL import Image
 
@@ -19,6 +21,15 @@ class ZeroShotClipSelection:
     duration_sec: float | None
     memory_seconds: tuple[float, ...]
     recent_seconds: tuple[float, ...]
+
+
+_GENERIC_MEMORY_STRINGS = {
+    "",
+    "task started",
+    "task started.",
+    "no progress has been recorded yet",
+    "no progress has been recorded yet.",
+}
 
 
 def parse_seconds_argument(value: str | None) -> list[float]:
@@ -113,6 +124,7 @@ def build_zero_shot_clips_from_video(
             )
         else:
             resolved_memory_seconds = []
+        resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
 
         memory_frames = [reader.read(second) for second in resolved_memory_seconds]
         recent_frames = [reader.read(second) for second in resolved_recent_seconds]
@@ -197,14 +209,49 @@ def update_rollout_memory_seconds(
     candidate_seconds: Iterable[float],
     *,
     memory_length: int,
+    merge_distance_sec: float | None = None,
 ) -> tuple[float, ...]:
     if memory_length <= 0:
         raise ValueError("memory_length must be positive.")
-    deduped: list[float] = []
-    for second in sorted([*memory_seconds, *candidate_seconds]):
-        if not deduped or abs(second - deduped[-1]) > 1e-6:
-            deduped.append(second)
-    return tuple(deduped[-memory_length:])
+    seconds = _sorted_unique_seconds([*memory_seconds, *candidate_seconds])
+    if merge_distance_sec is not None and merge_distance_sec > 0.0:
+        seconds = _cluster_keyframe_seconds(seconds, merge_distance_sec=merge_distance_sec)
+    return tuple(seconds[-memory_length:])
+
+
+def apply_rollout_language_memory_rule(
+    prediction: HLMemoryPrediction,
+    *,
+    previous_memory: str,
+    recent_end_sec: float,
+    max_entries: int = 6,
+    max_chars: int = 700,
+) -> tuple[HLMemoryPrediction, bool]:
+    """Ensures rollout memory advances and stays compact.
+
+    Zero-shot VLMs often repeat the previous memory verbatim. For rollout, that
+    makes the next step blind to the predicted subtask progression. This rule
+    keeps the model-proposed memory when it is informative, and otherwise
+    synthesizes a concise progress memory from the current prediction.
+    """
+    model_memory = prediction.updated_language_memory.strip()
+    previous_memory = previous_memory.strip()
+    should_replace = (
+        _is_generic_memory(model_memory)
+        or _normalize_text(model_memory) == _normalize_text(previous_memory)
+        or _looks_like_instruction_echo(model_memory, prediction.current_subtask)
+    )
+    if not should_replace:
+        compacted = _compact_language_memory(model_memory, max_chars=max_chars)
+        return dataclasses.replace(prediction, updated_language_memory=compacted), compacted != model_memory
+
+    entries = _extract_progress_entries(previous_memory)
+    new_entry = _format_progress_entry(prediction, recent_end_sec=recent_end_sec)
+    entries = _append_or_merge_progress_entry(entries, new_entry)
+    entries = entries[-max_entries:]
+    updated_memory = _render_progress_memory(entries, prediction)
+    updated_memory = _compact_language_memory(updated_memory, max_chars=max_chars)
+    return dataclasses.replace(prediction, updated_language_memory=updated_memory), True
 
 
 def build_zero_shot_sample(
@@ -325,5 +372,118 @@ def _sorted_unique_seconds(seconds: Iterable[float]) -> list[float]:
     return deduped
 
 
+def _filter_visible_memory_seconds(memory_seconds: Iterable[float], recent_seconds: Iterable[float]) -> list[float]:
+    recent_seconds = list(recent_seconds)
+    if not recent_seconds:
+        return _sorted_unique_seconds(memory_seconds)
+    earliest_recent = min(recent_seconds)
+    visible = set(round(second, 6) for second in recent_seconds)
+    return [
+        second
+        for second in _sorted_unique_seconds(memory_seconds)
+        if round(second, 6) not in visible and second < earliest_recent
+    ]
+
+
+def _cluster_keyframe_seconds(seconds: list[float], *, merge_distance_sec: float) -> list[float]:
+    if not seconds:
+        return []
+    clusters: list[list[float]] = [[seconds[0]]]
+    for second in seconds[1:]:
+        if second - clusters[-1][-1] <= merge_distance_sec:
+            clusters[-1].append(second)
+        else:
+            clusters.append([second])
+    return [cluster[(len(cluster) - 1) // 2] for cluster in clusters]
+
+
 def _format_second(second: float) -> str:
     return f"{second:08.3f}s".replace(".", "p")
+
+
+def _is_generic_memory(text: str) -> bool:
+    return _normalize_text(text) in _GENERIC_MEMORY_STRINGS
+
+
+def _looks_like_instruction_echo(memory: str, current_subtask: str) -> bool:
+    normalized_memory = _normalize_text(memory)
+    normalized_subtask = _normalize_text(current_subtask)
+    if not normalized_memory or not normalized_subtask:
+        return False
+    return normalized_memory == normalized_subtask
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _extract_progress_entries(memory: str) -> list[str]:
+    entries: list[str] = []
+    for line in memory.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            entries.append(stripped[2:].strip())
+    if entries:
+        return entries
+    if memory.strip() and not _is_generic_memory(memory):
+        return [memory.strip()]
+    return []
+
+
+def _format_progress_entry(prediction: HLMemoryPrediction, *, recent_end_sec: float) -> str:
+    phase = prediction.phase.strip() or "unknown"
+    subtask = prediction.current_subtask.strip()
+    target = prediction.target_query.strip()
+    goal = prediction.goal_query.strip()
+    details = [f"t={recent_end_sec:.1f}s", f"[{phase}]", subtask]
+    if target:
+        details.append(f"target={target}")
+    if goal:
+        details.append(f"goal={goal}")
+    return "; ".join(details)
+
+
+def _append_or_merge_progress_entry(entries: list[str], new_entry: str) -> list[str]:
+    if not entries:
+        return [new_entry]
+
+    previous_subtask = _extract_entry_subtask(entries[-1])
+    new_subtask = _extract_entry_subtask(new_entry)
+    if previous_subtask and new_subtask:
+        similarity = difflib.SequenceMatcher(None, _normalize_text(previous_subtask), _normalize_text(new_subtask)).ratio()
+        if similarity >= 0.82:
+            return [*entries[:-1], new_entry]
+    return [*entries, new_entry]
+
+
+def _extract_entry_subtask(entry: str) -> str:
+    parts = [part.strip() for part in entry.split(";")]
+    for part in parts:
+        if part.startswith("["):
+            closing = part.find("]")
+            if closing >= 0:
+                return part[closing + 1 :].strip()
+    if len(parts) >= 3:
+        return parts[2]
+    return entry.strip()
+
+
+def _render_progress_memory(entries: list[str], prediction: HLMemoryPrediction) -> str:
+    lines = ["Progress memory:"]
+    lines.extend(f"- {entry}" for entry in entries)
+    lines.append(f"Current subtask: {prediction.current_subtask.strip()}")
+    return "\n".join(lines)
+
+
+def _compact_language_memory(memory: str, *, max_chars: int) -> str:
+    if len(memory) <= max_chars:
+        return memory
+    lines = [line for line in memory.splitlines() if line.strip()]
+    if len(lines) <= 3:
+        return memory[: max(max_chars - 3, 0)].rstrip() + "..."
+    header = lines[:1]
+    tail = lines[-5:]
+    compacted = "\n".join([*header, "- Earlier repetitive progress compressed.", *tail])
+    if len(compacted) <= max_chars:
+        return compacted
+    return compacted[: max(max_chars - 3, 0)].rstrip() + "..."

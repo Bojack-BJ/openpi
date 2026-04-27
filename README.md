@@ -60,6 +60,8 @@ This repo also contains a standalone high-level memory / subtask pipeline under 
 - The current V1 runtime path is Qwen-based and consumes two ordered visual clips:
   - historical memory keyframes
   - recent observation window
+- Runtime backends currently include `qwen2_5_vl` and `qwen3_5_vl`; Qwen3.5 supports `vlm_variant` values
+  `qwen3_5_2b` / `qwen3_5_4b`.
 - It predicts:
   - updated language memory
   - current subtask

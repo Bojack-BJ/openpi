@@ -22,6 +22,7 @@ class EvalArgs:
     model_path: pathlib.Path | None = None
     config_yaml: pathlib.Path | None = None
     vlm_backend: str = "qwen2_5_vl"
+    vlm_variant: str | None = None
     vlm_hf_model_id: str | None = None
     local_vlm_ckpt_path: pathlib.Path | None = None
     precision: str = "bfloat16"
@@ -37,6 +38,7 @@ def main(args: EvalArgs) -> None:
         raise ValueError("Set either `model_path` or `local_vlm_ckpt_path`.")
     hl_config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
+        vlm_variant=args.vlm_variant,
         vlm_hf_model_id=args.vlm_hf_model_id or str(resolved_model_path),
         precision=args.precision,
     )

@@ -5,8 +5,13 @@ REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_ROOT="${DATA_ROOT:?Set DATA_ROOT to the directory containing crosstask_release and missing_videos.}"
 
 MODEL_BACKEND="${MODEL_BACKEND:-qwen2_5_vl}"
+MODEL_VARIANT="${MODEL_VARIANT:-}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-VL-3B-Instruct}"
 DEVICE="${DEVICE:-cuda}"
+MODEL_VARIANT_ARGS=()
+if [[ -n "$MODEL_VARIANT" ]]; then
+  MODEL_VARIANT_ARGS=(--vlm-variant "$MODEL_VARIANT")
+fi
 
 SMOKE_VIDEOS="${SMOKE_VIDEOS:-8}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
@@ -55,6 +60,7 @@ uv run python scripts/train_hl_memory.py \
   --dataset-dir "$TRAIN_EXPORT_DIR" \
   --output-dir "$CKPT_DIR" \
   --vlm-backend "$MODEL_BACKEND" \
+  "${MODEL_VARIANT_ARGS[@]}" \
   --vlm-hf-model-id "$MODEL_ID" \
   --device "$DEVICE" \
   --batch-size "$BATCH_SIZE" \
@@ -70,6 +76,7 @@ uv run python scripts/eval_hl_memory_rollout.py \
   --dataset-dir "$VAL_EXPORT_DIR" \
   --model-path "$CHECKPOINT_PATH" \
   --vlm-backend "$MODEL_BACKEND" \
+  "${MODEL_VARIANT_ARGS[@]}" \
   --device "$DEVICE" \
   --output-json "$METRICS_JSON"
 
