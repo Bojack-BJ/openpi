@@ -37,6 +37,16 @@ class HLMemoryPrediction:
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=True, separators=(",", ":"))
 
+    def with_recent_position_limit(self, recent_valid_length: int) -> "HLMemoryPrediction":
+        """Drops keyframe positions that point outside the valid recent clip."""
+        limit = max(int(recent_valid_length), 0)
+        return dataclasses.replace(
+            self,
+            keyframe_candidate_positions=tuple(
+                position for position in self.keyframe_candidate_positions if 1 <= position <= limit
+            ),
+        )
+
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "HLMemoryPrediction":
         required_keys = {
@@ -54,7 +64,12 @@ class HLMemoryPrediction:
             raise ValueError("keyframe_candidate_positions must be a list.")
         keyframe_candidate_positions: list[int] = []
         for raw_position in raw_positions:
-            position = int(raw_position)
+            try:
+                position = int(raw_position)
+            except (TypeError, ValueError):
+                continue
+            if position <= 0:
+                continue
             if position not in keyframe_candidate_positions:
                 keyframe_candidate_positions.append(position)
         return cls(

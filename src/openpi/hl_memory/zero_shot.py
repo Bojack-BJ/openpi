@@ -10,6 +10,7 @@ from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.data import build_loaded_video_clips_from_frames
+from openpi.hl_memory.schema import HLMemoryPrediction
 
 
 @dataclasses.dataclass(frozen=True)
@@ -134,6 +135,78 @@ def build_zero_shot_clips_from_video(
     return clips, selection
 
 
+def read_video_duration_sec(video_path: pathlib.Path | str) -> float | None:
+    reader = VideoFrameReader(video_path)
+    try:
+        return reader.duration_sec
+    finally:
+        reader.close()
+
+
+def build_rollout_end_seconds(
+    duration_sec: float | None,
+    *,
+    interval_sec: float,
+    start_sec: float = 0.0,
+    end_sec: float | None = None,
+) -> list[float]:
+    if interval_sec <= 0.0:
+        raise ValueError("interval_sec must be positive.")
+    resolved_start = max(float(start_sec), 0.0)
+    if end_sec is None:
+        if duration_sec is None:
+            raise ValueError("end_sec must be set when video duration is unavailable.")
+        resolved_end = duration_sec
+    else:
+        resolved_end = max(float(end_sec), 0.0)
+        if duration_sec is not None and duration_sec > 0.0:
+            resolved_end = min(resolved_end, duration_sec)
+    if resolved_end < resolved_start:
+        return [resolved_start]
+
+    seconds: list[float] = []
+    current = resolved_start
+    while current <= resolved_end + 1e-6:
+        seconds.append(round(current, 6))
+        current += interval_sec
+    if not seconds or seconds[-1] < resolved_end - 1e-6:
+        seconds.append(round(resolved_end, 6))
+    return seconds
+
+
+def keyframe_candidate_seconds(
+    prediction: HLMemoryPrediction,
+    selection: ZeroShotClipSelection,
+    *,
+    recent_valid_length: int,
+) -> tuple[float, ...]:
+    seconds: list[float] = []
+    for position in prediction.keyframe_candidate_positions:
+        if position <= 0 or position > recent_valid_length:
+            continue
+        if position > len(selection.recent_seconds):
+            continue
+        second = selection.recent_seconds[position - 1]
+        if second not in seconds:
+            seconds.append(second)
+    return tuple(seconds)
+
+
+def update_rollout_memory_seconds(
+    memory_seconds: Iterable[float],
+    candidate_seconds: Iterable[float],
+    *,
+    memory_length: int,
+) -> tuple[float, ...]:
+    if memory_length <= 0:
+        raise ValueError("memory_length must be positive.")
+    deduped: list[float] = []
+    for second in sorted([*memory_seconds, *candidate_seconds]):
+        if not deduped or abs(second - deduped[-1]) > 1e-6:
+            deduped.append(second)
+    return tuple(deduped[-memory_length:])
+
+
 def build_zero_shot_sample(
     *,
     video_path: pathlib.Path | str,
@@ -182,6 +255,26 @@ def save_zero_shot_debug_frames(
     for index, frame in enumerate(clips.recent_frames[: clips.recent_valid_length]):
         second = selection.recent_seconds[index]
         frame.save(debug_dir / f"recent_{index:02d}_{_format_second(second)}.png")
+
+
+def save_keyframe_candidate_frames(
+    debug_dir: pathlib.Path | str,
+    *,
+    clips: LoadedVideoClips,
+    selection: ZeroShotClipSelection,
+    positions: Iterable[int],
+) -> list[pathlib.Path]:
+    debug_dir = pathlib.Path(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    saved_paths: list[pathlib.Path] = []
+    for position in positions:
+        if position <= 0 or position > clips.recent_valid_length or position > len(selection.recent_seconds):
+            continue
+        second = selection.recent_seconds[position - 1]
+        output_path = debug_dir / f"keyframe_candidate_pos{position:02d}_{_format_second(second)}.png"
+        clips.recent_frames[position - 1].save(output_path)
+        saved_paths.append(output_path)
+    return saved_paths
 
 
 class VideoFrameReader:

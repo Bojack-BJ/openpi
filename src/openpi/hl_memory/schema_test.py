@@ -24,3 +24,13 @@ def test_prediction_parses_fenced_json():
     parsed = HLMemoryPrediction.from_json(text)
 
     assert parsed.keyframe_candidate_positions == (2,)
+
+
+def test_prediction_drops_invalid_generated_positions():
+    parsed = HLMemoryPrediction.from_json(
+        '{"updated_language_memory":"m","current_subtask":"s",'
+        '"keyframe_candidate_positions":[0,"bad",2,7,2],"phase":"p","target_query":"t","goal_query":"g"}'
+    )
+
+    assert parsed.keyframe_candidate_positions == (2, 7)
+    assert parsed.with_recent_position_limit(2).keyframe_candidate_positions == (2,)

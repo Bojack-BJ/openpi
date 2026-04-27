@@ -233,6 +233,16 @@ python scripts/run_hl_memory_zero_shot.py \
   --debug-dir /tmp/hl_zero_shot_debug
 ```
 
+视觉输入实际送入 Qwen 的方式：
+
+- 脚本不会把原始 mp4 直接交给模型自由读取。
+- 脚本先按秒抽帧，再 resize/pad 成两个定长 clip。
+- 第一个 `video` 是 historical memory keyframes clip。
+- 第二个 `video` 是 recent observation clip。
+- 每个 clip 内位置按时间从旧到新排列。
+- `keyframe_candidate_positions` 只能引用 recent clip 内的有效帧，且是 1-indexed。
+- 如果 recent clip 只有 2 张有效帧，即使 padding 到 8 帧，合法位置也只有 `1,2`。
+
 常用方式：
 
 - 自动 recent clip：
@@ -248,11 +258,40 @@ python scripts/run_hl_memory_zero_shot.py \
 
 - 选中的 `memory_seconds`
 - 选中的 `recent_seconds`
+- 原始模型输出 `raw_model_output`
 - `prediction.updated_language_memory`
 - `prediction.current_subtask`
 - `prediction.keyframe_candidate_positions`
+- `keyframe_candidate_seconds`
 
 如果传了 `--debug-dir`，脚本会把实际送入模型的 memory/recent 帧保存出来，方便你直接肉眼检查。
+
+如果想对同一个视频按时间间隔持续 rollout，记录每次 memory 更新和关键帧，可以用：
+
+```bash
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /path/to/video.mp4 \
+  --instruction "Fold the shoebox" \
+  --language-memory "Task started." \
+  --rollout-interval-sec 2 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 20 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen2_5_vl \
+  --local-vlm-ckpt-path /path/to/Qwen2.5-VL-3B-Instruct \
+  --device cuda \
+  --debug-dir /tmp/hl_zero_shot_rollout \
+  --output-json /tmp/hl_zero_shot_rollout/summary.json
+```
+
+rollout 模式会：
+
+- 每隔 `--rollout-interval-sec` 秒跑一次 HL 推理。
+- 用上一轮的 `updated_language_memory` 作为下一轮的 language memory。
+- 把预测出的 recent keyframe candidates 映射成视频秒数，作为下一轮 memory clip 的候选 keyframes。
+- 在 `debug_dir/rollout_step_XXX/` 保存每轮实际送入模型的 memory/recent 帧。
+- 在 `debug_dir/rollout_step_XXX/keyframe_candidates/` 保存每轮选中的关键帧。
+- 在 `debug_dir/rollout.jsonl` 保存逐步完整记录，包括 `raw_model_output`、解析后的 prediction 和 memory 更新。
 
 ## CrossTask 快速起步
 

@@ -33,6 +33,12 @@ class LoadedHLVLM:
     model: Any
 
 
+@dataclasses.dataclass(frozen=True)
+class HLVLMGeneration:
+    prediction: HLMemoryPrediction
+    raw_output: str
+
+
 class BaseHLVLMAdapter:
     def __init__(self, config: HLMemoryConfig):
         self.config = config
@@ -78,6 +84,16 @@ class BaseHLVLMAdapter:
         *,
         device: str | torch.device,
     ) -> HLMemoryPrediction:
+        return self.generate_prediction(loaded, sample, clips, device=device).prediction
+
+    def generate_prediction(
+        self,
+        loaded: LoadedHLVLM,
+        sample: ExportedHLMemorySample,
+        clips: LoadedVideoClips,
+        *,
+        device: str | torch.device,
+    ) -> HLVLMGeneration:
         inputs = self._encode_prompt_only(loaded.processor, sample, clips)
         input_ids = inputs["input_ids"].to(device)
         generation_inputs = {
@@ -93,7 +109,8 @@ class BaseHLVLMAdapter:
         generated_suffix = generated_ids[:, input_ids.shape[-1] :]
         tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         decoded = tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
-        return HLMemoryPrediction.from_json(decoded)
+        prediction = HLMemoryPrediction.from_json(decoded).with_recent_position_limit(clips.recent_valid_length)
+        return HLVLMGeneration(prediction=prediction, raw_output=decoded)
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
@@ -104,11 +121,21 @@ class BaseHLVLMAdapter:
             "The second clip is the recent observation window.\n"
             f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
             f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+            "In each clip, positions are ordered from oldest to newest.\n"
             "Update the long-term language memory and predict the current subtask.\n"
             "Return exactly one JSON object with keys "
             "`updated_language_memory`, `current_subtask`, `keyframe_candidate_positions`, `phase`, "
             "`target_query`, `goal_query`.\n"
+            "`updated_language_memory` must summarize observed task progress; do not just repeat the task instruction.\n"
+            "`current_subtask` must be a short executable robot subtask.\n"
+            "`target_query` and `goal_query` must be short grounding phrases or noun phrases, not questions.\n"
             "`keyframe_candidate_positions` must be 1-indexed positions inside the recent observation clip only.\n"
+            f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
+            f"Positions {clips.recent_valid_length + 1} to {self.config.recent_frames_length} are padding/fallback frames "
+            "and must never be returned.\n"
+            "If no valid recent frame is a useful keyframe candidate, return an empty list for "
+            "`keyframe_candidate_positions`.\n"
+            "Do not include markdown, explanation text, or extra keys outside the JSON object.\n"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
             f"Previous language memory: {previous_memory}\n"
         )
