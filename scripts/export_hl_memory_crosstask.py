@@ -12,7 +12,9 @@ from PIL import Image
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.crosstask import build_coverage_report
 from openpi.hl_memory.crosstask import build_subtask_annotations
+from openpi.hl_memory.crosstask import index_local_videos
 from openpi.hl_memory.crosstask import read_segments
 from openpi.hl_memory.crosstask import read_task_info
 from openpi.hl_memory.crosstask import read_video_records
@@ -84,42 +86,45 @@ def main(args: ExportCrossTaskArgs) -> None:
             records.append(record)
 
     records = [record for record in records if record.task_id in tasks]
-    video_index = _index_video_files(args.videos_root)
-    matched_records = []
-    missing_annotations = 0
-    missing_local_videos = 0
-    for record in records:
+    video_index = index_local_videos(args.videos_root)
+    coverage = build_coverage_report(
+        records,
+        tasks=tasks,
+        crosstask_release_dir=args.crosstask_release_dir,
+        annotations_dir=args.annotations_dir,
+        video_index=video_index,
+    )
+
+    for record in coverage.missing_annotation_records:
         segment_path = args.crosstask_release_dir / args.annotations_dir / f"{record.task_id}_{record.video_id}.csv"
-        if not segment_path.exists():
-            missing_annotations += 1
-            logging.warning(
-                "Skipping %s/%s because annotation file is missing: %s",
-                record.task_id,
-                record.video_id,
-                segment_path,
-            )
-            continue
-        if record.video_id not in video_index:
-            missing_local_videos += 1
-            logging.warning(
-                "Skipping %s/%s because no local video file matched stem `%s`.",
-                record.task_id,
-                record.video_id,
-                record.video_id,
-            )
-            continue
-        matched_records.append(record)
+        logging.warning(
+            "Skipping %s/%s because annotation file is missing: %s",
+            record.task_id,
+            record.video_id,
+            segment_path,
+        )
+    for record in coverage.missing_local_video_records:
+        logging.warning(
+            "Skipping %s/%s because no local video file matched stem `%s`.",
+            record.task_id,
+            record.video_id,
+            record.video_id,
+        )
+
+    matched_records = list(coverage.matched_records)
+    matched_before_limit = len(matched_records)
 
     if args.max_videos is not None:
         matched_records = matched_records[: args.max_videos]
 
     logging.info(
-        "CrossTask %s split: %d candidate records, %d matched local videos, %d missing annotations, %d missing local videos.",
+        "CrossTask %s split: %d candidate records, %d matched local videos before truncation, %d selected after max_videos, %d missing annotations, %d missing local videos.",
         args.split,
-        len(records),
+        coverage.total_records,
+        matched_before_limit,
         len(matched_records),
-        missing_annotations,
-        missing_local_videos,
+        coverage.missing_annotations,
+        coverage.missing_local_videos,
     )
 
     frame_cache: dict[tuple[str, int], str] = {}
@@ -241,19 +246,6 @@ def _export_episode(
     finally:
         video_reader.close()
     return samples
-
-
-def _index_video_files(videos_root: pathlib.Path) -> dict[str, pathlib.Path]:
-    index: dict[str, pathlib.Path] = {}
-    for path in videos_root.rglob("*"):
-        if not path.is_file():
-            continue
-        stem = path.stem
-        if stem not in index:
-            index[stem] = path
-    return index
-
-
 def _ensure_frame_saved(
     video_id: str,
     second_index: int,

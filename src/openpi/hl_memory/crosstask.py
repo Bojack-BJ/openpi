@@ -34,6 +34,26 @@ class CrossTaskSegment:
     end_sec: float
 
 
+@dataclasses.dataclass(frozen=True)
+class CrossTaskCoverageReport:
+    total_records: int
+    matched_records: tuple[CrossTaskVideoRecord, ...]
+    missing_annotation_records: tuple[CrossTaskVideoRecord, ...]
+    missing_local_video_records: tuple[CrossTaskVideoRecord, ...]
+
+    @property
+    def matched_count(self) -> int:
+        return len(self.matched_records)
+
+    @property
+    def missing_annotations(self) -> int:
+        return len(self.missing_annotation_records)
+
+    @property
+    def missing_local_videos(self) -> int:
+        return len(self.missing_local_video_records)
+
+
 def read_task_info(path: pathlib.Path | str) -> dict[str, CrossTaskTaskInfo]:
     path = pathlib.Path(path)
     tasks: dict[str, CrossTaskTaskInfo] = {}
@@ -143,3 +163,48 @@ def build_subtask_annotations(
 
     annotations.sort(key=lambda item: item.frame_index)
     return annotations
+
+
+def index_local_videos(videos_root: pathlib.Path | str) -> dict[str, pathlib.Path]:
+    root = pathlib.Path(videos_root)
+    index: dict[str, pathlib.Path] = {}
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        stem = path.stem
+        if stem not in index:
+            index[stem] = path
+    return index
+
+
+def build_coverage_report(
+    records: Iterable[CrossTaskVideoRecord],
+    *,
+    tasks: dict[str, CrossTaskTaskInfo],
+    crosstask_release_dir: pathlib.Path | str,
+    annotations_dir: str = "annotations",
+    video_index: dict[str, pathlib.Path],
+) -> CrossTaskCoverageReport:
+    release_dir = pathlib.Path(crosstask_release_dir)
+    filtered_records = [record for record in records if record.task_id in tasks]
+
+    matched: list[CrossTaskVideoRecord] = []
+    missing_annotations: list[CrossTaskVideoRecord] = []
+    missing_local_videos: list[CrossTaskVideoRecord] = []
+
+    for record in filtered_records:
+        segment_path = release_dir / annotations_dir / f"{record.task_id}_{record.video_id}.csv"
+        if not segment_path.exists():
+            missing_annotations.append(record)
+            continue
+        if record.video_id not in video_index:
+            missing_local_videos.append(record)
+            continue
+        matched.append(record)
+
+    return CrossTaskCoverageReport(
+        total_records=len(filtered_records),
+        matched_records=tuple(matched),
+        missing_annotation_records=tuple(missing_annotations),
+        missing_local_video_records=tuple(missing_local_videos),
+    )
