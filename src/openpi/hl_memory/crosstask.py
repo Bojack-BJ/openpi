@@ -93,6 +93,13 @@ def read_video_records(path: pathlib.Path | str) -> list[CrossTaskVideoRecord]:
     return records
 
 
+def write_video_records(path: pathlib.Path | str, records: Iterable[CrossTaskVideoRecord]) -> None:
+    path = pathlib.Path(path)
+    with path.open("w") as handle:
+        for record in records:
+            handle.write(f"{record.task_id},{record.video_id},{record.url}\n")
+
+
 def read_segments(path: pathlib.Path | str) -> list[CrossTaskSegment]:
     path = pathlib.Path(path)
     segments: list[CrossTaskSegment] = []

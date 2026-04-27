@@ -216,6 +216,64 @@ CrossTask 标注要点：
   - `keyframe candidate`
   - 模板化 `language memory`
 
+### CrossTask 覆盖率检查与本地重切分
+
+如果你本地只有一部分可用视频，先检查覆盖率：
+
+```bash
+python scripts/check_crosstask_video_coverage.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --split train
+```
+
+如果决定只在本地可用交集上做小规模实验，可以先重新切分：
+
+```bash
+python scripts/split_crosstask_matched_videos.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --output-dir "$DATA_ROOT/crosstask/matched_split" \
+  --val-ratio 0.2 \
+  --seed 0
+```
+
+它会生成：
+
+- `matched_split/train_records.csv`
+- `matched_split/val_records.csv`
+- `matched_split/split_summary.json`
+
+然后导出脚本直接读取这个自定义 split：
+
+```bash
+python scripts/export_hl_memory_crosstask.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --records-csv "$DATA_ROOT/crosstask/matched_split/train_records.csv" \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_train_local" \
+  --recent-frames-length 8 \
+  --frame-subsample 1 \
+  --memory-length 8 \
+  --merge-distance 1 \
+  --overwrite
+```
+
+验证集同理：
+
+```bash
+python scripts/export_hl_memory_crosstask.py \
+  --crosstask-release-dir "$DATA_ROOT/crosstask/crosstask_release" \
+  --videos-root "$DATA_ROOT/crosstask/missing_videos" \
+  --records-csv "$DATA_ROOT/crosstask/matched_split/val_records.csv" \
+  --output-dir "$DATA_ROOT/crosstask/hl_memory_val_local" \
+  --recent-frames-length 8 \
+  --frame-subsample 1 \
+  --memory-length 8 \
+  --merge-distance 1 \
+  --overwrite
+```
+
 ### 开发机下载与训练指令
 
 下面这组命令假设你的开发机已经有：

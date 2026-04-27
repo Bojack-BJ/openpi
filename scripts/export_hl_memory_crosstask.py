@@ -35,6 +35,7 @@ class ExportCrossTaskArgs:
     videos_root: pathlib.Path
     output_dir: pathlib.Path
     split: str = "train"
+    records_csv: pathlib.Path | None = None
     tasks_file: str = "tasks_primary.txt"
     train_videos_csv: str = "videos.csv"
     val_videos_csv: str = "videos_val.csv"
@@ -52,7 +53,7 @@ class ExportCrossTaskArgs:
 
 def main(args: ExportCrossTaskArgs) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if args.split not in {"train", "val", "all"}:
+    if args.records_csv is None and args.split not in {"train", "val", "all"}:
         raise ValueError("split must be one of: train, val, all")
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.overwrite:
         raise FileExistsError(f"{args.output_dir} already exists and is not empty. Use --overwrite to replace it.")
@@ -69,21 +70,26 @@ def main(args: ExportCrossTaskArgs) -> None:
     )
 
     tasks = read_task_info(args.crosstask_release_dir / args.tasks_file)
-    train_records = read_video_records(args.crosstask_release_dir / args.train_videos_csv)
-    val_records = read_video_records(args.crosstask_release_dir / args.val_videos_csv)
-    if args.split == "train":
-        records = train_records
-    elif args.split == "val":
-        records = val_records
+    if args.records_csv is not None:
+        records = read_video_records(args.records_csv)
+        split_label = f"custom:{args.records_csv.name}"
     else:
-        seen = set()
-        records = []
-        for record in [*train_records, *val_records]:
-            key = (record.task_id, record.video_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            records.append(record)
+        train_records = read_video_records(args.crosstask_release_dir / args.train_videos_csv)
+        val_records = read_video_records(args.crosstask_release_dir / args.val_videos_csv)
+        if args.split == "train":
+            records = train_records
+        elif args.split == "val":
+            records = val_records
+        else:
+            seen = set()
+            records = []
+            for record in [*train_records, *val_records]:
+                key = (record.task_id, record.video_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record)
+        split_label = args.split
 
     records = [record for record in records if record.task_id in tasks]
     video_index = index_local_videos(args.videos_root)
@@ -119,7 +125,7 @@ def main(args: ExportCrossTaskArgs) -> None:
 
     logging.info(
         "CrossTask %s split: %d candidate records, %d matched local videos before truncation, %d selected after max_videos, %d missing annotations, %d missing local videos.",
-        args.split,
+        split_label,
         coverage.total_records,
         matched_before_limit,
         len(matched_records),
@@ -160,7 +166,8 @@ def main(args: ExportCrossTaskArgs) -> None:
     metadata = {
         "schema_version": "hl_memory_v1_crosstask",
         "source": "crosstask",
-        "split": args.split,
+        "split": split_label,
+        "records_csv": None if args.records_csv is None else str(args.records_csv),
         "num_samples": len(samples),
         "num_videos": len({sample.episode_index for sample in samples}),
         "hl_memory_config": dataclasses.asdict(hl_config),
