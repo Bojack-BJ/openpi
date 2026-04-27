@@ -84,23 +84,50 @@ def main(args: ExportCrossTaskArgs) -> None:
             records.append(record)
 
     records = [record for record in records if record.task_id in tasks]
-    if args.max_videos is not None:
-        records = records[: args.max_videos]
-
     video_index = _index_video_files(args.videos_root)
+    matched_records = []
+    missing_annotations = 0
+    missing_local_videos = 0
+    for record in records:
+        segment_path = args.crosstask_release_dir / args.annotations_dir / f"{record.task_id}_{record.video_id}.csv"
+        if not segment_path.exists():
+            missing_annotations += 1
+            logging.warning(
+                "Skipping %s/%s because annotation file is missing: %s",
+                record.task_id,
+                record.video_id,
+                segment_path,
+            )
+            continue
+        if record.video_id not in video_index:
+            missing_local_videos += 1
+            logging.warning(
+                "Skipping %s/%s because no local video file matched stem `%s`.",
+                record.task_id,
+                record.video_id,
+                record.video_id,
+            )
+            continue
+        matched_records.append(record)
+
+    if args.max_videos is not None:
+        matched_records = matched_records[: args.max_videos]
+
+    logging.info(
+        "CrossTask %s split: %d candidate records, %d matched local videos, %d missing annotations, %d missing local videos.",
+        args.split,
+        len(records),
+        len(matched_records),
+        missing_annotations,
+        missing_local_videos,
+    )
+
     frame_cache: dict[tuple[str, int], str] = {}
     samples: list[ExportedHLMemorySample] = []
 
-    for episode_index, record in enumerate(records):
+    for episode_index, record in enumerate(matched_records):
         segment_path = args.crosstask_release_dir / args.annotations_dir / f"{record.task_id}_{record.video_id}.csv"
-        if not segment_path.exists():
-            logging.warning("Skipping %s/%s because annotation file is missing: %s", record.task_id, record.video_id, segment_path)
-            continue
-        video_path = video_index.get(record.video_id)
-        if video_path is None:
-            logging.warning("Skipping %s/%s because no local video file matched stem `%s`.", record.task_id, record.video_id, record.video_id)
-            continue
-
+        video_path = video_index[record.video_id]
         segments = read_segments(segment_path)
         annotations = build_subtask_annotations(
             episode_index=episode_index,
