@@ -10,9 +10,16 @@ import pathlib
 from PIL import Image
 
 from openpi.hl_memory.config import HLMemoryConfig
-from openpi.hl_memory.frame_composer import compose_context_panel
 from openpi.hl_memory.labels import SubtaskAnnotation
 from openpi.hl_memory.schema import HLMemoryPrediction
+
+
+@dataclasses.dataclass(frozen=True)
+class LoadedVideoClips:
+    memory_frames: tuple[Image.Image, ...]
+    recent_frames: tuple[Image.Image, ...]
+    memory_valid_length: int
+    recent_valid_length: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -28,10 +35,13 @@ class ExportedHLMemorySample:
     phase: str
     target_query: str
     goal_query: str
-    keyframe_positions: tuple[int, ...]
+    keyframe_candidate_positions: tuple[int, ...]
     memory_frame_paths: tuple[str, ...]
+    memory_frame_indices: tuple[int, ...]
+    memory_valid_length: int
     recent_frame_paths: tuple[str, ...]
     recent_frame_indices: tuple[int, ...]
+    recent_valid_length: int
     event_type: str = "none"
     event_text: str = ""
 
@@ -49,10 +59,15 @@ class ExportedHLMemorySample:
             phase=str(data["phase"]),
             target_query=str(data["target_query"]),
             goal_query=str(data["goal_query"]),
-            keyframe_positions=tuple(int(value) for value in data["keyframe_positions"]),
+            keyframe_candidate_positions=tuple(
+                int(value) for value in data.get("keyframe_candidate_positions", data.get("keyframe_positions", []))
+            ),
             memory_frame_paths=tuple(str(value) for value in data["memory_frame_paths"]),
+            memory_frame_indices=tuple(int(value) for value in data.get("memory_frame_indices", [])),
+            memory_valid_length=int(data.get("memory_valid_length", len(data["memory_frame_paths"]))),
             recent_frame_paths=tuple(str(value) for value in data["recent_frame_paths"]),
             recent_frame_indices=tuple(int(value) for value in data["recent_frame_indices"]),
+            recent_valid_length=int(data.get("recent_valid_length", len(data["recent_frame_paths"]))),
             event_type=str(data.get("event_type", "none")),
             event_text=str(data.get("event_text", "")),
         )
@@ -70,10 +85,13 @@ class ExportedHLMemorySample:
             "phase": self.phase,
             "target_query": self.target_query,
             "goal_query": self.goal_query,
-            "keyframe_positions": list(self.keyframe_positions),
+            "keyframe_candidate_positions": list(self.keyframe_candidate_positions),
             "memory_frame_paths": list(self.memory_frame_paths),
+            "memory_frame_indices": list(self.memory_frame_indices),
+            "memory_valid_length": self.memory_valid_length,
             "recent_frame_paths": list(self.recent_frame_paths),
             "recent_frame_indices": list(self.recent_frame_indices),
+            "recent_valid_length": self.recent_valid_length,
             "event_type": self.event_type,
             "event_text": self.event_text,
         }
@@ -82,7 +100,7 @@ class ExportedHLMemorySample:
         return HLMemoryPrediction(
             updated_language_memory=self.updated_language_memory,
             current_subtask=self.current_subtask,
-            keyframe_positions=self.keyframe_positions,
+            keyframe_candidate_positions=self.keyframe_candidate_positions,
             phase=self.phase,
             target_query=self.target_query,
             goal_query=self.goal_query,
@@ -93,11 +111,20 @@ class ExportedHLMemorySample:
         *,
         language_memory: str,
         memory_frame_paths: Iterable[str],
+        memory_frame_indices: Iterable[int] | None = None,
     ) -> "ExportedHLMemorySample":
+        resolved_memory_paths = tuple(memory_frame_paths)
+        resolved_memory_indices = (
+            tuple(memory_frame_indices)
+            if memory_frame_indices is not None
+            else self.memory_frame_indices[: len(resolved_memory_paths)]
+        )
         return dataclasses.replace(
             self,
             language_memory=language_memory,
-            memory_frame_paths=tuple(memory_frame_paths),
+            memory_frame_paths=resolved_memory_paths,
+            memory_frame_indices=resolved_memory_indices,
+            memory_valid_length=len(resolved_memory_paths),
         )
 
     def resolve_memory_frame_paths(self, dataset_dir: pathlib.Path) -> list[pathlib.Path]:
@@ -174,24 +201,69 @@ class ExportedHLMemoryDataset:
         return iter(self._samples)
 
 
-def build_context_panel_for_sample(
+def load_video_clips_for_sample(
     sample: ExportedHLMemorySample,
     dataset_dir: pathlib.Path | str,
     config: HLMemoryConfig,
-) -> Image.Image:
+) -> LoadedVideoClips:
     dataset_dir = pathlib.Path(dataset_dir)
     memory_frames = [_load_rgb_image(path) for path in sample.resolve_memory_frame_paths(dataset_dir)]
     recent_frames = [_load_rgb_image(path) for path in sample.resolve_recent_frame_paths(dataset_dir)]
-    return compose_context_panel(
-        memory_frames,
-        recent_frames,
-        frame_height=config.frame_height,
+    memory_valid_length = min(sample.memory_valid_length, len(memory_frames), config.memory_length)
+    recent_valid_length = min(sample.recent_valid_length, len(recent_frames), config.recent_frames_length)
+
+    padded_memory_frames = _pad_clip_frames(
+        memory_frames[:memory_valid_length],
+        target_length=config.memory_length,
         frame_width=config.frame_width,
-        columns=config.panel_columns,
-        gap=config.panel_gap,
+        frame_height=config.frame_height,
+        allow_single_frame_fallback=config.allow_single_frame_fallback,
+    )
+    padded_recent_frames = _pad_clip_frames(
+        recent_frames[:recent_valid_length],
+        target_length=config.recent_frames_length,
+        frame_width=config.frame_width,
+        frame_height=config.frame_height,
+        allow_single_frame_fallback=config.allow_single_frame_fallback,
+    )
+    return LoadedVideoClips(
+        memory_frames=tuple(padded_memory_frames),
+        recent_frames=tuple(padded_recent_frames),
+        memory_valid_length=memory_valid_length,
+        recent_valid_length=recent_valid_length,
     )
 
 
 def _load_rgb_image(path: pathlib.Path) -> Image.Image:
     with Image.open(path) as image:
         return image.convert("RGB").copy()
+
+
+def _pad_clip_frames(
+    frames: list[Image.Image],
+    *,
+    target_length: int,
+    frame_width: int,
+    frame_height: int,
+    allow_single_frame_fallback: bool,
+) -> list[Image.Image]:
+    if target_length <= 0:
+        raise ValueError("target_length must be positive.")
+    normalized_frames = [
+        frame.resize((frame_width, frame_height), Image.Resampling.BILINEAR)
+        for frame in frames[-target_length:]
+    ]
+    if not allow_single_frame_fallback and len(normalized_frames) < target_length:
+        raise ValueError(
+            f"Expected at least {target_length} frames, but received {len(normalized_frames)} and "
+            "`allow_single_frame_fallback=False`."
+        )
+    if not normalized_frames:
+        normalized_frames = [_blank_frame(frame_width=frame_width, frame_height=frame_height)]
+    while len(normalized_frames) < target_length:
+        normalized_frames.append(normalized_frames[-1].copy())
+    return normalized_frames
+
+
+def _blank_frame(*, frame_width: int, frame_height: int) -> Image.Image:
+    return Image.new("RGB", (frame_width, frame_height), color=(0, 0, 0))

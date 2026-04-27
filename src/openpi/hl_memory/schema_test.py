@@ -5,7 +5,7 @@ def test_prediction_round_trip():
     prediction = HLMemoryPrediction(
         updated_language_memory="Completed subtasks: pick apple.",
         current_subtask="place apple",
-        keyframe_positions=(1, 3),
+        keyframe_candidate_positions=(1, 3),
         phase="place",
         target_query="apple",
         goal_query="basket",
@@ -18,9 +18,9 @@ def test_prediction_round_trip():
 
 def test_prediction_parses_fenced_json():
     text = """```json
-{"updated_language_memory":"m","current_subtask":"s","keyframe_positions":[2],"phase":"p","target_query":"t","goal_query":"g"}
+{"updated_language_memory":"m","current_subtask":"s","keyframe_candidate_positions":[2],"phase":"p","target_query":"t","goal_query":"g"}
 ```"""
 
     parsed = HLMemoryPrediction.from_json(text)
 
-    assert parsed.keyframe_positions == (2,)
+    assert parsed.keyframe_candidate_positions == (2,)

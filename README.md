@@ -57,6 +57,13 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 This repo also contains a standalone high-level memory / subtask pipeline under [`src/openpi/hl_memory`](src/openpi/hl_memory), separate from the existing LL action models.
 
+- The current V1 runtime path is Qwen-based and consumes two ordered visual clips:
+  - historical memory keyframes
+  - recent observation window
+- It predicts:
+  - updated language memory
+  - current subtask
+  - recent-window keyframe candidate positions
 - Overview and dataset/export/train/eval instructions: [docs/hl_memory_v1.md](docs/hl_memory_v1.md)
 - CrossTask smoke workflow: [`scripts/hl_memory_crosstask_smoke.sh`](scripts/hl_memory_crosstask_smoke.sh)
 

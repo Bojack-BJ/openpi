@@ -4,23 +4,25 @@ import dataclasses
 from collections.abc import Mapping
 from typing import Any
 
-from PIL import Image
 import torch
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
+from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.schema import HLMemoryPrediction
 
 
 def create_hf_adapter(config: HLMemoryConfig) -> "BaseHLVLMAdapter":
     if config.vlm_backend == "paligemma":
-        return PaliGemmaHLAdapter(config)
+        raise NotImplementedError(
+            "HL memory V1 now expects ordered video-style clips and no longer supports `paligemma`. "
+            "Use `qwen2_5_vl`."
+        )
     if config.vlm_backend == "qwen2_5_vl":
         return Qwen25HLAdapter(config)
     if config.vlm_backend == "qwen3_5_vl":
         raise NotImplementedError(
-            "V1 HL memory runtime does not yet implement `qwen3_5_vl`. "
-            "Use `paligemma` or `qwen2_5_vl` for now."
+            "HL memory V1 does not yet implement `qwen3_5_vl`. Use `qwen2_5_vl` for now."
         )
     raise ValueError(f"Unsupported HL VLM backend: {config.vlm_backend}")
 
@@ -51,12 +53,12 @@ class BaseHLVLMAdapter:
         self,
         loaded: LoadedHLVLM,
         sample: ExportedHLMemorySample,
-        panel_image: Image.Image,
+        clips: LoadedVideoClips,
         *,
         device: str | torch.device,
     ) -> Mapping[str, torch.Tensor]:
-        prompt_inputs = self._encode_prompt_only(loaded.processor, sample, panel_image)
-        full_inputs = self._encode_prompt_and_target(loaded.processor, sample, panel_image)
+        prompt_inputs = self._encode_prompt_only(loaded.processor, sample, clips)
+        full_inputs = self._encode_prompt_and_target(loaded.processor, sample, clips)
         labels = full_inputs["input_ids"].clone()
         prompt_length = min(int(prompt_inputs["input_ids"].shape[-1]), int(labels.shape[-1]))
         labels[..., :prompt_length] = -100
@@ -72,11 +74,11 @@ class BaseHLVLMAdapter:
         self,
         loaded: LoadedHLVLM,
         sample: ExportedHLMemorySample,
-        panel_image: Image.Image,
+        clips: LoadedVideoClips,
         *,
         device: str | torch.device,
     ) -> HLMemoryPrediction:
-        inputs = self._encode_prompt_only(loaded.processor, sample, panel_image)
+        inputs = self._encode_prompt_only(loaded.processor, sample, clips)
         input_ids = inputs["input_ids"].to(device)
         generation_inputs = {
             key: value.to(device)
@@ -93,23 +95,22 @@ class BaseHLVLMAdapter:
         decoded = tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
         return HLMemoryPrediction.from_json(decoded)
 
-    def build_prompt(self, sample: ExportedHLMemorySample) -> str:
-        memory_count = len(sample.memory_frame_paths)
-        recent_count = len(sample.recent_frame_paths)
+    def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
         return (
             "You are the high-level planning policy for a robot.\n"
-            "The input image is a context panel: historical memory frames are shown first, "
-            "and recent observation frames are shown last.\n"
-            "Update the language memory and predict the current subtask.\n"
+            "You receive two ordered video clips.\n"
+            "The first clip is historical memory keyframes.\n"
+            "The second clip is the recent observation window.\n"
+            f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
+            f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+            "Update the long-term language memory and predict the current subtask.\n"
             "Return exactly one JSON object with keys "
-            "`updated_language_memory`, `current_subtask`, `keyframe_positions`, `phase`, "
+            "`updated_language_memory`, `current_subtask`, `keyframe_candidate_positions`, `phase`, "
             "`target_query`, `goal_query`.\n"
-            "`keyframe_positions` must be 1-indexed positions over the recent frames only.\n"
+            "`keyframe_candidate_positions` must be 1-indexed positions inside the recent observation clip only.\n"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
             f"Previous language memory: {previous_memory}\n"
-            f"Historical keyframe count: {memory_count}\n"
-            f"Recent frame count: {recent_count}\n"
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
@@ -121,38 +122,21 @@ class BaseHLVLMAdapter:
     def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
         raise NotImplementedError
 
-    def _encode_prompt_only(self, processor: Any, sample: ExportedHLMemorySample, panel_image: Image.Image) -> Mapping[str, Any]:
+    def _encode_prompt_only(
+        self,
+        processor: Any,
+        sample: ExportedHLMemorySample,
+        clips: LoadedVideoClips,
+    ) -> Mapping[str, Any]:
         raise NotImplementedError
 
     def _encode_prompt_and_target(
         self,
         processor: Any,
         sample: ExportedHLMemorySample,
-        panel_image: Image.Image,
+        clips: LoadedVideoClips,
     ) -> Mapping[str, Any]:
         raise NotImplementedError
-
-
-class PaliGemmaHLAdapter(BaseHLVLMAdapter):
-    def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
-        return transformers.PaliGemmaForConditionalGeneration.from_pretrained(
-            pretrained_path,
-            torch_dtype=torch_dtype,
-        )
-
-    def _encode_prompt_only(self, processor: Any, sample: ExportedHLMemorySample, panel_image: Image.Image) -> Mapping[str, Any]:
-        prompt = self.build_prompt(sample)
-        return processor(images=panel_image, text=prompt, return_tensors="pt")
-
-    def _encode_prompt_and_target(
-        self,
-        processor: Any,
-        sample: ExportedHLMemorySample,
-        panel_image: Image.Image,
-    ) -> Mapping[str, Any]:
-        prompt = self.build_prompt(sample)
-        target_text = self.build_target_text(sample)
-        return processor(images=panel_image, text=f"{prompt}{target_text}", return_tensors="pt")
 
 
 class Qwen25HLAdapter(BaseHLVLMAdapter):
@@ -163,23 +147,48 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
             trust_remote_code=True,
         )
 
-    def _encode_prompt_only(self, processor: Any, sample: ExportedHLMemorySample, panel_image: Image.Image) -> Mapping[str, Any]:
-        rendered = self._render_messages(processor, sample, include_target=False)
-        return processor(text=[rendered], images=[panel_image], padding=True, return_tensors="pt")
+    def _encode_prompt_only(
+        self,
+        processor: Any,
+        sample: ExportedHLMemorySample,
+        clips: LoadedVideoClips,
+    ) -> Mapping[str, Any]:
+        rendered = self._render_messages(processor, sample, clips, include_target=False)
+        return processor(
+            text=[rendered],
+            videos=self._prepare_videos(clips),
+            padding=True,
+            return_tensors="pt",
+        )
 
     def _encode_prompt_and_target(
         self,
         processor: Any,
         sample: ExportedHLMemorySample,
-        panel_image: Image.Image,
+        clips: LoadedVideoClips,
     ) -> Mapping[str, Any]:
-        rendered = self._render_messages(processor, sample, include_target=True)
-        return processor(text=[rendered], images=[panel_image], padding=True, return_tensors="pt")
+        rendered = self._render_messages(processor, sample, clips, include_target=True)
+        return processor(
+            text=[rendered],
+            videos=self._prepare_videos(clips),
+            padding=True,
+            return_tensors="pt",
+        )
 
-    def _render_messages(self, processor: Any, sample: ExportedHLMemorySample, *, include_target: bool) -> str:
+    def _render_messages(
+        self,
+        processor: Any,
+        sample: ExportedHLMemorySample,
+        clips: LoadedVideoClips,
+        *,
+        include_target: bool,
+    ) -> str:
         user_content = [
-            {"type": "image"},
-            {"type": "text", "text": self.build_prompt(sample)},
+            {"type": "text", "text": "Historical memory clip."},
+            {"type": "video"},
+            {"type": "text", "text": "Recent observation clip."},
+            {"type": "video"},
+            {"type": "text", "text": self.build_prompt(sample, clips)},
         ]
         messages: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
         if include_target:
@@ -190,8 +199,21 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                 }
             )
         tokenizer = getattr(processor, "tokenizer", processor)
-        apply_chat_template = getattr(processor, "apply_chat_template", None) or getattr(tokenizer, "apply_chat_template")
-        return apply_chat_template(messages, tokenize=False, add_generation_prompt=not include_target)
+        apply_chat_template = getattr(processor, "apply_chat_template", None) or getattr(
+            tokenizer, "apply_chat_template"
+        )
+        return apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=not include_target,
+            video_fps=1,
+        )
+
+    def _prepare_videos(self, clips: LoadedVideoClips) -> list[list[Any]]:
+        return [
+            list(clips.memory_frames),
+            list(clips.recent_frames),
+        ]
 
 
 def _import_transformers() -> Any:

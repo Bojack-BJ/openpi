@@ -8,7 +8,7 @@ import json
 class HLMemoryPrediction:
     updated_language_memory: str
     current_subtask: str
-    keyframe_positions: tuple[int, ...]
+    keyframe_candidate_positions: tuple[int, ...]
     phase: str
     target_query: str
     goal_query: str
@@ -20,15 +20,15 @@ class HLMemoryPrediction:
             raise ValueError("current_subtask must be non-empty.")
         if not self.phase.strip():
             raise ValueError("phase must be non-empty.")
-        for position in self.keyframe_positions:
+        for position in self.keyframe_candidate_positions:
             if position <= 0:
-                raise ValueError("keyframe_positions must be positive and 1-indexed.")
+                raise ValueError("keyframe_candidate_positions must be positive and 1-indexed.")
 
     def to_dict(self) -> dict[str, object]:
         return {
             "updated_language_memory": self.updated_language_memory,
             "current_subtask": self.current_subtask,
-            "keyframe_positions": list(self.keyframe_positions),
+            "keyframe_candidate_positions": list(self.keyframe_candidate_positions),
             "phase": self.phase,
             "target_query": self.target_query,
             "goal_query": self.goal_query,
@@ -42,7 +42,6 @@ class HLMemoryPrediction:
         required_keys = {
             "updated_language_memory",
             "current_subtask",
-            "keyframe_positions",
             "phase",
             "target_query",
             "goal_query",
@@ -50,18 +49,18 @@ class HLMemoryPrediction:
         missing = required_keys - set(data)
         if missing:
             raise ValueError(f"Missing prediction keys: {sorted(missing)}")
-        raw_positions = data["keyframe_positions"]
+        raw_positions = data.get("keyframe_candidate_positions", data.get("keyframe_positions"))
         if not isinstance(raw_positions, list):
-            raise ValueError("keyframe_positions must be a list.")
-        keyframe_positions: list[int] = []
+            raise ValueError("keyframe_candidate_positions must be a list.")
+        keyframe_candidate_positions: list[int] = []
         for raw_position in raw_positions:
             position = int(raw_position)
-            if position not in keyframe_positions:
-                keyframe_positions.append(position)
+            if position not in keyframe_candidate_positions:
+                keyframe_candidate_positions.append(position)
         return cls(
             updated_language_memory=str(data["updated_language_memory"]).strip(),
             current_subtask=str(data["current_subtask"]).strip(),
-            keyframe_positions=tuple(keyframe_positions),
+            keyframe_candidate_positions=tuple(keyframe_candidate_positions),
             phase=str(data["phase"]).strip(),
             target_query=str(data["target_query"]).strip(),
             goal_query=str(data["goal_query"]).strip(),

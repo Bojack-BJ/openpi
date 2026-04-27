@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import pathlib
@@ -8,7 +9,7 @@ import torch
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
-from openpi.hl_memory.data import build_context_panel_for_sample
+from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.eval import evaluate_ablation_modes
 from openpi.hl_memory.hf_adapter import create_hf_adapter
@@ -37,8 +38,8 @@ def main(args: EvalArgs) -> None:
     loaded = adapter.load(model_path=str(args.model_path), device=args.device)
 
     def predict(sample):
-        panel = build_context_panel_for_sample(sample, args.dataset_dir, hl_config)
-        return adapter.predict(loaded, sample, panel, device=args.device)
+        clips = load_video_clips_for_sample(sample, args.dataset_dir, hl_config)
+        return adapter.predict(loaded, sample, clips, device=args.device)
 
     metrics = evaluate_ablation_modes(samples, hl_config, predict)
     rendered = json.dumps(metrics, indent=2, ensure_ascii=True)

@@ -174,16 +174,15 @@ def _export_episode(
                 )
                 for second_index in recent_indices
             )
-            memory_frame_paths = tuple(
-                frame_cache[(video_id, second_index)]
-                for second_index in keyframe_memory.visible_indices(recent_indices)
-                if (video_id, second_index) in frame_cache
+            memory_frame_indices = tuple(
+                second_index for second_index in keyframe_memory.visible_indices(recent_indices) if (video_id, second_index) in frame_cache
             )
+            memory_frame_paths = tuple(frame_cache[(video_id, second_index)] for second_index in memory_frame_indices)
 
             current_language_memory = render_language_memory(progress_state)
             next_progress_state = update_progress_state(progress_state, annotation)
             updated_language_memory = render_language_memory(next_progress_state)
-            keyframe_positions = derive_keyframe_positions(annotations, step_index, recent_indices)
+            keyframe_candidate_positions = derive_keyframe_positions(annotations, step_index, recent_indices)
 
             sample = ExportedHLMemorySample(
                 sample_id=f"crosstask_{video_id}_step_{step_index:06d}",
@@ -197,16 +196,19 @@ def _export_episode(
                 phase=annotation.phase or annotation.current_subtask,
                 target_query=annotation.target_query,
                 goal_query=annotation.goal_query,
-                keyframe_positions=keyframe_positions,
+                keyframe_candidate_positions=keyframe_candidate_positions,
                 memory_frame_paths=memory_frame_paths,
+                memory_frame_indices=memory_frame_indices,
+                memory_valid_length=len(memory_frame_paths),
                 recent_frame_paths=recent_frame_paths,
                 recent_frame_indices=tuple(recent_indices),
+                recent_valid_length=len(recent_frame_paths),
                 event_type=annotation.event_type,
                 event_text=annotation.event_text,
             )
             samples.append(sample)
 
-            absolute_keyframes, _ = map_relative_positions_to_absolute(keyframe_positions, recent_indices)
+            absolute_keyframes, _ = map_relative_positions_to_absolute(keyframe_candidate_positions, recent_indices)
             keyframe_memory.add_candidates(absolute_keyframes)
             progress_state = next_progress_state
     finally:

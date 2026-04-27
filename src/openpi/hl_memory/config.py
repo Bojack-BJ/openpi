@@ -13,7 +13,7 @@ _DEFAULT_MODEL_IDS: dict[HLVLMBackend, str | None] = {
     "qwen3_5_vl": None,
 }
 
-_SUPPORTED_RUNTIME_BACKENDS = {"paligemma", "qwen2_5_vl"}
+_SUPPORTED_RUNTIME_BACKENDS = {"qwen2_5_vl"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -27,8 +27,7 @@ class HLMemoryConfig:
     merge_distance: int = 5
     frame_height: int = 224
     frame_width: int = 224
-    panel_columns: int = 4
-    panel_gap: int = 8
+    allow_single_frame_fallback: bool = True
     max_new_tokens: int = 256
 
     def __post_init__(self) -> None:
@@ -45,10 +44,6 @@ class HLMemoryConfig:
             raise ValueError("merge_distance must be non-negative.")
         if self.frame_height <= 0 or self.frame_width <= 0:
             raise ValueError("frame_height and frame_width must be positive.")
-        if self.panel_columns <= 0:
-            raise ValueError("panel_columns must be positive.")
-        if self.panel_gap < 0:
-            raise ValueError("panel_gap must be non-negative.")
         if self.max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive.")
 
@@ -64,4 +59,3 @@ class HLMemoryConfig:
     @property
     def supports_runtime_backend(self) -> bool:
         return self.vlm_backend in _SUPPORTED_RUNTIME_BACKENDS
-

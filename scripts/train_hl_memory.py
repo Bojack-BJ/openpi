@@ -10,7 +10,7 @@ import torch
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
-from openpi.hl_memory.data import build_context_panel_for_sample
+from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.hf_adapter import create_hf_adapter
 
@@ -64,8 +64,8 @@ def main(args: TrainArgs) -> None:
             batch = _sample_batch(samples, args.batch_size, rng)
             micro_loss = 0.0
             for sample in batch:
-                panel = build_context_panel_for_sample(sample, args.dataset_dir, hl_config)
-                inputs = adapter.prepare_training_inputs(loaded, sample, panel, device=args.device)
+                clips = load_video_clips_for_sample(sample, args.dataset_dir, hl_config)
+                inputs = adapter.prepare_training_inputs(loaded, sample, clips, device=args.device)
                 outputs = loaded.model(**inputs)
                 loss = outputs.loss / max(len(batch), 1)
                 micro_loss += float(loss.detach().cpu())

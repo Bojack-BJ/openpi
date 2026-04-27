@@ -32,8 +32,8 @@ def compute_prediction_metrics(
     sample: ExportedHLMemorySample,
 ) -> dict[str, float]:
     expected = sample.target_prediction()
-    expected_positions = set(expected.keyframe_positions)
-    predicted_positions = set(prediction.keyframe_positions)
+    expected_positions = set(expected.keyframe_candidate_positions)
+    predicted_positions = set(prediction.keyframe_candidate_positions)
     overlap = expected_positions & predicted_positions
 
     precision = len(overlap) / len(predicted_positions) if predicted_positions else float(not expected_positions)
@@ -114,7 +114,7 @@ def run_offline_rollout(
                 language_memory = prediction.updated_language_memory
             if mode in ("keyframe_memory_only", "full"):
                 absolute_positions, _ = map_relative_positions_to_absolute(
-                    prediction.keyframe_positions,
+                    prediction.keyframe_candidate_positions,
                     sample.recent_frame_indices,
                 )
                 memory.add_candidates(absolute_positions)
@@ -141,12 +141,15 @@ def _with_ablation_context(
 ) -> ExportedHLMemorySample:
     runtime_language_memory = language_memory if mode in ("language_memory_only", "full") else DEFAULT_LANGUAGE_MEMORY
     if mode in ("keyframe_memory_only", "full"):
-        memory_paths = tuple(frame_lookup[index] for index in memory.visible_indices(sample.recent_frame_indices) if index in frame_lookup)
+        memory_indices = tuple(index for index in memory.visible_indices(sample.recent_frame_indices) if index in frame_lookup)
+        memory_paths = tuple(frame_lookup[index] for index in memory_indices)
     else:
+        memory_indices = ()
         memory_paths = ()
     return sample.with_runtime_context(
         language_memory=runtime_language_memory,
         memory_frame_paths=memory_paths,
+        memory_frame_indices=memory_indices,
     )
 
 
