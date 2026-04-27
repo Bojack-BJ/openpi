@@ -36,5 +36,7 @@ dist/
 /assets/
 /checkpoints/
 /wandb/
+cross_task_datasets/
+dataprocess_new/test/
 
 /exp_intermediate
