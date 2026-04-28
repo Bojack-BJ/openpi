@@ -319,9 +319,9 @@ rollout 模式会：
 - 每隔 `--rollout-interval-sec` 秒跑一次 HL 推理。
 - 用上一轮的 `prediction.updated_language_memory` 作为下一轮的 language memory。
 - 如果模型把 memory 原样复制为 `Task started.` 或和上一轮完全相同，脚本会启用确定性 memory update rule：
-  - 用当前 `current_subtask / phase / target_query / goal_query` 生成一条进度摘要。
-  - 对连续重复或高度相似 subtask 做合并，不无限 append。
-  - memory 太长时压缩旧的重复性 context，只保留最近关键进度。
+  - 把 memory 改写成给下游 LL VLM 使用的四行上下文，而不是 debug log。
+  - 不记录时间戳、frame id、每秒事件或 `target=...; goal=...` 这种工程字段。
+  - 重复 subtask 不追加新行，只稳定更新当前 objective 和关键对象。
 - `model_prediction` 保留模型原始 JSON 解析结果，`prediction` 是应用 memory rule 后用于下一轮 rollout 的结果。
 - 把预测出的 recent keyframe candidates 映射成视频秒数，作为下一轮 memory clip 的候选 keyframes。
 - keyframe memory 会过滤仍在 recent window 里可见的候选帧，只把已经退出 recent context 的帧作为 historical memory 输入。
@@ -332,6 +332,18 @@ rollout 模式会：
 - 在 `debug_dir/rollout_pretty.json` 额外保存易读版逐步记录。
 - 也可以显式传 `--rollout-jsonl /path/to/rollout.jsonl` 和
   `--rollout-pretty-json /path/to/rollout_pretty.json`。
+
+当前 `updated_language_memory` 约定固定为四行：
+
+```text
+Task progress: <one short sentence about completed/observed progress>
+Current objective: <one short executable objective for the low-level policy>
+Relevant objects: <comma-separated object/location phrases, or none>
+Notes: <one short caution, spatial fact, or none>
+```
+
+这个字段是给 LL VLM/action policy 读的，不是给人调试的日志。调试细节应该看
+`raw_model_output`、`model_prediction` 和 `rollout_pretty.json`。
 
 ## CrossTask 快速起步
 

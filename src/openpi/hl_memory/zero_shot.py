@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import dataclasses
-import difflib
 import pathlib
 import re
 
@@ -224,15 +223,13 @@ def apply_rollout_language_memory_rule(
     *,
     previous_memory: str,
     recent_end_sec: float,
-    max_entries: int = 6,
-    max_chars: int = 700,
+    max_chars: int = 420,
 ) -> tuple[HLMemoryPrediction, bool]:
-    """Ensures rollout memory advances and stays compact.
+    """Ensures rollout memory stays useful for the downstream LL VLM.
 
-    Zero-shot VLMs often repeat the previous memory verbatim. For rollout, that
-    makes the next step blind to the predicted subtask progression. This rule
-    keeps the model-proposed memory when it is informative, and otherwise
-    synthesizes a concise progress memory from the current prediction.
+    The memory is not a debug trace. It is a compact context string consumed by
+    a low-level VLM policy, so the fallback rewrites generic or log-like memory
+    into stable action-useful fields.
     """
     model_memory = prediction.updated_language_memory.strip()
     previous_memory = previous_memory.strip()
@@ -240,17 +237,16 @@ def apply_rollout_language_memory_rule(
         _is_generic_memory(model_memory)
         or _normalize_text(model_memory) == _normalize_text(previous_memory)
         or _looks_like_instruction_echo(model_memory, prediction.current_subtask)
+        or _looks_like_debug_log_memory(model_memory)
+        or not _has_ll_memory_fields(model_memory)
     )
     if not should_replace:
-        compacted = _compact_language_memory(model_memory, max_chars=max_chars)
+        compacted = _compact_ll_memory(model_memory, max_chars=max_chars)
         return dataclasses.replace(prediction, updated_language_memory=compacted), compacted != model_memory
 
-    entries = _extract_progress_entries(previous_memory)
-    new_entry = _format_progress_entry(prediction, recent_end_sec=recent_end_sec)
-    entries = _append_or_merge_progress_entry(entries, new_entry)
-    entries = entries[-max_entries:]
-    updated_memory = _render_progress_memory(entries, prediction)
-    updated_memory = _compact_language_memory(updated_memory, max_chars=max_chars)
+    state = _parse_ll_memory(previous_memory)
+    updated_memory = _render_ll_memory(state, prediction)
+    updated_memory = _compact_ll_memory(updated_memory, max_chars=max_chars)
     return dataclasses.replace(prediction, updated_language_memory=updated_memory), True
 
 
@@ -413,77 +409,107 @@ def _looks_like_instruction_echo(memory: str, current_subtask: str) -> bool:
     return normalized_memory == normalized_subtask
 
 
+def _looks_like_debug_log_memory(memory: str) -> bool:
+    normalized = _normalize_text(memory)
+    return (
+        normalized.startswith("progress memory:")
+        or "t=" in normalized
+        or "target=" in normalized
+        or "goal=" in normalized
+    )
+
+
+def _has_ll_memory_fields(memory: str) -> bool:
+    keys = {line.split(":", 1)[0].strip().lower() for line in memory.splitlines() if ":" in line}
+    return {"task progress", "current objective", "relevant objects", "notes"}.issubset(keys)
+
+
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def _extract_progress_entries(memory: str) -> list[str]:
-    entries: list[str] = []
+def _parse_ll_memory(memory: str) -> dict[str, str]:
+    fields = {
+        "task progress": "",
+        "current objective": "",
+        "relevant objects": "",
+        "notes": "",
+    }
     for line in memory.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- "):
-            entries.append(stripped[2:].strip())
-    if entries:
-        return entries
-    if memory.strip() and not _is_generic_memory(memory):
-        return [memory.strip()]
-    return []
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = key.strip().lower()
+        if normalized_key in fields:
+            fields[normalized_key] = value.strip()
+    return fields
 
 
-def _format_progress_entry(prediction: HLMemoryPrediction, *, recent_end_sec: float) -> str:
-    phase = prediction.phase.strip() or "unknown"
-    subtask = prediction.current_subtask.strip()
-    target = prediction.target_query.strip()
-    goal = prediction.goal_query.strip()
-    details = [f"t={recent_end_sec:.1f}s", f"[{phase}]", subtask]
-    if target:
-        details.append(f"target={target}")
-    if goal:
-        details.append(f"goal={goal}")
-    return "; ".join(details)
+def _render_ll_memory(fields: dict[str, str], prediction: HLMemoryPrediction) -> str:
+    current_subtask = _clean_memory_field(prediction.current_subtask) or "continue the task"
+    previous_progress = _clean_memory_field(fields.get("task progress", ""))
+    progress = _progress_sentence(previous_progress, current_subtask)
+    relevant_objects = _merge_relevant_objects(
+        fields.get("relevant objects", ""),
+        prediction.target_query,
+        prediction.goal_query,
+    )
+    notes = _clean_memory_field(fields.get("notes", "")) or "none"
+    return "\n".join(
+        [
+            f"Task progress: {progress}",
+            f"Current objective: {current_subtask}",
+            f"Relevant objects: {relevant_objects or 'none'}",
+            f"Notes: {notes}",
+        ]
+    )
 
 
-def _append_or_merge_progress_entry(entries: list[str], new_entry: str) -> list[str]:
-    if not entries:
-        return [new_entry]
-
-    previous_subtask = _extract_entry_subtask(entries[-1])
-    new_subtask = _extract_entry_subtask(new_entry)
-    if previous_subtask and new_subtask:
-        similarity = difflib.SequenceMatcher(None, _normalize_text(previous_subtask), _normalize_text(new_subtask)).ratio()
-        if similarity >= 0.82:
-            return [*entries[:-1], new_entry]
-    return [*entries, new_entry]
+def _progress_sentence(previous_progress: str, current_subtask: str) -> str:
+    if not previous_progress or _is_generic_memory(previous_progress):
+        return f"The robot is working on: {current_subtask}."
+    normalized_progress = _normalize_text(previous_progress)
+    normalized_subtask = _normalize_text(current_subtask)
+    if normalized_subtask and normalized_subtask in normalized_progress:
+        return previous_progress
+    return f"{previous_progress.rstrip('.')} The current focus is: {current_subtask}."
 
 
-def _extract_entry_subtask(entry: str) -> str:
-    parts = [part.strip() for part in entry.split(";")]
-    for part in parts:
-        if part.startswith("["):
-            closing = part.find("]")
-            if closing >= 0:
-                return part[closing + 1 :].strip()
-    if len(parts) >= 3:
-        return parts[2]
-    return entry.strip()
+def _merge_relevant_objects(*values: str) -> str:
+    objects: list[str] = []
+    for value in values:
+        for chunk in re.split(r"[,;/]", value):
+            cleaned = _clean_memory_field(chunk)
+            if not cleaned or cleaned.lower() == "none":
+                continue
+            if _normalize_text(cleaned) not in {_normalize_text(item) for item in objects}:
+                objects.append(cleaned)
+    return ", ".join(objects[:6])
 
 
-def _render_progress_memory(entries: list[str], prediction: HLMemoryPrediction) -> str:
-    lines = ["Progress memory:"]
-    lines.extend(f"- {entry}" for entry in entries)
-    lines.append(f"Current subtask: {prediction.current_subtask.strip()}")
-    return "\n".join(lines)
+def _clean_memory_field(value: str) -> str:
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    cleaned = re.sub(r"\bt=\d+(?:\.\d+)?s\b", "", cleaned)
+    cleaned = cleaned.replace("target=", "").replace("goal=", "")
+    cleaned = cleaned.strip(" ;-")
+    return cleaned
 
 
-def _compact_language_memory(memory: str, *, max_chars: int) -> str:
-    if len(memory) <= max_chars:
-        return memory
-    lines = [line for line in memory.splitlines() if line.strip()]
-    if len(lines) <= 3:
-        return memory[: max(max_chars - 3, 0)].rstrip() + "..."
-    header = lines[:1]
-    tail = lines[-5:]
-    compacted = "\n".join([*header, "- Earlier repetitive progress compressed.", *tail])
+def _compact_ll_memory(memory: str, *, max_chars: int) -> str:
+    lines = []
+    for line in memory.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = _clean_memory_field(value)
+        lines.append(f"{key.strip()}: {value or 'none'}")
+    compacted = "\n".join(lines)
     if len(compacted) <= max_chars:
         return compacted
-    return compacted[: max(max_chars - 3, 0)].rstrip() + "..."
+    truncated: list[str] = []
+    per_line_budget = max(max_chars // max(len(lines), 1) - 8, 24)
+    for line in lines:
+        if len(line) > per_line_budget:
+            line = line[: per_line_budget - 3].rstrip() + "..."
+        truncated.append(line)
+    return "\n".join(truncated)

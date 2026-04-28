@@ -53,16 +53,18 @@ def test_rollout_language_memory_rule_advances_generic_memory():
     )
 
     assert changed
-    assert "Move the shoebox to the center of the table." in updated.updated_language_memory
-    assert "t=8.0s" in updated.updated_language_memory
+    assert "Task progress:" in updated.updated_language_memory
+    assert "Current objective: Move the shoebox to the center of the table." in updated.updated_language_memory
+    assert "Relevant objects: shoebox, center of table" in updated.updated_language_memory
+    assert "t=8.0s" not in updated.updated_language_memory
 
 
-def test_rollout_language_memory_rule_merges_repeated_subtask():
+def test_rollout_language_memory_rule_keeps_ll_friendly_shape_for_repeated_subtask():
     previous_memory = (
-        "Progress memory:\n"
-        "- t=8.0s; [preparation]; Move the shoebox to the center of the table.; "
-        "target=shoebox; goal=center of table\n"
-        "Current subtask: Move the shoebox to the center of the table."
+        "Task progress: The robot is working on: Move the shoebox to the center of the table.\n"
+        "Current objective: Move the shoebox to the center of the table.\n"
+        "Relevant objects: shoebox, center of table\n"
+        "Notes: none"
     )
     prediction = HLMemoryPrediction(
         updated_language_memory=previous_memory,
@@ -80,5 +82,31 @@ def test_rollout_language_memory_rule_merges_repeated_subtask():
     )
 
     assert changed
-    assert updated.updated_language_memory.count("- ") == 1
-    assert "t=10.0s" in updated.updated_language_memory
+    assert updated.updated_language_memory.count("\n") == 3
+    assert "Current objective: Move the shoebox to the center of the table." in updated.updated_language_memory
+    assert "t=10.0s" not in updated.updated_language_memory
+
+
+def test_rollout_language_memory_rule_rewrites_debug_log_memory():
+    prediction = HLMemoryPrediction(
+        updated_language_memory=(
+            "Progress memory:\n"
+            "- t=8.0s; [preparation]; Move the shoebox; target=shoebox; goal=center"
+        ),
+        current_subtask="Fold the shoebox",
+        keyframe_candidate_positions=(),
+        phase="action",
+        target_query="shoebox",
+        goal_query="folded shoebox",
+    )
+
+    updated, changed = apply_rollout_language_memory_rule(
+        prediction,
+        previous_memory="Task started.",
+        recent_end_sec=10.0,
+    )
+
+    assert changed
+    assert updated.updated_language_memory.startswith("Task progress:")
+    assert "Progress memory" not in updated.updated_language_memory
+    assert "target=" not in updated.updated_language_memory
