@@ -201,6 +201,33 @@ python scripts/run_hl_memory_zero_shot.py \
 Qwen3.5 依赖较新的 Transformers image-text-to-text 支持。如果你的环境报缺少
 `AutoModelForImageTextToText`，按 Qwen3.5 官方模型卡建议安装更新的 `transformers`。
 
+Qwen3.5 thinking 控制：
+
+- HL memory 默认 `--no-enable-thinking`，也就是关闭 thinking。
+- 原因是这个任务需要稳定的结构化 JSON；thinking 文本容易让模型先输出长分析，导致 JSON 被截断或 parser 失败。
+- 关闭 thinking 时，prompt 会明确要求不输出 chain-of-thought，只输出最终 JSON，并向 Qwen chat template 传
+  `enable_thinking=False`。
+- 如果你想观察 Qwen3.5 的推理过程，可以显式加 `--enable-thinking`。
+- 开启 thinking 时，prompt 会要求模型把 thinking 控制在 `--thinking-budget-tokens` 内，并在最后输出唯一 JSON。
+- 开启 thinking 时，generation token 上限会自动使用
+  `max(--max-new-tokens, --thinking-max-new-tokens)`，默认至少 1024，避免 reasoning 把 JSON 挤掉。
+- parser 会清理 reasoning 输出：优先提取 `</think>` 后面的最终 JSON；如果输出里有多个 JSON，会选择最后一个字段完整的
+  HL prediction JSON。
+
+示例：
+
+```bash
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /path/to/video.mp4 \
+  --instruction "Put the crescent and square blocks into their corresponding slots" \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --enable-thinking \
+  --thinking-budget-tokens 128 \
+  --thinking-max-new-tokens 1024 \
+  --device cuda
+```
+
 ## 离线 rollout 评估
 
 ```bash
@@ -341,6 +368,33 @@ python scripts/run_hl_memory_zero_shot.py \
   --device cuda \
   --debug-dir /tmp/hl_zero_shot_rollout \
   --output-json /tmp/hl_zero_shot_rollout/summary.json
+```
+
+如果换成 Qwen3.5，默认不启用 thinking：
+
+```bash
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /path/to/video.mp4 \
+  --instruction "Fold the shoebox" \
+  --language-memory "Task started." \
+  --rollout-interval-sec 2 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 20 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /path/to/Qwen3.5-4B \
+  --device cuda \
+  --debug-dir /tmp/hl_zero_shot_rollout \
+  --output-json /tmp/hl_zero_shot_rollout/summary.json
+```
+
+只有当你需要保留 reasoning trace 时才建议加：
+
+```bash
+  --enable-thinking \
+  --thinking-budget-tokens 128 \
+  --thinking-max-new-tokens 1024
 ```
 
 rollout 模式会：

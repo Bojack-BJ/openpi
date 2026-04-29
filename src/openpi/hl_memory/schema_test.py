@@ -42,3 +42,32 @@ def test_prediction_defaults_missing_keyframe_positions_to_empty():
     )
 
     assert parsed.keyframe_candidate_positions == ()
+
+
+def test_prediction_parses_json_after_thinking_block():
+    text = """
+<think>
+I will inspect the clips briefly and then answer.
+</think>
+{"updated_language_memory":"m","current_subtask":"s","keyframe_candidate_positions":[1],"phase":"p","target_query":"t","goal_query":"g"}
+"""
+
+    parsed = HLMemoryPrediction.from_json(text)
+
+    assert parsed.current_subtask == "s"
+    assert parsed.keyframe_candidate_positions == (1,)
+
+
+def test_prediction_prefers_final_prediction_json():
+    text = """
+Reasoning with an irrelevant object {"debug": true}.
+{"updated_language_memory":"old","current_subtask":"old","keyframe_candidate_positions":[],"phase":"old","target_query":"","goal_query":""}
+Final answer:
+{"updated_language_memory":"new","current_subtask":"new","keyframe_candidate_positions":[2],"phase":"new","target_query":"target","goal_query":"goal"}
+"""
+
+    parsed = HLMemoryPrediction.from_json(text)
+
+    assert parsed.updated_language_memory == "new"
+    assert parsed.current_subtask == "new"
+    assert parsed.keyframe_candidate_positions == (2,)

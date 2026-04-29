@@ -58,6 +58,9 @@ class ZeroShotArgs:
     frame_width: int = 224
     allow_single_frame_fallback: bool = True
     max_new_tokens: int = 256
+    enable_thinking: bool = False
+    thinking_budget_tokens: int = 128
+    thinking_max_new_tokens: int = 1024
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -73,6 +76,9 @@ def main(args: ZeroShotArgs) -> None:
         frame_width=args.frame_width,
         allow_single_frame_fallback=args.allow_single_frame_fallback,
         max_new_tokens=args.max_new_tokens,
+        enable_thinking=args.enable_thinking,
+        thinking_budget_tokens=args.thinking_budget_tokens,
+        thinking_max_new_tokens=args.thinking_max_new_tokens,
     )
     adapter = create_hf_adapter(config)
     resolved_model_path = args.model_path

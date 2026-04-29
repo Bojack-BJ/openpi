@@ -26,6 +26,9 @@ class EvalArgs:
     vlm_hf_model_id: str | None = None
     local_vlm_ckpt_path: pathlib.Path | None = None
     precision: str = "bfloat16"
+    enable_thinking: bool = False
+    thinking_budget_tokens: int = 128
+    thinking_max_new_tokens: int = 1024
     output_json: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -41,6 +44,9 @@ def main(args: EvalArgs) -> None:
         vlm_variant=args.vlm_variant,
         vlm_hf_model_id=args.vlm_hf_model_id or str(resolved_model_path),
         precision=args.precision,
+        enable_thinking=args.enable_thinking,
+        thinking_budget_tokens=args.thinking_budget_tokens,
+        thinking_max_new_tokens=args.thinking_max_new_tokens,
     )
     adapter = create_hf_adapter(hl_config)
     loaded = adapter.load(model_path=str(resolved_model_path), device=args.device)

@@ -62,6 +62,9 @@ This repo also contains a standalone high-level memory / subtask pipeline under 
   - recent observation window
 - Runtime backends currently include `qwen2_5_vl` and `qwen3_5_vl`; Qwen3.5 supports `vlm_variant` values
   `qwen3_5_2b` / `qwen3_5_4b`.
+- Qwen3.5 thinking is disabled by default for HL memory because this task expects short structured JSON. Use
+  `--enable-thinking` only when you explicitly want reasoning traces; the parser will clean the output and extract the
+  final JSON.
 - It predicts:
   - updated language memory
   - current subtask

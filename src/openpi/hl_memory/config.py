@@ -44,6 +44,9 @@ class HLMemoryConfig:
     frame_width: int = 224
     allow_single_frame_fallback: bool = True
     max_new_tokens: int = 256
+    enable_thinking: bool = False
+    thinking_budget_tokens: int = 128
+    thinking_max_new_tokens: int = 1024
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
@@ -65,6 +68,10 @@ class HLMemoryConfig:
             raise ValueError("frame_height and frame_width must be positive.")
         if self.max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive.")
+        if self.thinking_budget_tokens <= 0:
+            raise ValueError("thinking_budget_tokens must be positive.")
+        if self.thinking_max_new_tokens <= 0:
+            raise ValueError("thinking_max_new_tokens must be positive.")
 
     @property
     def resolved_model_id(self) -> str:

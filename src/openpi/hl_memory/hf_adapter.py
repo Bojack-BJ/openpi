@@ -103,7 +103,7 @@ class BaseHLVLMAdapter:
         }
         generated_ids = loaded.model.generate(
             **generation_inputs,
-            max_new_tokens=self.config.max_new_tokens,
+            max_new_tokens=self._generation_max_new_tokens(),
             do_sample=False,
         )
         generated_suffix = generated_ids[:, input_ids.shape[-1] :]
@@ -126,6 +126,13 @@ class BaseHLVLMAdapter:
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
+        thinking_instruction = (
+            "Thinking is enabled. If you produce private reasoning, keep it brief: at most "
+            f"{self.config.thinking_budget_tokens} tokens, then finish with exactly one final JSON object. "
+            "Do not include reasoning after the JSON object.\n"
+            if self.config.enable_thinking
+            else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
+        )
         return (
             "You receive two ordered video clips.\n"
             "The first clip contains selected historical keyframes: sparse frames of particular importance from "
@@ -141,6 +148,7 @@ class BaseHLVLMAdapter:
             "Return exactly one JSON object with keys "
             "`updated_language_memory`, `current_subtask`, `keyframe_candidate_positions`, `phase`, "
             "`target_query`, `goal_query`.\n"
+            f"{thinking_instruction}"
             "`updated_language_memory` will be read by a downstream low-level VLM policy. It must be compact, stable, "
             "and action-useful, not a verbose log.\n"
             "`updated_language_memory` must use exactly this four-line plain-text format:\n"
@@ -170,10 +178,16 @@ class BaseHLVLMAdapter:
         )
 
     def build_system_prompt(self) -> str:
+        thinking_instruction = (
+            f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
+            "valid JSON object after the thinking text."
+            if self.config.enable_thinking
+            else "Do not output chain-of-thought or analysis text. Output only valid JSON."
+        )
         return (
             "You are a robot high-level memory policy. Your job is to choose the next language subtask for a "
             "low-level robot controller and to select task-relevant keyframes for future memory. Be concise, "
-            "ground decisions in the provided images, and output only valid JSON."
+            f"ground decisions in the provided images, and output only valid JSON. {thinking_instruction}"
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
@@ -198,6 +212,11 @@ class BaseHLVLMAdapter:
 
     def _resolve_torch_dtype(self) -> torch.dtype:
         return torch.bfloat16 if self.config.precision == "bfloat16" else torch.float32
+
+    def _generation_max_new_tokens(self) -> int:
+        if self.config.enable_thinking:
+            return max(self.config.max_new_tokens, self.config.thinking_max_new_tokens)
+        return self.config.max_new_tokens
 
     def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
         raise NotImplementedError
@@ -285,12 +304,19 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         apply_chat_template = getattr(processor, "apply_chat_template", None) or getattr(
             tokenizer, "apply_chat_template"
         )
-        return apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=not include_target,
-            video_fps=1,
-        )
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": not include_target,
+            "video_fps": 1,
+            **self._chat_template_kwargs(),
+        }
+        try:
+            return apply_chat_template(messages, **kwargs)
+        except TypeError as exc:
+            if "enable_thinking" not in str(exc):
+                raise
+            kwargs.pop("enable_thinking", None)
+            return apply_chat_template(messages, **kwargs)
 
     def _prepare_videos(self, clips: LoadedVideoClips) -> list[list[Any]]:
         return [
@@ -298,8 +324,14 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
             list(clips.recent_frames),
         ]
 
+    def _chat_template_kwargs(self) -> dict[str, Any]:
+        return {}
+
 
 class Qwen35HLAdapter(Qwen25HLAdapter):
+    def _chat_template_kwargs(self) -> dict[str, Any]:
+        return {"enable_thinking": self.config.enable_thinking}
+
     def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
         model_cls = getattr(transformers, "AutoModelForImageTextToText", None)
         if model_cls is None:

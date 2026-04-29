@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 import dataclasses
 import json
+
+_PREDICTION_REQUIRED_KEYS = {
+    "updated_language_memory",
+    "current_subtask",
+    "phase",
+    "target_query",
+    "goal_query",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,14 +58,7 @@ class HLMemoryPrediction:
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "HLMemoryPrediction":
-        required_keys = {
-            "updated_language_memory",
-            "current_subtask",
-            "phase",
-            "target_query",
-            "goal_query",
-        }
-        missing = required_keys - set(data)
+        missing = _PREDICTION_REQUIRED_KEYS - set(data)
         if missing:
             raise ValueError(f"Missing prediction keys: {sorted(missing)}")
         raw_positions = data.get("keyframe_candidate_positions", data.get("keyframe_positions", []))
@@ -87,22 +89,72 @@ class HLMemoryPrediction:
 
 
 def _extract_first_json_object(text: str) -> dict[str, object]:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = _strip_fenced_block(stripped)
+    fallback: dict[str, object] | None = None
+    for candidate_text in _candidate_json_texts(text):
+        parsed_objects = list(_iter_json_objects(candidate_text))
+        prediction_objects = [parsed for parsed in parsed_objects if _looks_like_prediction(parsed)]
+        if prediction_objects:
+            return prediction_objects[-1]
+        if fallback is None and parsed_objects:
+            fallback = parsed_objects[-1]
 
+    if fallback is not None:
+        return fallback
+
+    raise ValueError("Could not parse a JSON object from model output.")
+
+
+def _candidate_json_texts(text: str) -> list[str]:
+    stripped = text.strip()
+    candidates: list[str] = []
+    if "</think>" in stripped:
+        candidates.append(stripped.rsplit("</think>", maxsplit=1)[-1].strip())
+    candidates.extend(_extract_fenced_blocks(stripped))
+    candidates.append(_strip_fenced_block(stripped))
+    candidates.append(stripped)
+
+    deduped: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
+def _iter_json_objects(text: str) -> Iterator[dict[str, object]]:
     decoder = json.JSONDecoder()
-    for index, char in enumerate(stripped):
+    for index, char in enumerate(text):
         if char != "{":
             continue
         try:
-            parsed, _ = decoder.raw_decode(stripped[index:])
+            parsed, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
-            return parsed
+            yield parsed
 
-    raise ValueError("Could not parse a JSON object from model output.")
+
+def _looks_like_prediction(data: dict[str, object]) -> bool:
+    return _PREDICTION_REQUIRED_KEYS.issubset(data)
+
+
+def _extract_fenced_blocks(text: str) -> list[str]:
+    blocks: list[str] = []
+    lines = text.splitlines()
+    in_block = False
+    current: list[str] = []
+    for line in lines:
+        if line.startswith("```"):
+            if in_block:
+                blocks.append("\n".join(current).strip())
+                current = []
+                in_block = False
+            else:
+                in_block = True
+                current = []
+            continue
+        if in_block:
+            current.append(line)
+    return blocks
 
 
 def _strip_fenced_block(text: str) -> str:
