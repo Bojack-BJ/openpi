@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from collections.abc import Mapping
 import dataclasses
+import json
 import pathlib
 import re
 
@@ -11,6 +13,7 @@ from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.data import build_loaded_video_clips_from_frames
+from openpi.hl_memory.frame_composer import compose_observation_frame
 from openpi.hl_memory.schema import HLMemoryPrediction
 
 
@@ -20,6 +23,7 @@ class ZeroShotClipSelection:
     duration_sec: float | None
     memory_seconds: tuple[float, ...]
     recent_seconds: tuple[float, ...]
+    video_paths: tuple[tuple[str, pathlib.Path], ...] = ()
 
 
 _GENERIC_MEMORY_STRINGS = {
@@ -41,6 +45,34 @@ def parse_seconds_argument(value: str | None) -> list[float]:
             continue
         parsed.append(float(stripped))
     return _sorted_unique_seconds(parsed)
+
+
+def parse_video_paths_argument(value: str | None) -> dict[str, pathlib.Path]:
+    if value is None or not value.strip():
+        return {}
+    stripped = value.strip()
+    if stripped.startswith("{"):
+        payload = json.loads(stripped)
+        if not isinstance(payload, dict):
+            raise ValueError("video paths JSON must be an object mapping view names to paths.")
+        return _normalize_video_paths(payload)
+
+    parsed: dict[str, pathlib.Path] = {}
+    for chunk in stripped.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError("video paths must use `view_name=/path/to/video` entries separated by commas.")
+        view_name, path = item.split("=", 1)
+        view_name = view_name.strip()
+        path = path.strip()
+        if not view_name or not path:
+            raise ValueError("video path entries must include both a non-empty view name and path.")
+        if view_name in parsed:
+            raise ValueError(f"Duplicate video view name: {view_name}")
+        parsed[view_name] = pathlib.Path(path)
+    return parsed
 
 
 def build_recent_seconds(
@@ -146,12 +178,95 @@ def build_zero_shot_clips_from_video(
     return clips, selection
 
 
+def build_zero_shot_clips_from_video_paths(
+    video_paths: Mapping[str, pathlib.Path | str],
+    *,
+    config: HLMemoryConfig,
+    recent_end_sec: float | None = None,
+    recent_step_sec: float = 1.0,
+    recent_seconds: Iterable[float] | None = None,
+    memory_seconds: Iterable[float] | None = None,
+    auto_memory: bool = True,
+) -> tuple[LoadedVideoClips, ZeroShotClipSelection]:
+    resolved_video_paths = _normalize_video_paths(video_paths)
+    readers = {view_name: VideoFrameReader(path) for view_name, path in resolved_video_paths.items()}
+    try:
+        duration_sec = _combined_duration_sec(reader.duration_sec for reader in readers.values())
+        resolved_recent_seconds = build_recent_seconds(
+            duration_sec,
+            clip_length=config.recent_frames_length,
+            recent_end_sec=recent_end_sec,
+            recent_step_sec=recent_step_sec,
+            explicit_seconds=recent_seconds,
+        )
+        if memory_seconds is not None:
+            resolved_memory_seconds = _sorted_unique_seconds(memory_seconds)
+        elif auto_memory:
+            resolved_memory_seconds = build_auto_memory_seconds(
+                duration_sec,
+                recent_seconds=resolved_recent_seconds,
+                clip_length=config.memory_length,
+            )
+        else:
+            resolved_memory_seconds = []
+        resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
+
+        memory_frames = [
+            _read_composed_multiview_frame(
+                readers,
+                second,
+                frame_height=config.frame_height,
+                frame_width=config.frame_width,
+            )
+            for second in resolved_memory_seconds
+        ]
+        recent_frames = [
+            _read_composed_multiview_frame(
+                readers,
+                second,
+                frame_height=config.frame_height,
+                frame_width=config.frame_width,
+            )
+            for second in resolved_recent_seconds
+        ]
+    finally:
+        for reader in readers.values():
+            reader.close()
+
+    clips = build_loaded_video_clips_from_frames(
+        memory_frames,
+        recent_frames,
+        config=config,
+        memory_valid_length=len(memory_frames),
+        recent_valid_length=len(recent_frames),
+    )
+    ordered_paths = tuple(sorted(resolved_video_paths.items()))
+    selection = ZeroShotClipSelection(
+        video_path=ordered_paths[0][1],
+        duration_sec=duration_sec,
+        memory_seconds=tuple(resolved_memory_seconds),
+        recent_seconds=tuple(resolved_recent_seconds),
+        video_paths=ordered_paths,
+    )
+    return clips, selection
+
+
 def read_video_duration_sec(video_path: pathlib.Path | str) -> float | None:
     reader = VideoFrameReader(video_path)
     try:
         return reader.duration_sec
     finally:
         reader.close()
+
+
+def read_video_paths_duration_sec(video_paths: Mapping[str, pathlib.Path | str]) -> float | None:
+    resolved_video_paths = _normalize_video_paths(video_paths)
+    readers = [VideoFrameReader(path) for path in resolved_video_paths.values()]
+    try:
+        return _combined_duration_sec(reader.duration_sec for reader in readers)
+    finally:
+        for reader in readers:
+            reader.close()
 
 
 def build_rollout_end_seconds(
@@ -366,6 +481,39 @@ def _sorted_unique_seconds(seconds: Iterable[float]) -> list[float]:
         if not deduped or abs(second - deduped[-1]) > 1e-6:
             deduped.append(second)
     return deduped
+
+
+def _normalize_video_paths(video_paths: Mapping[str, pathlib.Path | str]) -> dict[str, pathlib.Path]:
+    normalized: dict[str, pathlib.Path] = {}
+    for view_name, path in video_paths.items():
+        view_name = str(view_name).strip()
+        if not view_name:
+            raise ValueError("Video view names must be non-empty.")
+        normalized[view_name] = pathlib.Path(path)
+    if not normalized:
+        raise ValueError("At least one video path is required.")
+    return normalized
+
+
+def _combined_duration_sec(durations: Iterable[float | None]) -> float | None:
+    valid = [duration for duration in durations if duration is not None and duration > 0.0]
+    if not valid:
+        return None
+    return min(valid)
+
+
+def _read_composed_multiview_frame(
+    readers: Mapping[str, VideoFrameReader],
+    second: float,
+    *,
+    frame_height: int,
+    frame_width: int,
+) -> Image.Image:
+    return compose_observation_frame(
+        {view_name: reader.read(second) for view_name, reader in readers.items()},
+        frame_height=frame_height,
+        frame_width=frame_width,
+    )
 
 
 def _filter_visible_memory_seconds(memory_seconds: Iterable[float], recent_seconds: Iterable[float]) -> list[float]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from collections.abc import Mapping
 from typing import Any
 
@@ -35,6 +36,7 @@ class LoadedHLVLM:
 class HLVLMGeneration:
     prediction: HLMemoryPrediction
     raw_output: str
+    parse_error: str | None = None
 
 
 class BaseHLVLMAdapter:
@@ -107,8 +109,20 @@ class BaseHLVLMAdapter:
         generated_suffix = generated_ids[:, input_ids.shape[-1] :]
         tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         decoded = tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
-        prediction = HLMemoryPrediction.from_json(decoded).with_recent_position_limit(clips.recent_valid_length)
-        return HLVLMGeneration(prediction=prediction, raw_output=decoded)
+        try:
+            prediction = HLMemoryPrediction.from_json(decoded).with_recent_position_limit(clips.recent_valid_length)
+            return HLVLMGeneration(prediction=prediction, raw_output=decoded)
+        except ValueError as exc:
+            parse_error = f"{type(exc).__name__}: {exc}"
+            logging.warning(
+                "HL VLM output could not be parsed as JSON; using fallback prediction. raw_output=%r",
+                decoded[:1000],
+            )
+            return HLVLMGeneration(
+                prediction=self._fallback_prediction(sample),
+                raw_output=decoded,
+                parse_error=parse_error,
+            )
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
@@ -164,6 +178,23 @@ class BaseHLVLMAdapter:
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
         return sample.target_prediction().to_json()
+
+    def _fallback_prediction(self, sample: ExportedHLMemorySample) -> HLMemoryPrediction:
+        instruction = sample.instruction.strip() or "continue the task"
+        memory = (
+            "Task progress: Continue the task using the current visual observations.\n"
+            f"Current objective: {instruction}\n"
+            "Relevant objects: none\n"
+            "Notes: Use current visual observations."
+        )
+        return HLMemoryPrediction(
+            updated_language_memory=memory,
+            current_subtask=instruction,
+            keyframe_candidate_positions=(),
+            phase="unknown",
+            target_query="",
+            goal_query="",
+        )
 
     def _resolve_torch_dtype(self) -> torch.dtype:
         return torch.bfloat16 if self.config.precision == "bfloat16" else torch.float32

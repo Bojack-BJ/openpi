@@ -21,6 +21,22 @@ def test_compose_observation_frame_returns_rgb_image():
     assert image.height == 32
 
 
+def test_compose_observation_frame_accepts_pil_images():
+    image = compose_observation_frame(
+        {
+            "front": Image.new("RGB", (16, 16), color=(255, 0, 0)),
+            "robot_0": Image.new("RGB", (16, 16), color=(0, 255, 0)),
+            "robot_1": Image.new("RGB", (16, 16), color=(0, 0, 255)),
+        },
+        frame_height=32,
+        frame_width=32,
+    )
+
+    assert image.mode == "RGB"
+    assert image.width == 72
+    assert image.height == 72
+
+
 def test_compose_context_panel_stacks_memory_and_recent_sections():
     memory_frames = [Image.new("RGB", (32, 32), color=(255, 0, 0))]
     recent_frames = [Image.new("RGB", (32, 32), color=(0, 255, 0))]

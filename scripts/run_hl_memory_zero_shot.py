@@ -9,14 +9,17 @@ import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
+from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 from openpi.hl_memory.zero_shot import build_rollout_end_seconds
-from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.zero_shot import build_zero_shot_clips_from_video
+from openpi.hl_memory.zero_shot import build_zero_shot_clips_from_video_paths
 from openpi.hl_memory.zero_shot import build_zero_shot_sample
 from openpi.hl_memory.zero_shot import keyframe_candidate_seconds
 from openpi.hl_memory.zero_shot import parse_seconds_argument
+from openpi.hl_memory.zero_shot import parse_video_paths_argument
 from openpi.hl_memory.zero_shot import read_video_duration_sec
+from openpi.hl_memory.zero_shot import read_video_paths_duration_sec
 from openpi.hl_memory.zero_shot import save_keyframe_candidate_frames
 from openpi.hl_memory.zero_shot import save_zero_shot_debug_frames
 from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
@@ -43,6 +46,8 @@ class ZeroShotArgs:
     rollout_end_sec: float | None = None
     keyframe_merge_distance_sec: float = 2.0
     auto_memory: bool = True
+    view_name: str = "front"
+    extra_video_paths: str | None = None
     vlm_backend: str = "qwen2_5_vl"
     vlm_variant: str | None = None
     vlm_hf_model_id: str | None = None
@@ -106,8 +111,8 @@ def _run_single_prediction(
     loaded,
     resolved_model_path: str | None,
 ) -> dict[str, object]:
-    clips, selection = build_zero_shot_clips_from_video(
-        args.video_path,
+    clips, selection = _build_clips_from_args(
+        args,
         config=config,
         recent_end_sec=args.recent_end_sec,
         recent_step_sec=args.recent_step_sec,
@@ -137,6 +142,7 @@ def _run_single_prediction(
 
     payload = {
         "video_path": str(args.video_path),
+        "video_paths": _payload_video_paths_from_args(args),
         "model_path": args.model_path,
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
@@ -148,6 +154,7 @@ def _run_single_prediction(
         "memory_valid_length": clips.memory_valid_length,
         "recent_valid_length": clips.recent_valid_length,
         "raw_model_output": generation.raw_output,
+        "parse_error": generation.parse_error,
         "model_prediction": generation.prediction.to_dict(),
         "prediction": prediction.to_dict(),
         "language_memory_rule_applied": memory_rule_applied,
@@ -179,7 +186,12 @@ def _run_rollout(
     if args.recent_seconds is not None:
         raise ValueError("`--recent-seconds` is not supported with interval rollout; use `--recent-step-sec` instead.")
 
-    duration_sec = read_video_duration_sec(args.video_path)
+    video_paths = _resolve_video_paths(args)
+    duration_sec = (
+        read_video_duration_sec(args.video_path)
+        if len(video_paths) == 1
+        else read_video_paths_duration_sec(video_paths)
+    )
     rollout_seconds = build_rollout_end_seconds(
         duration_sec,
         interval_sec=float(args.rollout_interval_sec),
@@ -194,12 +206,11 @@ def _run_rollout(
     for step_index, end_sec in enumerate(rollout_seconds):
         memory_before = memory_seconds
         language_memory_before = language_memory
-        clips, selection = build_zero_shot_clips_from_video(
-            args.video_path,
+        clips, selection = _build_clips_from_args(
+            args,
             config=config,
             recent_end_sec=end_sec,
             recent_step_sec=args.recent_step_sec,
-            recent_seconds=None,
             memory_seconds=memory_before,
             auto_memory=False,
         )
@@ -256,6 +267,7 @@ def _run_rollout(
                 "memory_valid_length": clips.memory_valid_length,
                 "recent_valid_length": clips.recent_valid_length,
                 "raw_model_output": generation.raw_output,
+                "parse_error": generation.parse_error,
                 "model_prediction": generation.prediction.to_dict(),
                 "prediction": prediction.to_dict(),
                 "language_memory_rule_applied": memory_rule_applied,
@@ -276,6 +288,7 @@ def _run_rollout(
 
     return {
         "video_path": str(args.video_path),
+        "video_paths": _payload_video_paths_from_args(args),
         "model_path": args.model_path,
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
@@ -291,6 +304,52 @@ def _run_rollout(
         "debug_dir": None if debug_dir is None else str(debug_dir),
         "steps": steps,
     }
+
+
+def _build_clips_from_args(
+    args: ZeroShotArgs,
+    *,
+    config: HLMemoryConfig,
+    recent_end_sec: float | None,
+    recent_step_sec: float,
+    recent_seconds: list[float] | None = None,
+    memory_seconds: tuple[float, ...] | list[float] | None = None,
+    auto_memory: bool,
+):
+    video_paths = _resolve_video_paths(args)
+    if len(video_paths) == 1:
+        return build_zero_shot_clips_from_video(
+            args.video_path,
+            config=config,
+            recent_end_sec=recent_end_sec,
+            recent_step_sec=recent_step_sec,
+            recent_seconds=recent_seconds,
+            memory_seconds=memory_seconds,
+            auto_memory=auto_memory,
+        )
+    return build_zero_shot_clips_from_video_paths(
+        video_paths,
+        config=config,
+        recent_end_sec=recent_end_sec,
+        recent_step_sec=recent_step_sec,
+        recent_seconds=recent_seconds,
+        memory_seconds=memory_seconds,
+        auto_memory=auto_memory,
+    )
+
+
+def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
+    extra_video_paths = parse_video_paths_argument(args.extra_video_paths)
+    view_name = args.view_name.strip()
+    if not view_name:
+        raise ValueError("`view_name` must be non-empty.")
+    if view_name in extra_video_paths:
+        raise ValueError(f"`view_name={view_name}` conflicts with an entry in `extra_video_paths`.")
+    return {view_name: args.video_path, **extra_video_paths}
+
+
+def _payload_video_paths_from_args(args: ZeroShotArgs) -> dict[str, str]:
+    return {view_name: str(path) for view_name, path in _resolve_video_paths(args).items()}
 
 
 def _write_jsonl(path: pathlib.Path, rows: list[dict[str, object]]) -> None:

@@ -4,13 +4,13 @@ from collections.abc import Mapping, Sequence
 import math
 
 import numpy as np
+import torch
 from PIL import Image
 from PIL import ImageOps
-import torch
 
 
 def compose_observation_frame(
-    images: Mapping[str, np.ndarray | torch.Tensor],
+    images: Mapping[str, Image.Image | np.ndarray | torch.Tensor],
     *,
     frame_height: int,
     frame_width: int,
@@ -105,7 +105,9 @@ def _resize_with_pad(image: Image.Image, *, cell_width: int, cell_height: int) -
     return canvas
 
 
-def _to_pil_image(image: np.ndarray | torch.Tensor) -> Image.Image:
+def _to_pil_image(image: Image.Image | np.ndarray | torch.Tensor) -> Image.Image:
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
     if isinstance(image, torch.Tensor):
         image = image.detach().cpu().numpy()
     array = np.asarray(image)

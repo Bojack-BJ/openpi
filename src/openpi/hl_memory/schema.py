@@ -59,7 +59,7 @@ class HLMemoryPrediction:
         missing = required_keys - set(data)
         if missing:
             raise ValueError(f"Missing prediction keys: {sorted(missing)}")
-        raw_positions = data.get("keyframe_candidate_positions", data.get("keyframe_positions"))
+        raw_positions = data.get("keyframe_candidate_positions", data.get("keyframe_positions", []))
         if not isinstance(raw_positions, list):
             raise ValueError("keyframe_candidate_positions must be a list.")
         keyframe_candidate_positions: list[int] = []

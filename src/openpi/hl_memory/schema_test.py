@@ -34,3 +34,11 @@ def test_prediction_drops_invalid_generated_positions():
 
     assert parsed.keyframe_candidate_positions == (2, 7)
     assert parsed.with_recent_position_limit(2).keyframe_candidate_positions == (2,)
+
+
+def test_prediction_defaults_missing_keyframe_positions_to_empty():
+    parsed = HLMemoryPrediction.from_json(
+        '{"updated_language_memory":"m","current_subtask":"s","phase":"p","target_query":"t","goal_query":"g"}'
+    )
+
+    assert parsed.keyframe_candidate_positions == ()

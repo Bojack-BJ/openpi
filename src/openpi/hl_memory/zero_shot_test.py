@@ -1,14 +1,31 @@
+import pathlib
+
+from openpi.hl_memory.schema import HLMemoryPrediction
+from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 from openpi.hl_memory.zero_shot import build_auto_memory_seconds
 from openpi.hl_memory.zero_shot import build_recent_seconds
 from openpi.hl_memory.zero_shot import build_rollout_end_seconds
-from openpi.hl_memory.schema import HLMemoryPrediction
-from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 from openpi.hl_memory.zero_shot import parse_seconds_argument
+from openpi.hl_memory.zero_shot import parse_video_paths_argument
 from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
 
 
 def test_parse_seconds_argument_sorts_and_dedupes():
     assert parse_seconds_argument("3,1,1,2.5") == [1.0, 2.5, 3.0]
+
+
+def test_parse_video_paths_argument_supports_csv_mapping():
+    assert parse_video_paths_argument("robot_0=/tmp/left.mp4,robot_1=/tmp/right.mp4") == {
+        "robot_0": pathlib.Path("/tmp/left.mp4"),
+        "robot_1": pathlib.Path("/tmp/right.mp4"),
+    }
+
+
+def test_parse_video_paths_argument_supports_json_mapping():
+    assert parse_video_paths_argument('{"front": "/tmp/front.mp4", "robot_0": "/tmp/left.mp4"}') == {
+        "front": pathlib.Path("/tmp/front.mp4"),
+        "robot_0": pathlib.Path("/tmp/left.mp4"),
+    }
 
 
 def test_build_recent_seconds_defaults_from_video_end():
