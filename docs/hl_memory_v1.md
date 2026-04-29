@@ -371,6 +371,8 @@ python scripts/run_hl_memory_zero_shot.py \
 - 第一个 `video` 是 historical memory keyframes clip。
 - 第二个 `video` 是 recent observation clip。
 - 每个 clip 内位置按时间从旧到新排列。
+- 在 recent observation clip 里，最后一个有效帧才是当前状态；`current_subtask` / `phase` / `target_query` / `goal_query` 应描述最后有效帧，而不是窗口里更早、更显眼或 memory 里残留的动作。
+- 如果 recent clip 跨过多个 object 或 phase，例如前面还看到 square block、后面已经在操作 crescent block，则以后面的最后有效帧为准。
 - `keyframe_candidate_positions` 只能引用 recent clip 内的有效帧，且是 1-indexed。
 - 如果 recent clip 只有 2 张有效帧，即使 padding 到 8 帧，合法位置也只有 `1,2`。
 

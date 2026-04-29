@@ -101,13 +101,20 @@ class BaseHLVLMAdapter:
             for key, value in inputs.items()
             if isinstance(value, torch.Tensor)
         }
+        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+        generation_kwargs: dict[str, Any] = {}
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = pad_token_id
         generated_ids = loaded.model.generate(
             **generation_inputs,
             max_new_tokens=self._generation_max_new_tokens(),
             do_sample=False,
+            **generation_kwargs,
         )
         generated_suffix = generated_ids[:, input_ids.shape[-1] :]
-        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         decoded = tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
         try:
             prediction = HLMemoryPrediction.from_json(decoded).with_recent_position_limit(clips.recent_valid_length)
@@ -141,18 +148,32 @@ class BaseHLVLMAdapter:
             f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
             f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
             "In each clip, positions are ordered from oldest to newest.\n"
+            f"In the recent observation clip, position 1 is the oldest valid recent frame and position "
+            f"{clips.recent_valid_length} is the current frame. If the model internally sees 0-indexed frames, "
+            f"frame 0 is oldest and frame {max(clips.recent_valid_length - 1, 0)} is current.\n"
+            "`current_subtask`, `phase`, `target_query`, `goal_query`, and the `Current objective` line must describe "
+            "the state/action at the last valid recent frame, not the most salient earlier action in the clip.\n"
+            "Use earlier recent frames only as temporal context for deciding how the final frame was reached.\n"
             "Use visual evidence first. Treat language memory as a compact progress hint, and correct it when it "
             "conflicts with the current visual evidence.\n"
             "Manipulation segmentation rules:\n"
             "- Choose the current subtask from the visible robot behavior, not from the first object mentioned in "
             "the instruction or previous memory.\n"
+            "- If the recent clip spans multiple objects or phases, follow the temporal order and report the phase "
+            "visible at the last valid recent frame. Do not report an earlier object phase, such as a square-block "
+            "phase, if later frames show another object, such as the crescent block, being manipulated, released, "
+            "or followed by hand return.\n"
             "- A low-level subtask should be one primitive: approach, pick/grasp, transport above target, "
             "place/release, retreat/return, or transition to the next object.\n"
             "- Identify the active hand and active object from recent frames: the hand moving toward an object, "
-            "contacting it, holding it, or releasing it at a target. If the active hand is handling the square block, "
-            "use square block as `target_query` even if the instruction also mentions a crescent block.\n"
+            "contacting it, holding it, or releasing it at a target. Use the observed active object as "
+            "`target_query` even if the instruction or previous memory mentions a different object.\n"
             "- For multi-object tasks, mark an object completed only after it is visibly released at its target. "
             "Do not advance to the next object until release plus return/transition is visually supported.\n"
+            "- If the final recent frame shows an object already released at its slot, do not keep `current_subtask` "
+            "as place/release for that object unless release is happening in that final frame. Advance to the visible "
+            "post-release state: retreat/return if a hand is moving back, transition to the next object if one remains, "
+            "or task complete/hold position if all objects are placed and the robot is idle.\n"
             "- Use the nominal plan, if included in the task instruction, only as a segmentation prior. If the "
             "recent video contradicts that plan, correct to the observed manipulation step.\n"
             "- `target_query` should name the manipulated object or object part; `goal_query` should name the target "
@@ -201,7 +222,9 @@ class BaseHLVLMAdapter:
         return (
             "You are a robot high-level memory policy. Your job is to choose the next language subtask for a "
             "low-level robot controller and to select task-relevant keyframes for future memory. Be concise, "
-            f"ground decisions in the provided images, and output only valid JSON. {thinking_instruction}"
+            "ground decisions in the provided images, and output only valid JSON. The recent observation clip is "
+            "a past-to-current sequence; the last valid recent frame is the current state that must determine "
+            f"`current_subtask`. {thinking_instruction}"
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
@@ -272,12 +295,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         clips: LoadedVideoClips,
     ) -> Mapping[str, Any]:
         rendered = self._render_messages(processor, sample, clips, include_target=False)
-        return processor(
-            text=[rendered],
-            videos=self._prepare_videos(clips),
-            padding=True,
-            return_tensors="pt",
-        )
+        return self._encode_processor_inputs(processor, rendered, clips)
 
     def _encode_prompt_and_target(
         self,
@@ -286,12 +304,48 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         clips: LoadedVideoClips,
     ) -> Mapping[str, Any]:
         rendered = self._render_messages(processor, sample, clips, include_target=True)
-        return processor(
-            text=[rendered],
-            videos=self._prepare_videos(clips),
-            padding=True,
-            return_tensors="pt",
-        )
+        return self._encode_processor_inputs(processor, rendered, clips)
+
+    def _encode_processor_inputs(
+        self,
+        processor: Any,
+        rendered: str,
+        clips: LoadedVideoClips,
+    ) -> Mapping[str, Any]:
+        videos = self._prepare_videos(clips)
+        video_metadata = self._prepare_video_metadata(videos)
+        try:
+            return processor(
+                text=[rendered],
+                videos=videos,
+                text_kwargs={"padding": True, "return_tensors": "pt"},
+                videos_kwargs={
+                    "do_sample_frames": False,
+                    "video_metadata": video_metadata,
+                    "return_tensors": "pt",
+                },
+            )
+        except TypeError as exc:
+            if not _is_structured_processor_kwargs_error(exc):
+                raise
+            try:
+                return processor(
+                    text=[rendered],
+                    videos=videos,
+                    padding=True,
+                    return_tensors="pt",
+                    do_sample_frames=False,
+                    video_metadata=video_metadata,
+                )
+            except TypeError as fallback_exc:
+                if not _is_structured_processor_kwargs_error(fallback_exc):
+                    raise
+                return processor(
+                    text=[rendered],
+                    videos=videos,
+                    padding=True,
+                    return_tensors="pt",
+                )
 
     def _render_messages(
         self,
@@ -302,9 +356,15 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         include_target: bool,
     ) -> str:
         user_content = [
-            {"type": "text", "text": "Historical memory clip."},
+            {"type": "text", "text": "Historical memory clip, ordered oldest to newest."},
             {"type": "video"},
-            {"type": "text", "text": "Recent observation clip."},
+            {
+                "type": "text",
+                "text": (
+                    "Recent observation clip, ordered oldest to newest. "
+                    "The last valid frame is the current state to predict."
+                ),
+            },
             {"type": "video"},
             {"type": "text", "text": self.build_prompt(sample, clips)},
         ]
@@ -326,7 +386,6 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         kwargs = {
             "tokenize": False,
             "add_generation_prompt": not include_target,
-            "video_fps": 1,
             **self._chat_template_kwargs(),
         }
         try:
@@ -341,6 +400,17 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         return [
             list(clips.memory_frames),
             list(clips.recent_frames),
+        ]
+
+    def _prepare_video_metadata(self, videos: list[list[Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "total_num_frames": len(video),
+                "fps": 1.0,
+                "duration": float(len(video)),
+                "frames_indices": list(range(len(video))),
+            }
+            for video in videos
         ]
 
     def _chat_template_kwargs(self) -> dict[str, Any]:
@@ -385,6 +455,19 @@ def _import_transformers() -> Any:
             "The HL memory adapters require `transformers` to be installed in the active environment."
         ) from exc
     return transformers
+
+
+def _is_structured_processor_kwargs_error(exc: TypeError) -> bool:
+    message = str(exc)
+    return any(
+        token in message
+        for token in (
+            "text_kwargs",
+            "videos_kwargs",
+            "video_metadata",
+            "do_sample_frames",
+        )
+    )
 
 
 def _parse_ll_memory_fields(memory: str) -> dict[str, str]:
