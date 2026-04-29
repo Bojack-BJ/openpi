@@ -5,7 +5,7 @@ from typing import Literal
 
 
 HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl"]
-Precision = Literal["bfloat16", "float32"]
+Precision = Literal["bfloat16", "float16", "float32"]
 
 _DEFAULT_VARIANTS: dict[HLVLMBackend, str | None] = {
     "paligemma": None,
@@ -51,6 +51,8 @@ class HLMemoryConfig:
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
             raise ValueError(f"Unsupported HL VLM backend: {self.vlm_backend}")
+        if self.precision not in {"bfloat16", "float16", "float32"}:
+            raise ValueError("`precision` must be one of `bfloat16`, `float16`, or `float32`.")
         resolved_variant = _resolve_variant(self.vlm_backend, self.vlm_variant)
         object.__setattr__(self, "vlm_variant", resolved_variant)
         if self.vlm_hf_model_id is None:

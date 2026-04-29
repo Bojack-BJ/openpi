@@ -1,12 +1,17 @@
 import pathlib
 
+from PIL import Image
+
+from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.schema import HLMemoryPrediction
+from openpi.hl_memory.zero_shot import ZeroShotClipSelection
 from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 from openpi.hl_memory.zero_shot import build_auto_memory_seconds
 from openpi.hl_memory.zero_shot import build_recent_seconds
 from openpi.hl_memory.zero_shot import build_rollout_end_seconds
 from openpi.hl_memory.zero_shot import parse_seconds_argument
 from openpi.hl_memory.zero_shot import parse_video_paths_argument
+from openpi.hl_memory.zero_shot import save_prediction_debug_panel
 from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
 
 
@@ -127,3 +132,49 @@ def test_rollout_language_memory_rule_rewrites_debug_log_memory():
     assert updated.updated_language_memory.startswith("Task progress:")
     assert "Progress memory" not in updated.updated_language_memory
     assert "target=" not in updated.updated_language_memory
+
+
+def test_save_prediction_debug_panel_writes_current_frame_summary(tmp_path):
+    clips = LoadedVideoClips(
+        memory_frames=(),
+        recent_frames=(
+            Image.new("RGB", (32, 24), color=(255, 0, 0)),
+            Image.new("RGB", (32, 24), color=(0, 255, 0)),
+        ),
+        memory_valid_length=0,
+        recent_valid_length=2,
+    )
+    selection = ZeroShotClipSelection(
+        video_path=pathlib.Path("demo.mp4"),
+        duration_sec=2.0,
+        memory_seconds=(),
+        recent_seconds=(0.0, 1.0),
+    )
+    prediction = HLMemoryPrediction(
+        updated_language_memory=(
+            "Task progress: crescent block placed.\n"
+            "Current objective: return right hand.\n"
+            "Relevant objects: crescent block, slot\n"
+            "Notes: none"
+        ),
+        current_subtask="return right hand after crescent placement",
+        keyframe_candidate_positions=(2,),
+        phase="retreat",
+        target_query="right hand",
+        goal_query="home position",
+    )
+
+    output_path = save_prediction_debug_panel(
+        tmp_path / "debug_panel.png",
+        clips=clips,
+        selection=selection,
+        prediction=prediction,
+        step_index=1,
+        recent_end_sec=1.0,
+        language_memory_before="Task started.",
+        language_memory_after=prediction.updated_language_memory,
+        keyframe_candidate_seconds=(1.0,),
+    )
+
+    assert output_path.exists()
+    assert Image.open(output_path).size == (1400, 820)

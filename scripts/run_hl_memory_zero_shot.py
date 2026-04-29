@@ -19,8 +19,10 @@ from openpi.hl_memory.zero_shot import keyframe_candidate_seconds
 from openpi.hl_memory.zero_shot import parse_seconds_argument
 from openpi.hl_memory.zero_shot import read_video_paths_duration_sec
 from openpi.hl_memory.zero_shot import save_keyframe_candidate_frames
+from openpi.hl_memory.zero_shot import save_prediction_debug_panel
 from openpi.hl_memory.zero_shot import save_zero_shot_debug_frames
 from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
+from openpi.hl_memory.zero_shot import write_debug_video
 
 
 @dataclasses.dataclass
@@ -37,6 +39,7 @@ class ZeroShotArgs:
     rollout_jsonl: pathlib.Path | None = None
     rollout_pretty_json: pathlib.Path | None = None
     debug_dir: pathlib.Path | None = None
+    debug_video_fps: float = 1.0
     language_memory: str = ""
     memory_seconds: str | None = None
     recent_seconds: str | None = None
@@ -170,15 +173,30 @@ def _run_single_prediction(
     }
 
     if args.debug_dir is not None:
-        save_zero_shot_debug_frames(args.debug_dir, clips=clips, selection=selection)
+        debug_dir = pathlib.Path(args.debug_dir)
+        save_zero_shot_debug_frames(debug_dir, clips=clips, selection=selection)
         saved_keyframes = save_keyframe_candidate_frames(
-            pathlib.Path(args.debug_dir) / "keyframe_candidates",
+            debug_dir / "keyframe_candidates",
             clips=clips,
             selection=selection,
             positions=prediction.keyframe_candidate_positions,
         )
+        debug_panel_path = save_prediction_debug_panel(
+            debug_dir / "debug_panel.png",
+            clips=clips,
+            selection=selection,
+            prediction=prediction,
+            recent_end_sec=recent_end_sec,
+            language_memory_before=args.language_memory,
+            language_memory_after=prediction.updated_language_memory,
+            memory_seconds_before=selection.memory_seconds,
+            memory_seconds_after=selection.memory_seconds,
+            keyframe_candidate_seconds=candidate_seconds,
+            parse_error=generation.parse_error,
+        )
         payload["debug_dir"] = str(args.debug_dir)
         payload["saved_keyframe_candidate_paths"] = [str(path) for path in saved_keyframes]
+        payload["debug_panel_path"] = str(debug_panel_path)
 
     return payload
 
@@ -206,6 +224,7 @@ def _run_rollout(
     memory_seconds = tuple(parse_seconds_argument(args.memory_seconds))
     steps: list[dict[str, object]] = []
     debug_dir = pathlib.Path(args.debug_dir) if args.debug_dir is not None else None
+    debug_panel_paths: list[pathlib.Path] = []
 
     for step_index, end_sec in enumerate(rollout_seconds):
         memory_before = memory_seconds
@@ -245,6 +264,7 @@ def _run_rollout(
         language_memory = prediction.updated_language_memory
 
         saved_keyframes: list[str] = []
+        debug_panel_path: pathlib.Path | None = None
         step_debug_dir: pathlib.Path | None = None
         if debug_dir is not None:
             step_debug_dir = debug_dir / f"rollout_step_{step_index:03d}"
@@ -258,6 +278,21 @@ def _run_rollout(
                     positions=prediction.keyframe_candidate_positions,
                 )
             ]
+            debug_panel_path = save_prediction_debug_panel(
+                step_debug_dir / "debug_panel.png",
+                clips=clips,
+                selection=selection,
+                prediction=prediction,
+                step_index=step_index,
+                recent_end_sec=end_sec,
+                language_memory_before=language_memory_before,
+                language_memory_after=language_memory,
+                memory_seconds_before=memory_before,
+                memory_seconds_after=memory_seconds,
+                keyframe_candidate_seconds=candidate_seconds,
+                parse_error=generation.parse_error,
+            )
+            debug_panel_paths.append(debug_panel_path)
 
         steps.append(
             {
@@ -277,14 +312,25 @@ def _run_rollout(
                 "language_memory_rule_applied": memory_rule_applied,
                 "keyframe_candidate_seconds": list(candidate_seconds),
                 "debug_dir": None if step_debug_dir is None else str(step_debug_dir),
+                "debug_panel_path": None if debug_panel_path is None else str(debug_panel_path),
                 "saved_keyframe_candidate_paths": saved_keyframes,
             }
         )
 
+    debug_video_path: pathlib.Path | None = None
+    debug_video_error: str | None = None
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
         _write_jsonl(debug_dir / "rollout.jsonl", steps)
         _write_pretty_json(debug_dir / "rollout_pretty.json", steps)
+        try:
+            debug_video_path = write_debug_video(
+                debug_panel_paths,
+                debug_dir / "rollout_debug.mp4",
+                fps=args.debug_video_fps,
+            )
+        except (ModuleNotFoundError, OSError, RuntimeError, ValueError) as exc:
+            debug_video_error = f"{type(exc).__name__}: {exc}"
     if args.rollout_jsonl is not None:
         _write_jsonl(args.rollout_jsonl, steps)
     if args.rollout_pretty_json is not None:
@@ -306,6 +352,8 @@ def _run_rollout(
         "final_language_memory": language_memory,
         "final_memory_seconds": list(memory_seconds),
         "debug_dir": None if debug_dir is None else str(debug_dir),
+        "debug_video_path": None if debug_video_path is None else str(debug_video_path),
+        "debug_video_error": debug_video_error,
         "steps": steps,
     }
 

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from collections.abc import Mapping
+from collections.abc import Sequence
 import dataclasses
 import json
 import pathlib
 import re
+import textwrap
 
 from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
@@ -433,6 +437,353 @@ def save_keyframe_candidate_frames(
         clips.recent_frames[position - 1].save(output_path)
         saved_paths.append(output_path)
     return saved_paths
+
+
+def save_prediction_debug_panel(
+    output_path: pathlib.Path | str,
+    *,
+    clips: LoadedVideoClips,
+    selection: ZeroShotClipSelection,
+    prediction: HLMemoryPrediction,
+    step_index: int | None = None,
+    recent_end_sec: float | None = None,
+    language_memory_before: str = "",
+    language_memory_after: str = "",
+    memory_seconds_before: Iterable[float] = (),
+    memory_seconds_after: Iterable[float] = (),
+    keyframe_candidate_seconds: Iterable[float] = (),
+    parse_error: str | None = None,
+    title: str = "HL memory debug",
+) -> pathlib.Path:
+    output_path = pathlib.Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    valid_recent_length = max(0, min(clips.recent_valid_length, len(clips.recent_frames)))
+    current_index = valid_recent_length - 1
+    current_frame = (
+        clips.recent_frames[current_index].convert("RGB")
+        if current_index >= 0
+        else Image.new("RGB", (clips.recent_frames[0].width, clips.recent_frames[0].height), (32, 32, 32))
+        if clips.recent_frames
+        else Image.new("RGB", (224, 224), (32, 32, 32))
+    )
+    current_second = (
+        selection.recent_seconds[current_index]
+        if current_index >= 0 and current_index < len(selection.recent_seconds)
+        else recent_end_sec
+    )
+
+    width = 1400
+    height = 820
+    margin = 24
+    title_height = 48
+    text_width = 560
+    image_width = width - text_width - margin * 3
+    image_height = 520
+    strip_height = 150
+
+    panel = Image.new("RGB", (width, height), (18, 20, 24))
+    draw = ImageDraw.Draw(panel)
+    title_font = _load_debug_font(24)
+    body_font = _load_debug_font(17)
+    small_font = _load_debug_font(13)
+
+    _safe_draw_text(draw, (margin, 16), title, font=title_font, fill=(245, 247, 250))
+
+    image_box = (margin, margin + title_height, margin + image_width, margin + title_height + image_height)
+    _paste_debug_image(panel, current_frame, image_box)
+    _draw_rect(draw, image_box, fill=(116, 227, 255), width=3)
+    _safe_draw_text(
+        draw,
+        (image_box[0] + 12, image_box[1] + 10),
+        f"current frame @ {_format_optional_second(current_second)}",
+        font=body_font,
+        fill=(116, 227, 255),
+    )
+
+    strip_box = (
+        margin,
+        image_box[3] + margin,
+        margin + image_width,
+        image_box[3] + margin + strip_height,
+    )
+    _draw_recent_strip(
+        panel,
+        draw,
+        strip_box,
+        clips=clips,
+        selection=selection,
+        valid_recent_length=valid_recent_length,
+        keyframe_positions=set(prediction.keyframe_candidate_positions),
+        font=small_font,
+    )
+
+    text_x = image_box[2] + margin
+    text_y = image_box[1]
+    text_lines = _build_debug_text_lines(
+        prediction=prediction,
+        step_index=step_index,
+        recent_end_sec=recent_end_sec,
+        current_second=current_second,
+        language_memory_before=language_memory_before,
+        language_memory_after=language_memory_after or prediction.updated_language_memory,
+        memory_seconds_before=memory_seconds_before,
+        memory_seconds_after=memory_seconds_after,
+        keyframe_candidate_seconds=keyframe_candidate_seconds,
+        parse_error=parse_error,
+    )
+    _draw_debug_text_lines(
+        draw,
+        (text_x, text_y),
+        text_lines,
+        max_y=height - margin,
+        font=body_font,
+        fill=(235, 239, 245),
+        muted_fill=(164, 174, 190),
+        accent_fill=(255, 215, 106),
+    )
+
+    panel.save(output_path)
+    return output_path
+
+
+def write_debug_video(
+    frame_paths: Sequence[pathlib.Path | str],
+    output_path: pathlib.Path | str,
+    *,
+    fps: float = 1.0,
+) -> pathlib.Path | None:
+    paths = [pathlib.Path(path) for path in frame_paths]
+    if not paths:
+        return None
+    if fps <= 0.0:
+        raise ValueError("debug video fps must be positive.")
+
+    try:
+        import cv2
+        import numpy as np
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("Debug video writing requires `opencv-python` and `numpy`.") from exc
+
+    output_path = pathlib.Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    first_frame = Image.open(paths[0]).convert("RGB")
+    size = first_frame.size
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        size,
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open debug video writer: {output_path}")
+
+    try:
+        for path in paths:
+            frame = Image.open(path).convert("RGB")
+            if frame.size != size:
+                frame = frame.resize(size, _resample_lanczos())
+            writer.write(cv2.cvtColor(np.asarray(frame), cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return output_path
+
+
+def _build_debug_text_lines(
+    *,
+    prediction: HLMemoryPrediction,
+    step_index: int | None,
+    recent_end_sec: float | None,
+    current_second: float | None,
+    language_memory_before: str,
+    language_memory_after: str,
+    memory_seconds_before: Iterable[float],
+    memory_seconds_after: Iterable[float],
+    keyframe_candidate_seconds: Iterable[float],
+    parse_error: str | None,
+) -> list[tuple[str, str]]:
+    lines: list[tuple[str, str]] = []
+    step_label = "single" if step_index is None else str(step_index)
+    _append_wrapped_debug_line(lines, "Step", step_label, style="muted")
+    _append_wrapped_debug_line(lines, "Recent end", _format_optional_second(recent_end_sec), style="muted")
+    _append_wrapped_debug_line(lines, "Current frame", _format_optional_second(current_second), style="accent")
+    lines.append(("", ""))
+    _append_wrapped_debug_line(lines, "Current task", prediction.current_subtask, style="accent", max_lines=3)
+    _append_wrapped_debug_line(lines, "Phase", prediction.phase, max_lines=2)
+    _append_wrapped_debug_line(lines, "Target", prediction.target_query or "none", max_lines=2)
+    _append_wrapped_debug_line(lines, "Goal", prediction.goal_query or "none", max_lines=2)
+    _append_wrapped_debug_line(
+        lines,
+        "Keyframes",
+        f"positions={list(prediction.keyframe_candidate_positions)} seconds={_format_seconds(keyframe_candidate_seconds)}",
+        max_lines=3,
+    )
+    _append_wrapped_debug_line(lines, "Memory secs before", _format_seconds(memory_seconds_before), style="muted")
+    _append_wrapped_debug_line(lines, "Memory secs after", _format_seconds(memory_seconds_after), style="muted")
+    if parse_error:
+        _append_wrapped_debug_line(lines, "Parse error", parse_error, max_lines=3)
+    lines.append(("", ""))
+    _append_wrapped_debug_line(lines, "Memory before", language_memory_before or "none", max_lines=6)
+    lines.append(("", ""))
+    _append_wrapped_debug_line(lines, "Memory after", language_memory_after or "none", max_lines=8, style="accent")
+    return lines
+
+
+def _append_wrapped_debug_line(
+    lines: list[tuple[str, str]],
+    label: str,
+    value: object,
+    *,
+    style: str = "normal",
+    width: int = 64,
+    max_lines: int | None = None,
+) -> None:
+    text = f"{label}: {value}".strip()
+    wrapped: list[str] = []
+    for raw_line in text.splitlines() or [""]:
+        wrapped.extend(textwrap.wrap(raw_line, width=width) or [""])
+    if max_lines is not None and len(wrapped) > max_lines:
+        wrapped = wrapped[: max_lines - 1] + ["..."]
+    lines.extend((line, style) for line in wrapped)
+
+
+def _draw_debug_text_lines(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    lines: list[tuple[str, str]],
+    *,
+    max_y: int,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+    muted_fill: tuple[int, int, int],
+    accent_fill: tuple[int, int, int],
+) -> None:
+    x, y = xy
+    line_height = _font_line_height(font) + 7
+    for line, style in lines:
+        if y + line_height > max_y:
+            _safe_draw_text(draw, (x, y), "...", font=font, fill=muted_fill)
+            return
+        if not line:
+            y += line_height // 2
+            continue
+        resolved_fill = accent_fill if style == "accent" else muted_fill if style == "muted" else fill
+        _safe_draw_text(draw, (x, y), line, font=font, fill=resolved_fill)
+        y += line_height
+
+
+def _draw_recent_strip(
+    panel: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    *,
+    clips: LoadedVideoClips,
+    selection: ZeroShotClipSelection,
+    valid_recent_length: int,
+    keyframe_positions: set[int],
+    font: ImageFont.ImageFont,
+) -> None:
+    x0, y0, x1, y1 = box
+    _draw_rect(draw, box, fill=(64, 70, 82), width=1)
+    if valid_recent_length <= 0:
+        _safe_draw_text(draw, (x0 + 12, y0 + 12), "No recent frames", font=font, fill=(164, 174, 190))
+        return
+
+    gap = 8
+    label_height = 22
+    thumb_width = max(1, (x1 - x0 - gap * (valid_recent_length - 1)) // valid_recent_length)
+    thumb_height = max(1, y1 - y0 - label_height - 10)
+    for index, frame in enumerate(clips.recent_frames[:valid_recent_length]):
+        thumb_x0 = x0 + index * (thumb_width + gap)
+        thumb_box = (thumb_x0, y0 + 6, thumb_x0 + thumb_width, y0 + 6 + thumb_height)
+        _paste_debug_image(panel, frame.convert("RGB"), thumb_box)
+        position = index + 1
+        if position == valid_recent_length:
+            border = (116, 227, 255)
+        elif position in keyframe_positions:
+            border = (255, 215, 106)
+        else:
+            border = (86, 95, 110)
+        _draw_rect(draw, thumb_box, fill=border, width=3 if position == valid_recent_length else 2)
+        second = selection.recent_seconds[index] if index < len(selection.recent_seconds) else None
+        label = f"{position} | {_format_optional_second(second)}"
+        if position in keyframe_positions:
+            label += " key"
+        _safe_draw_text(draw, (thumb_x0 + 3, y1 - label_height), label, font=font, fill=border)
+
+
+def _paste_debug_image(panel: Image.Image, image: Image.Image, box: tuple[int, int, int, int]) -> None:
+    x0, y0, x1, y1 = box
+    frame = image.copy()
+    frame.thumbnail((x1 - x0, y1 - y0), _resample_lanczos())
+    paste_x = x0 + (x1 - x0 - frame.width) // 2
+    paste_y = y0 + (y1 - y0 - frame.height) // 2
+    panel.paste(frame, (paste_x, paste_y))
+
+
+def _draw_rect(
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    *,
+    fill: tuple[int, int, int],
+    width: int,
+) -> None:
+    for offset in range(width):
+        draw.rectangle(
+            (box[0] + offset, box[1] + offset, box[2] - offset - 1, box[3] - offset - 1),
+            outline=fill,
+        )
+
+
+def _load_debug_font(size: int) -> ImageFont.ImageFont:
+    for path in (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ):
+        try:
+            return ImageFont.truetype(path, size=size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+def _font_line_height(font: ImageFont.ImageFont) -> int:
+    if hasattr(font, "getbbox"):
+        bbox = font.getbbox("Ag")
+        return int(bbox[3] - bbox[1])
+    return int(font.getsize("Ag")[1])
+
+
+def _safe_draw_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    *,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int],
+) -> None:
+    try:
+        draw.text(xy, text, font=font, fill=fill)
+    except UnicodeEncodeError:
+        draw.text(xy, text.encode("ascii", "replace").decode("ascii"), font=font, fill=fill)
+
+
+def _format_seconds(seconds: Iterable[float]) -> str:
+    values = list(seconds)
+    if not values:
+        return "[]"
+    return "[" + ", ".join(_format_second(second) for second in values) + "]"
+
+
+def _format_optional_second(second: float | None) -> str:
+    if second is None:
+        return "unknown"
+    return f"{float(second):.2f}s"
+
+
+def _resample_lanczos() -> int:
+    return getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 
 
 class VideoFrameReader:

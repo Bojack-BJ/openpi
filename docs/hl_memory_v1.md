@@ -188,6 +188,7 @@ python scripts/run_hl_memory_zero_shot.py \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
+  --precision float16 \
   --device cuda \
   --debug-dir cross_task_datasets/debug_rollout_block \
   --output-json cross_task_datasets/debug_rollout_block/summary.json
@@ -202,6 +203,13 @@ python scripts/run_hl_memory_zero_shot.py \
 
 Qwen3.5 依赖较新的 Transformers image-text-to-text 支持。如果你的环境报缺少
 `AutoModelForImageTextToText`，按 Qwen3.5 官方模型卡建议安装更新的 `transformers`。
+
+Qwen3.5 precision 选择：
+
+- 默认是 `--precision bfloat16`。
+- 如果 CUDA GPU 不支持 bf16，runtime 会自动降到 `float16` 并打印 warning。
+- 如果遇到 Qwen3.5 vision `conv3d` 的 `CUDNN_STATUS_NOT_INITIALIZED`，优先显式加 `--precision float16`。
+- 如果仍然失败，再用 `--precision float32` 判断是否是半精度/cuDNN 兼容问题；`float32` 显存占用更高。
 
 Qwen3.5 thinking 控制：
 
@@ -367,6 +375,7 @@ python scripts/run_hl_memory_zero_shot.py \
 - `--video-path` 和 `--left-video-path` / `--right-video-path` 互斥；双视角模式必须同时提供 left 和 right。
 - 双视角模式按同一组秒数从左右视频抽帧，再拼成一张 observation frame；单视角模式直接使用该视频帧。
 - 之后脚本会把帧 resize/pad 成两个定长 clip。
+- 如果传 `--debug-dir`，单次推理会额外保存 `debug_panel.png`，把当前帧、recent 缩略图、memory 和 current task 拼成一张图。
 - 如果传 `--task-config-path`，prompt 会包含 expected primitive sequence，但仍要求模型优先依据当前视频。
 - 第一个 `video` 是 historical memory keyframes clip。
 - 第二个 `video` 是 recent observation clip。
@@ -435,6 +444,7 @@ python scripts/run_hl_memory_zero_shot.py \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /path/to/Qwen3.5-4B \
+  --precision float16 \
   --device cuda \
   --debug-dir /tmp/hl_zero_shot_rollout \
   --output-json /tmp/hl_zero_shot_rollout/summary.json
@@ -462,6 +472,8 @@ rollout 模式会：
 - keyframe memory 会用 `--keyframe-merge-distance-sec` 做时间聚类，选每个 cluster 的中位代表帧，减少重复 memory。
 - 在 `debug_dir/rollout_step_XXX/` 保存每轮实际送入模型的 memory/recent 帧。
 - 在 `debug_dir/rollout_step_XXX/keyframe_candidates/` 保存每轮选中的关键帧。
+- 在 `debug_dir/rollout_step_XXX/debug_panel.png` 保存每轮当前帧、recent 缩略图、memory 和 current task 文本拼图。
+- 在 `debug_dir/rollout_debug.mp4` 保存按 rollout step 串起来的可视化视频，默认 `--debug-video-fps 1.0`。
 - 在 `debug_dir/rollout.jsonl` 保存机器可读逐步记录。
 - 在 `debug_dir/rollout_pretty.json` 额外保存易读版逐步记录。
 - 也可以显式传 `--rollout-jsonl /path/to/rollout.jsonl` 和

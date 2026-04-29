@@ -45,9 +45,16 @@ class BaseHLVLMAdapter:
 
     def load(self, *, model_path: str | None = None, device: str | torch.device = "cpu") -> LoadedHLVLM:
         transformers = _import_transformers()
+        resolved_device = torch.device(device)
         torch_dtype = self._resolve_torch_dtype()
-        if torch.device(device).type == "cpu" and torch_dtype == torch.bfloat16:
+        if resolved_device.type == "cpu" and torch_dtype != torch.float32:
             torch_dtype = torch.float32
+        elif resolved_device.type == "cuda" and torch_dtype == torch.bfloat16 and not _cuda_supports_bfloat16():
+            logging.warning(
+                "CUDA device does not report bfloat16 support; using float16 for HL VLM inference. "
+                "Pass `--precision float16` to request this explicitly."
+            )
+            torch_dtype = torch.float16
         pretrained_path = model_path or self.config.resolved_model_id
         processor = transformers.AutoProcessor.from_pretrained(pretrained_path, trust_remote_code=True)
         model = self._load_model(transformers, pretrained_path, torch_dtype=torch_dtype)
@@ -253,7 +260,11 @@ class BaseHLVLMAdapter:
         )
 
     def _resolve_torch_dtype(self) -> torch.dtype:
-        return torch.bfloat16 if self.config.precision == "bfloat16" else torch.float32
+        if self.config.precision == "bfloat16":
+            return torch.bfloat16
+        if self.config.precision == "float16":
+            return torch.float16
+        return torch.float32
 
     def _generation_max_new_tokens(self) -> int:
         if self.config.enable_thinking:
@@ -455,6 +466,13 @@ def _import_transformers() -> Any:
             "The HL memory adapters require `transformers` to be installed in the active environment."
         ) from exc
     return transformers
+
+
+def _cuda_supports_bfloat16() -> bool:
+    try:
+        return bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+    except RuntimeError:
+        return False
 
 
 def _is_structured_processor_kwargs_error(exc: TypeError) -> bool:
