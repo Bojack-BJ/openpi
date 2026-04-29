@@ -69,7 +69,7 @@ This repo also contains a standalone high-level memory / subtask pipeline under 
   - updated language memory
   - current subtask
   - recent-window keyframe candidate positions
-- A zero-shot inference entrypoint for your own videos is available at
+- A zero-shot inference entrypoint for your own single-view or left/right view videos is available at
   [`scripts/run_hl_memory_zero_shot.py`](scripts/run_hl_memory_zero_shot.py)
 - The same entrypoint also supports interval rollout with `--rollout-interval-sec`, saving per-step raw model output,
   language-memory updates, recent/memory frames, and selected keyframe candidates under `--debug-dir`.

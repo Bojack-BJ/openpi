@@ -169,14 +169,16 @@ Qwen3.5 variant 选择：
 
 ```bash
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /path/to/video.mp4 \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
   --instruction "Fold the shoebox" \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --device cuda
 
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block.mp4 \
+  --left-video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block_left.mp4 \
+  --right-video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block_right.mp4 \
   --instruction "Put the crescent and square blocks into their corresponding slots" \
   --language-memory "Task started." \
   --rollout-interval-sec 2 \
@@ -218,7 +220,8 @@ Qwen3.5 thinking 控制：
 
 ```bash
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /path/to/video.mp4 \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
   --instruction "Put the crescent and square blocks into their corresponding slots" \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_4b \
@@ -245,7 +248,8 @@ python scripts/eval_hl_memory_rollout.py \
   --local-vlm-ckpt-path </path/to/local/hl-memory-checkpoint>
 
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block.mp4 \
+  --left-video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block_left.mp4 \
+  --right-video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block_right.mp4 \
   --instruction "Put the crescent and square blocks into their corresponding slots" \
   --language-memory "Task started." \
   --rollout-interval-sec 2 \
@@ -302,11 +306,27 @@ device: cuda
 
 ## Zero-shot 自定义视频推理
 
-如果你想先不训练，直接看 HL zero-shot 在自己视频上的输出，可以用：
+如果你想先不训练，直接看 HL zero-shot 在自己左右双视角视频上的输出，可以用：
 
 ```bash
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /path/to/video.mp4 \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
+  --instruction "Put all the cans into the basket." \
+  --language-memory "One can has already been placed into the basket." \
+  --recent-end-sec 42 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen2_5_vl \
+  --vlm-hf-model-id Qwen/Qwen2.5-VL-3B-Instruct \
+  --device cuda \
+  --debug-dir /tmp/hl_zero_shot_debug
+```
+
+如果只有单视角视频，也可以用：
+
+```bash
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /path/to/front.mp4 \
   --instruction "Put all the cans into the basket." \
   --language-memory "One can has already been placed into the basket." \
   --recent-end-sec 42 \
@@ -320,7 +340,12 @@ python scripts/run_hl_memory_zero_shot.py \
 视觉输入实际送入 Qwen 的方式：
 
 - 脚本不会把原始 mp4 直接交给模型自由读取。
-- 脚本先按秒抽帧，再 resize/pad 成两个定长 clip。
+- 双视角模式使用 `--left-video-path` 和 `--right-video-path`，两者是对等输入，不存在主视角。
+- 双视角模式里，左视角固定映射为 config 里的 `robot_0`，右视角固定映射为 `robot_1`。
+- 单视角模式使用 `--video-path`，固定映射为 `front`。
+- `--video-path` 和 `--left-video-path` / `--right-video-path` 互斥；双视角模式必须同时提供 left 和 right。
+- 双视角模式按同一组秒数从左右视频抽帧，再拼成一张 observation frame；单视角模式直接使用该视频帧。
+- 之后脚本会把帧 resize/pad 成两个定长 clip。
 - 第一个 `video` 是 historical memory keyframes clip。
 - 第二个 `video` 是 recent observation clip。
 - 每个 clip 内位置按时间从旧到新排列。
@@ -352,11 +377,12 @@ python scripts/run_hl_memory_zero_shot.py \
 
 如果传了 `--debug-dir`，脚本会把实际送入模型的 memory/recent 帧保存出来，方便你直接肉眼检查。
 
-如果想对同一个视频按时间间隔持续 rollout，记录每次 memory 更新和关键帧，可以用：
+如果想对同一组左右视频按时间间隔持续 rollout，记录每次 memory 更新和关键帧，可以用：
 
 ```bash
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /path/to/video.mp4 \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
   --instruction "Fold the shoebox" \
   --language-memory "Task started." \
   --rollout-interval-sec 2 \
@@ -374,7 +400,8 @@ python scripts/run_hl_memory_zero_shot.py \
 
 ```bash
 python scripts/run_hl_memory_zero_shot.py \
-  --video-path /path/to/video.mp4 \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
   --instruction "Fold the shoebox" \
   --language-memory "Task started." \
   --rollout-interval-sec 2 \

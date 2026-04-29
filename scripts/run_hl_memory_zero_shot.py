@@ -17,8 +17,6 @@ from openpi.hl_memory.zero_shot import build_zero_shot_clips_from_video_paths
 from openpi.hl_memory.zero_shot import build_zero_shot_sample
 from openpi.hl_memory.zero_shot import keyframe_candidate_seconds
 from openpi.hl_memory.zero_shot import parse_seconds_argument
-from openpi.hl_memory.zero_shot import parse_video_paths_argument
-from openpi.hl_memory.zero_shot import read_video_duration_sec
 from openpi.hl_memory.zero_shot import read_video_paths_duration_sec
 from openpi.hl_memory.zero_shot import save_keyframe_candidate_frames
 from openpi.hl_memory.zero_shot import save_zero_shot_debug_frames
@@ -27,8 +25,10 @@ from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
 
 @dataclasses.dataclass
 class ZeroShotArgs:
-    video_path: pathlib.Path
     instruction: str
+    video_path: pathlib.Path | None = None
+    left_video_path: pathlib.Path | None = None
+    right_video_path: pathlib.Path | None = None
     config_yaml: pathlib.Path | None = None
     model_path: str | None = None
     local_vlm_ckpt_path: pathlib.Path | None = None
@@ -46,8 +46,6 @@ class ZeroShotArgs:
     rollout_end_sec: float | None = None
     keyframe_merge_distance_sec: float = 2.0
     auto_memory: bool = True
-    view_name: str = "front"
-    extra_video_paths: str | None = None
     vlm_backend: str = "qwen2_5_vl"
     vlm_variant: str | None = None
     vlm_hf_model_id: str | None = None
@@ -65,6 +63,7 @@ class ZeroShotArgs:
 
 
 def main(args: ZeroShotArgs) -> None:
+    _resolve_video_paths(args)
     config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -127,7 +126,7 @@ def _run_single_prediction(
         auto_memory=args.auto_memory,
     )
     sample = build_zero_shot_sample(
-        video_path=args.video_path,
+        video_path=_sample_video_path(args),
         instruction=args.instruction,
         language_memory=args.language_memory,
         memory_seconds=selection.memory_seconds,
@@ -147,7 +146,6 @@ def _run_single_prediction(
     )
 
     payload = {
-        "video_path": str(args.video_path),
         "video_paths": _payload_video_paths_from_args(args),
         "model_path": args.model_path,
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
@@ -193,11 +191,7 @@ def _run_rollout(
         raise ValueError("`--recent-seconds` is not supported with interval rollout; use `--recent-step-sec` instead.")
 
     video_paths = _resolve_video_paths(args)
-    duration_sec = (
-        read_video_duration_sec(args.video_path)
-        if len(video_paths) == 1
-        else read_video_paths_duration_sec(video_paths)
-    )
+    duration_sec = read_video_paths_duration_sec(video_paths)
     rollout_seconds = build_rollout_end_seconds(
         duration_sec,
         interval_sec=float(args.rollout_interval_sec),
@@ -221,7 +215,7 @@ def _run_rollout(
             auto_memory=False,
         )
         sample = build_zero_shot_sample(
-            video_path=args.video_path,
+            video_path=_sample_video_path(args),
             instruction=args.instruction,
             language_memory=language_memory_before,
             memory_seconds=selection.memory_seconds,
@@ -293,7 +287,6 @@ def _run_rollout(
         _write_pretty_json(args.rollout_pretty_json, steps)
 
     return {
-        "video_path": str(args.video_path),
         "video_paths": _payload_video_paths_from_args(args),
         "model_path": args.model_path,
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
@@ -322,8 +315,7 @@ def _build_clips_from_args(
     memory_seconds: tuple[float, ...] | list[float] | None = None,
     auto_memory: bool,
 ):
-    video_paths = _resolve_video_paths(args)
-    if len(video_paths) == 1:
+    if args.video_path is not None:
         return build_zero_shot_clips_from_video(
             args.video_path,
             config=config,
@@ -334,7 +326,7 @@ def _build_clips_from_args(
             auto_memory=auto_memory,
         )
     return build_zero_shot_clips_from_video_paths(
-        video_paths,
+        _resolve_video_paths(args),
         config=config,
         recent_end_sec=recent_end_sec,
         recent_step_sec=recent_step_sec,
@@ -345,17 +337,40 @@ def _build_clips_from_args(
 
 
 def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
-    extra_video_paths = parse_video_paths_argument(args.extra_video_paths)
-    view_name = args.view_name.strip()
-    if not view_name:
-        raise ValueError("`view_name` must be non-empty.")
-    if view_name in extra_video_paths:
-        raise ValueError(f"`view_name={view_name}` conflicts with an entry in `extra_video_paths`.")
-    return {view_name: args.video_path, **extra_video_paths}
+    has_single_video = args.video_path is not None
+    has_left_video = args.left_video_path is not None
+    has_right_video = args.right_video_path is not None
+
+    if has_single_video:
+        if has_left_video or has_right_video:
+            raise ValueError("Use either `--video-path` or `--left-video-path` + `--right-video-path`, not both.")
+        assert args.video_path is not None
+        return {"front": args.video_path}
+
+    if has_left_video != has_right_video:
+        raise ValueError("Dual-view mode requires both `--left-video-path` and `--right-video-path`.")
+
+    if not has_left_video:
+        raise ValueError("Provide either `--video-path` or both `--left-video-path` and `--right-video-path`.")
+
+    assert args.left_video_path is not None
+    assert args.right_video_path is not None
+    return {
+        "robot_0": args.left_video_path,
+        "robot_1": args.right_video_path,
+    }
 
 
 def _payload_video_paths_from_args(args: ZeroShotArgs) -> dict[str, str]:
     return {view_name: str(path) for view_name, path in _resolve_video_paths(args).items()}
+
+
+def _sample_video_path(args: ZeroShotArgs) -> pathlib.Path:
+    if args.video_path is not None:
+        return args.video_path
+    if args.left_video_path is None or args.right_video_path is None:
+        raise ValueError("Cannot build sample path without a valid single-view or dual-view input.")
+    return pathlib.Path(f"{args.left_video_path.stem}__{args.right_video_path.stem}")
 
 
 def _write_jsonl(path: pathlib.Path, rows: list[dict[str, object]]) -> None:
