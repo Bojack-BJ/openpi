@@ -312,6 +312,7 @@ device: cuda
 python scripts/run_hl_memory_zero_shot.py \
   --left-video-path /path/to/left.mp4 \
   --right-video-path /path/to/right.mp4 \
+  --task-config-path /path/to/task_config.json \
   --instruction "Put all the cans into the basket." \
   --language-memory "One can has already been placed into the basket." \
   --recent-end-sec 42 \
@@ -337,6 +338,26 @@ python scripts/run_hl_memory_zero_shot.py \
   --debug-dir /tmp/hl_zero_shot_debug
 ```
 
+如果你已经有人工写好的 manipulation 分段配置，建议传 `--task-config-path`：
+
+```json
+{
+  "task_description": "Building block recognition and placement: crescent and square",
+  "steps": [
+    "Approach the square block with the left hand",
+    "Pick up the square block with the left hand",
+    "Move the square block above the square target slot with the left hand and release the left gripper",
+    "Move the left hand back to the initial position",
+    "Approach the crescent block with the right hand",
+    "Pick up the crescent block with the right hand",
+    "Move the crescent block above the crescent target slot with the right hand and release the right gripper",
+    "Move the right hand back to the initial position"
+  ]
+}
+```
+
+这个配置只作为 nominal plan 帮助 VLM 分段，不会强制覆盖视觉判断。如果视频里实际行为和 plan 不一致，prompt 会要求模型按当前视觉证据纠错。
+
 视觉输入实际送入 Qwen 的方式：
 
 - 脚本不会把原始 mp4 直接交给模型自由读取。
@@ -346,6 +367,7 @@ python scripts/run_hl_memory_zero_shot.py \
 - `--video-path` 和 `--left-video-path` / `--right-video-path` 互斥；双视角模式必须同时提供 left 和 right。
 - 双视角模式按同一组秒数从左右视频抽帧，再拼成一张 observation frame；单视角模式直接使用该视频帧。
 - 之后脚本会把帧 resize/pad 成两个定长 clip。
+- 如果传 `--task-config-path`，prompt 会包含 expected primitive sequence，但仍要求模型优先依据当前视频。
 - 第一个 `video` 是 historical memory keyframes clip。
 - 第二个 `video` 是 recent observation clip。
 - 每个 clip 内位置按时间从旧到新排列。

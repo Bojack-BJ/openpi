@@ -143,6 +143,20 @@ class BaseHLVLMAdapter:
             "In each clip, positions are ordered from oldest to newest.\n"
             "Use visual evidence first. Treat language memory as a compact progress hint, and correct it when it "
             "conflicts with the current visual evidence.\n"
+            "Manipulation segmentation rules:\n"
+            "- Choose the current subtask from the visible robot behavior, not from the first object mentioned in "
+            "the instruction or previous memory.\n"
+            "- A low-level subtask should be one primitive: approach, pick/grasp, transport above target, "
+            "place/release, retreat/return, or transition to the next object.\n"
+            "- Identify the active hand and active object from recent frames: the hand moving toward an object, "
+            "contacting it, holding it, or releasing it at a target. If the active hand is handling the square block, "
+            "use square block as `target_query` even if the instruction also mentions a crescent block.\n"
+            "- For multi-object tasks, mark an object completed only after it is visibly released at its target. "
+            "Do not advance to the next object until release plus return/transition is visually supported.\n"
+            "- Use the nominal plan, if included in the task instruction, only as a segmentation prior. If the "
+            "recent video contradicts that plan, correct to the observed manipulation step.\n"
+            "- `target_query` should name the manipulated object or object part; `goal_query` should name the target "
+            "slot/bin/plate/placement area. Do not put the full task instruction in either field.\n"
             "Predict the current low-level subtask and nominate recent frames worth remembering after they leave "
             "the recent window.\n"
             "Return exactly one JSON object with keys "
@@ -194,16 +208,21 @@ class BaseHLVLMAdapter:
         return sample.target_prediction().to_json()
 
     def _fallback_prediction(self, sample: ExportedHLMemorySample) -> HLMemoryPrediction:
-        instruction = sample.instruction.strip() or "continue the task"
+        previous_fields = _parse_ll_memory_fields(sample.language_memory)
+        objective = previous_fields.get("current objective", "").strip()
+        if _is_usable_fallback_objective(objective, sample.instruction):
+            current_subtask = objective
+        else:
+            current_subtask = "continue the observed manipulation step"
         memory = (
             "Task progress: Continue the task using the current visual observations.\n"
-            f"Current objective: {instruction}\n"
+            f"Current objective: {current_subtask}\n"
             "Relevant objects: none\n"
             "Notes: Use current visual observations."
         )
         return HLMemoryPrediction(
             updated_language_memory=memory,
-            current_subtask=instruction,
+            current_subtask=current_subtask,
             keyframe_candidate_positions=(),
             phase="unknown",
             target_query="",
@@ -366,3 +385,25 @@ def _import_transformers() -> Any:
             "The HL memory adapters require `transformers` to be installed in the active environment."
         ) from exc
     return transformers
+
+
+def _parse_ll_memory_fields(memory: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in memory.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    return fields
+
+
+def _is_usable_fallback_objective(objective: str, instruction: str) -> bool:
+    normalized_objective = " ".join(objective.lower().split())
+    normalized_instruction = " ".join(instruction.lower().split())
+    primary_instruction = instruction.strip().splitlines()[0] if instruction.strip() else ""
+    normalized_primary_instruction = " ".join(primary_instruction.lower().split())
+    if not normalized_objective:
+        return False
+    if normalized_objective in {"continue the task", "task started"}:
+        return False
+    return normalized_objective not in {normalized_instruction, normalized_primary_instruction}

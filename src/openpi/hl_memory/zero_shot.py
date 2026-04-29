@@ -620,7 +620,12 @@ def _progress_sentence(previous_progress: str, current_subtask: str) -> str:
     normalized_subtask = _normalize_text(current_subtask)
     if normalized_subtask and normalized_subtask in normalized_progress:
         return previous_progress
-    return f"{previous_progress.rstrip('.')} The current focus is: {current_subtask}."
+    if (
+        "current focus is:" in normalized_progress
+        or "continue the task using the current visual observations" in normalized_progress
+    ):
+        return f"The robot is working on: {current_subtask}."
+    return previous_progress
 
 
 def _merge_relevant_objects(*values: str) -> str:

@@ -29,6 +29,7 @@ class ZeroShotArgs:
     video_path: pathlib.Path | None = None
     left_video_path: pathlib.Path | None = None
     right_video_path: pathlib.Path | None = None
+    task_config_path: pathlib.Path | None = None
     config_yaml: pathlib.Path | None = None
     model_path: str | None = None
     local_vlm_ckpt_path: pathlib.Path | None = None
@@ -64,6 +65,8 @@ class ZeroShotArgs:
 
 def main(args: ZeroShotArgs) -> None:
     _resolve_video_paths(args)
+    if args.task_config_path is not None:
+        _load_task_config(args.task_config_path)
     config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -127,7 +130,7 @@ def _run_single_prediction(
     )
     sample = build_zero_shot_sample(
         video_path=_sample_video_path(args),
-        instruction=args.instruction,
+        instruction=_instruction_with_task_plan(args),
         language_memory=args.language_memory,
         memory_seconds=selection.memory_seconds,
         recent_seconds=selection.recent_seconds,
@@ -151,6 +154,7 @@ def _run_single_prediction(
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
         "instruction": args.instruction,
+        "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
         "language_memory": args.language_memory,
         "duration_sec": selection.duration_sec,
         "memory_seconds": list(selection.memory_seconds),
@@ -216,7 +220,7 @@ def _run_rollout(
         )
         sample = build_zero_shot_sample(
             video_path=_sample_video_path(args),
-            instruction=args.instruction,
+            instruction=_instruction_with_task_plan(args),
             language_memory=language_memory_before,
             memory_seconds=selection.memory_seconds,
             recent_seconds=selection.recent_seconds,
@@ -292,6 +296,7 @@ def _run_rollout(
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
         "instruction": args.instruction,
+        "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
         "initial_language_memory": args.language_memory,
         "duration_sec": duration_sec,
         "rollout_interval_sec": args.rollout_interval_sec,
@@ -371,6 +376,49 @@ def _sample_video_path(args: ZeroShotArgs) -> pathlib.Path:
     if args.left_video_path is None or args.right_video_path is None:
         raise ValueError("Cannot build sample path without a valid single-view or dual-view input.")
     return pathlib.Path(f"{args.left_video_path.stem}__{args.right_video_path.stem}")
+
+
+def _instruction_with_task_plan(args: ZeroShotArgs) -> str:
+    instruction = args.instruction.strip()
+    if args.task_config_path is None:
+        return instruction
+
+    task_config = _load_task_config(args.task_config_path)
+    description = str(task_config.get("task_description", "")).strip()
+    steps = task_config.get("steps", [])
+    if not isinstance(steps, list):
+        raise ValueError(f"`steps` must be a list in task config: {args.task_config_path}")
+    rendered_steps = [
+        f"{index}. {str(step).strip()}"
+        for index, step in enumerate(steps, start=1)
+        if str(step).strip()
+    ]
+    plan_lines = [
+        instruction,
+        "",
+        (
+            "Nominal manipulation plan from task config. Use it as a segmentation prior, "
+            "not as a substitute for visual evidence."
+        ),
+    ]
+    if description:
+        plan_lines.append(f"Task description: {description}")
+    if rendered_steps:
+        plan_lines.append("Expected primitive sequence:")
+        plan_lines.extend(rendered_steps)
+    plan_lines.append(
+        "If the recent video shows a different active hand/object/phase than this nominal plan, "
+        "report the observed step."
+    )
+    return "\n".join(plan_lines)
+
+
+def _load_task_config(path: pathlib.Path) -> dict[str, object]:
+    with path.open() as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError(f"Task config must be a JSON object: {path}")
+    return data
 
 
 def _write_jsonl(path: pathlib.Path, rows: list[dict[str, object]]) -> None:
