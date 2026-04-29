@@ -174,6 +174,21 @@ python scripts/run_hl_memory_zero_shot.py \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --device cuda
+
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block.mp4 \
+  --instruction "Put the crescent and square blocks into their corresponding slots" \
+  --language-memory "Task started." \
+  --rollout-interval-sec 2 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 20 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
+  --device cuda \
+  --debug-dir cross_task_datasets/debug_rollout_block \
+  --output-json cross_task_datasets/debug_rollout_block/summary.json
 ```
 
 也可以用简写：
@@ -201,6 +216,20 @@ python scripts/eval_hl_memory_rollout.py \
 python scripts/eval_hl_memory_rollout.py \
   --dataset-dir <out_dir> \
   --local-vlm-ckpt-path </path/to/local/hl-memory-checkpoint>
+
+python scripts/run_hl_memory_zero_shot.py \
+  --video-path /root/Users/lixiaotong/openpi/cross_task_datasets/video_block.mp4 \
+  --instruction "Put the crescent and square blocks into their corresponding slots" \
+  --language-memory "Task started." \
+  --rollout-interval-sec 2 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 20 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen2_5_vl \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct \
+  --device cuda \
+  --debug-dir cross_task_datasets/debug_rollout_block \
+  --output-json cross_task_datasets/debug_rollout_block/summary.json
 ```
 
 同样支持：
