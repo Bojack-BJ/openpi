@@ -373,8 +373,9 @@ python scripts/run_hl_memory_zero_shot.py \
 - 双视角模式里，左视角固定映射为 config 里的 `robot_0`，右视角固定映射为 `robot_1`。
 - 单视角模式使用 `--video-path`，固定映射为 `front`。
 - `--video-path` 和 `--left-video-path` / `--right-video-path` 互斥；双视角模式必须同时提供 left 和 right。
-- 双视角模式按同一组秒数从左右视频抽帧，再拼成一张 observation frame；单视角模式直接使用该视频帧。
-- 之后脚本会把帧 resize/pad 成两个定长 clip。
+- 双视角模式按同一组秒数从左右视频抽帧，再横向拼成一张 observation frame；VLM 看到的是拼接后的单路 video clip。
+- 单视角模式直接使用该视频帧。
+- 之后脚本会把帧等比缩放并 padding 成两个定长 clip，不会把宽图强行拉伸成方图。
 - 如果传 `--debug-dir`，单次推理会额外保存 `debug_panel.png`，把当前帧、recent 缩略图、memory 和 current task 拼成一张图。
 - 如果传 `--task-config-path`，prompt 会包含 expected primitive sequence，但仍要求模型优先依据当前视频。
 - 第一个 `video` 是 historical memory keyframes clip。

@@ -7,6 +7,7 @@ from PIL import Image
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
+from openpi.hl_memory.data import build_loaded_video_clips_from_frames
 from openpi.hl_memory.data import load_video_clips_for_sample
 
 
@@ -54,3 +55,23 @@ def test_load_video_clips_for_sample_pads_and_tracks_valid_lengths():
         assert len(clips.recent_frames) == 4
         assert clips.memory_frames[0].size == (8, 8)
         assert clips.recent_frames[0].size == (8, 8)
+
+
+def test_build_loaded_video_clips_preserves_aspect_ratio_with_padding():
+    config = HLMemoryConfig(
+        recent_frames_length=1,
+        memory_length=1,
+        frame_height=10,
+        frame_width=10,
+    )
+    wide_frame = Image.new("RGB", (20, 10), color=(255, 0, 0))
+
+    clips = build_loaded_video_clips_from_frames(
+        memory_frames=(),
+        recent_frames=(wide_frame,),
+        config=config,
+    )
+
+    assert clips.recent_frames[0].size == (10, 10)
+    assert clips.recent_frames[0].getpixel((5, 5)) == (255, 0, 0)
+    assert clips.recent_frames[0].getpixel((5, 0)) == (0, 0, 0)

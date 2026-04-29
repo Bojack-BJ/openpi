@@ -8,6 +8,7 @@ import json
 import pathlib
 
 from PIL import Image
+from PIL import ImageOps
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.labels import SubtaskAnnotation
@@ -276,7 +277,7 @@ def _pad_clip_frames(
     if target_length <= 0:
         raise ValueError("target_length must be positive.")
     normalized_frames = [
-        frame.resize((frame_width, frame_height), Image.Resampling.BILINEAR)
+        _resize_with_pad(frame, frame_width=frame_width, frame_height=frame_height)
         for frame in frames[-target_length:]
     ]
     if not allow_single_frame_fallback and len(normalized_frames) < target_length:
@@ -293,3 +294,12 @@ def _pad_clip_frames(
 
 def _blank_frame(*, frame_width: int, frame_height: int) -> Image.Image:
     return Image.new("RGB", (frame_width, frame_height), color=(0, 0, 0))
+
+
+def _resize_with_pad(frame: Image.Image, *, frame_width: int, frame_height: int) -> Image.Image:
+    contained = ImageOps.contain(frame.convert("RGB"), (frame_width, frame_height))
+    canvas = _blank_frame(frame_width=frame_width, frame_height=frame_height)
+    offset_x = (frame_width - contained.width) // 2
+    offset_y = (frame_height - contained.height) // 2
+    canvas.paste(contained, (offset_x, offset_y))
+    return canvas
