@@ -404,29 +404,81 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_")
 
 
+def _candidate_paths(path_value: Any, dataset_root: Path | None) -> list[Path]:
+    path = Path(str(path_value))
+    candidates = [path]
+    if dataset_root is not None and not path.is_absolute():
+        candidates.append(dataset_root / path)
+    return candidates
+
+
+def _decode_video_frame(path: Path, *, frame_index: Any = None, timestamp: Any = None) -> np.ndarray | None:
+    try:
+        import cv2
+    except Exception:
+        return None
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        return None
+    try:
+        target_frame = None
+        if frame_index is not None:
+            target_frame = int(frame_index)
+        elif timestamp is not None:
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps > 0:
+                target_frame = int(round(float(timestamp) * fps))
+        if target_frame is not None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, max(target_frame, 0))
+        ok, frame_bgr = cap.read()
+        if not ok:
+            return None
+        return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    finally:
+        cap.release()
+
+
+def _load_image_path(path: Path, *, frame_index: Any = None, timestamp: Any = None) -> np.ndarray | None:
+    if path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+        return _decode_video_frame(path, frame_index=frame_index, timestamp=timestamp)
+    try:
+        from PIL import Image
+
+        return np.asarray(Image.open(path).convert("RGB"))
+    except Exception:
+        return None
+
+
 def _image_array(value: Any, dataset_root: Path | None = None) -> np.ndarray | None:
     if isinstance(value, Mapping):
-        if isinstance(value.get("bytes"), bytes):
+        if isinstance(value.get("bytes"), (bytes, bytearray, memoryview)):
             try:
                 from PIL import Image
 
-                return np.asarray(Image.open(io.BytesIO(value["bytes"])).convert("RGB"))
+                return np.asarray(Image.open(io.BytesIO(bytes(value["bytes"]))).convert("RGB"))
             except Exception:
                 return None
         if value.get("path") is not None:
-            image_path = Path(str(value["path"]))
-            candidates = [image_path]
-            if dataset_root is not None and not image_path.is_absolute():
-                candidates.append(dataset_root / image_path)
-            for candidate in candidates:
+            for candidate in _candidate_paths(value["path"], dataset_root):
                 if not candidate.exists():
                     continue
-                try:
-                    from PIL import Image
+                image = _load_image_path(
+                    candidate,
+                    frame_index=value.get("frame_index"),
+                    timestamp=value.get("timestamp"),
+                )
+                if image is not None:
+                    return image
+        return None
 
-                    return np.asarray(Image.open(candidate).convert("RGB"))
-                except Exception:
-                    return None
+    if isinstance(value, (str, Path)):
+        for candidate in _candidate_paths(value, dataset_root):
+            if not candidate.exists():
+                continue
+            image = _load_image_path(candidate)
+            if image is not None:
+                return image
         return None
 
     if hasattr(value, "__array__") and value.__class__.__module__.startswith("PIL"):
@@ -456,6 +508,21 @@ def _image_array(value: Any, dataset_root: Path | None = None) -> np.ndarray | N
     return array.astype(np.uint8, copy=False)
 
 
+def _iter_preview_candidates(prefix: str, value: Any) -> Iterable[tuple[str, Any]]:
+    lowered = prefix.lower()
+    is_preview_key = prefix and ("image" in lowered or "mask" in lowered)
+    if isinstance(value, Mapping):
+        if is_preview_key and ("path" in value or "bytes" in value):
+            yield prefix, value
+            return
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            yield from _iter_preview_candidates(child_prefix, child)
+        return
+    if is_preview_key:
+        yield prefix, value
+
+
 def _save_previews(
     sample: Mapping[str, Any],
     sample_index: int,
@@ -470,13 +537,14 @@ def _save_previews(
 
     preview_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
-    for key, value in _flatten("", sample):
-        lowered = key.lower()
-        if "image" not in lowered and "mask" not in lowered:
+    seen: set[str] = set()
+    for key, value in _iter_preview_candidates("", sample):
+        if key in seen:
             continue
         array = _image_array(value, dataset_root=dataset_root)
         if array is None:
             continue
+        seen.add(key)
         path = preview_dir / f"sample_{sample_index:06d}_{_safe_name(key)}.png"
         Image.fromarray(array).save(path)
         paths.append(path)
