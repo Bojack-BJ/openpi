@@ -90,6 +90,10 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional episode-level subtask segmentation JSON. If set, the LeRobot data loader will attach
+    # a frame-level "subtask" field before the normal repack/model transforms.
+    subtask_segments_path: str | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -773,6 +777,188 @@ class FastUMIdualData14DRPYConfig(DataConfigFactory):
                     mask=None,
                 ),
 
+                fastumi_policy.FastUMIOutputs(
+                    original_action_dim=14,
+                ),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+        keys: Sequence[str] = ("action",)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
+    """Single-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
+
+    overlay_alpha: float = 0.35
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack = _transforms.Group(
+            inputs=[
+                _transforms.InjectOptionalGuidanceFields(
+                    image_to_mask_paths={
+                        "observation.images.front": "observation.masks.front_mask",
+                    },
+                ),
+                _transforms.RepackTransform(
+                    {
+                        "state": "observation.state",
+                        "actions": "action",
+                        "image": {"front": "observation.images.front"},
+                        "mask": {"front": "observation.masks.front_mask"},
+                        "subtask": "subtask",
+                        "prompt": "prompt",
+                    }
+                ),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                _transforms.ToNumpy(),
+                _transforms.OverlayMasksOnImages(
+                    image_to_mask_keys={"front": "front"},
+                    alpha=self.overlay_alpha,
+                ),
+                _transforms.ComposePromptWithSubtask(),
+                fastumi_policy.FastUMIInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                ),
+                _transforms.ChunkRelDeltaPoseRPY(
+                    pos_slice=slice(0, 3),
+                    quat_slice=slice(3, 7),
+                    grip_slice=slice(7, 8),
+                    action_key="actions",
+                    degrees=True,
+                    include_gripper=True,
+                    gripper_as_delta=True,
+                    mask=None,
+                ),
+                _transforms.PadStatesAndActions(
+                    model_action_dim=model_config.action_dim,
+                ),
+            ],
+            outputs=[
+                _transforms.SliceActions(
+                    dim=7,
+                    action_key="actions",
+                ),
+                _transforms.ChunkRelDeltaPoseRPYInverse(
+                    pos_slice=slice(0, 3),
+                    quat_slice=slice(3, 7),
+                    grip_slice=slice(7, 8),
+                    action_key="actions",
+                    degrees=True,
+                    include_gripper=True,
+                    gripper_as_delta=True,
+                    euler_order="xyz",
+                    mask=None,
+                ),
+                fastumi_policy.FastUMIOutputs(
+                    original_action_dim=7,
+                ),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+        keys: Sequence[str] = ("action",)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
+    """Dual-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
+
+    overlay_alpha: float = 0.35
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack = _transforms.Group(
+            inputs=[
+                _transforms.InjectOptionalGuidanceFields(
+                    image_to_mask_paths={
+                        "observation.images.robot_0_image": "observation.masks.robot_0_mask",
+                        "observation.images.robot_1_image": "observation.masks.robot_1_mask",
+                    },
+                ),
+                _transforms.RepackTransform(
+                    {
+                        "state": "observation.state",
+                        "actions": "action",
+                        "image": {
+                            "robot_0": "observation.images.robot_0_image",
+                            "robot_1": "observation.images.robot_1_image",
+                        },
+                        "mask": {
+                            "robot_0": "observation.masks.robot_0_mask",
+                            "robot_1": "observation.masks.robot_1_mask",
+                        },
+                        "subtask": "subtask",
+                        "prompt": "prompt",
+                    }
+                ),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                _transforms.ToNumpy(),
+                _transforms.OverlayMasksOnImages(
+                    image_to_mask_keys={
+                        "robot_0": "robot_0",
+                        "robot_1": "robot_1",
+                    },
+                    alpha=self.overlay_alpha,
+                ),
+                _transforms.ComposePromptWithSubtask(),
+                fastumi_policy.FastUMIInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                ),
+                _transforms.ChunkRelDeltaRPYBimanual(
+                    left_state_slice=slice(0, 8),
+                    right_state_slice=slice(8, 16),
+                    left_action_slice=slice(0, 8),
+                    right_action_slice=slice(8, 16),
+                    action_key="actions",
+                    gripper_as_delta=True,
+                    degrees=True,
+                    mask=None,
+                ),
+                _transforms.PadStatesAndActions(
+                    model_action_dim=model_config.action_dim,
+                ),
+            ],
+            outputs=[
+                _transforms.SliceActions(
+                    dim=14,
+                    action_key="actions",
+                ),
+                _transforms.ChunkRelDeltaRPYInverseBimanual(
+                    left_state_slice=slice(0, 8),
+                    right_state_slice=slice(8, 16),
+                    action_key="actions",
+                    gripper_as_delta=True,
+                    degrees=True,
+                    euler_order="xyz",
+                    mask=None,
+                ),
                 fastumi_policy.FastUMIOutputs(
                     original_action_dim=14,
                 ),
@@ -2048,6 +2234,32 @@ _CONFIGS = [
         num_workers=32,
         qwen3_5_remat_mode="linear_only",
         ),
+    TrainConfig(
+        name="toy_block_placement_Ba_qwen3_5_2b_400m_guided",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_2B,
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        data=FastUMIdualData14DRPYGuidedConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            assets=AssetsConfig(
+                assets_dir="./assets/20260312H081Ba_toy_block",
+                asset_id="fastumi/20260312H081Ba_toy_block",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                subtask_segments_path="subtask_segments.json",
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_2B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        qwen3_5_remat_mode="linear_only",
+    ),
     TrainConfig(
         name="unplug_network_cable",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
