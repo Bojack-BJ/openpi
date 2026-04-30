@@ -11,7 +11,12 @@ Examples:
         --dataset-root /root/Users/dataset/lerobot_home/fastumi/sponge_visual_guided \
         --sample-indices 0,100,-1 \
         --preview-dir /tmp/lerobot_preview
-    
+        
+    # meta-data-only mode:
+    python dataprocess_new/inspect_lerobot_dataset.py \
+        --dataset-root /root/Users/dataset/lerobot_home/fastumi/sponge_visual_guided \
+        --metadata-only
+    # with image preview:
     python dataprocess_new/inspect_lerobot_dataset.py \
         --dataset-root /root/Users/dataset/lerobot_home/fastumi/sponge_visual_guided \
         --episodes 3 \
