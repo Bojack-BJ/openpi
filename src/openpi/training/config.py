@@ -2261,6 +2261,95 @@ _CONFIGS = [
         qwen3_5_remat_mode="linear_only",
     ),
     TrainConfig(
+        name="sponge_visual_guided_pi0",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_pi05",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_qwen2_5_3b_400m",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(LOCAL_QWEN_2_5_3B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_qwen3_5_2b_400m",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_2B,
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_2B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        qwen3_5_remat_mode="linear_only",
+    ),
+    TrainConfig(
         name="unplug_network_cable",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(),
