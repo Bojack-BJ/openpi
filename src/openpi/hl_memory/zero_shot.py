@@ -243,6 +243,7 @@ def build_zero_shot_clips_from_video_paths(
         config=config,
         memory_valid_length=len(memory_frames),
         recent_valid_length=len(recent_frames),
+        preserve_input_size=True,
     )
     ordered_paths = tuple(sorted(resolved_video_paths.items()))
     selection = ZeroShotClipSelection(

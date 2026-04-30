@@ -75,3 +75,22 @@ def test_build_loaded_video_clips_preserves_aspect_ratio_with_padding():
     assert clips.recent_frames[0].size == (10, 10)
     assert clips.recent_frames[0].getpixel((5, 5)) == (255, 0, 0)
     assert clips.recent_frames[0].getpixel((5, 0)) == (0, 0, 0)
+
+
+def test_build_loaded_video_clips_can_preserve_input_frame_size():
+    config = HLMemoryConfig(
+        recent_frames_length=1,
+        memory_length=1,
+        frame_height=10,
+        frame_width=10,
+    )
+    wide_frame = Image.new("RGB", (20, 10), color=(255, 0, 0))
+
+    clips = build_loaded_video_clips_from_frames(
+        memory_frames=(),
+        recent_frames=(wide_frame,),
+        config=config,
+        preserve_input_size=True,
+    )
+
+    assert clips.recent_frames[0].size == (20, 10)

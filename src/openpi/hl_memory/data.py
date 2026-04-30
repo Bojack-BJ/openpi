@@ -226,6 +226,7 @@ def build_loaded_video_clips_from_frames(
     config: HLMemoryConfig,
     memory_valid_length: int | None = None,
     recent_valid_length: int | None = None,
+    preserve_input_size: bool = False,
 ) -> LoadedVideoClips:
     memory_frames = list(memory_frames)
     recent_frames = list(recent_frames)
@@ -239,18 +240,27 @@ def build_loaded_video_clips_from_frames(
         len(recent_frames),
         config.recent_frames_length,
     )
+    frame_width = config.frame_width
+    frame_height = config.frame_height
+    if preserve_input_size:
+        reference_frame = _reference_frame(
+            recent_frames[:resolved_recent_valid_length],
+            memory_frames[:resolved_memory_valid_length],
+        )
+        if reference_frame is not None:
+            frame_width, frame_height = reference_frame.size
     padded_memory_frames = _pad_clip_frames(
         memory_frames[:resolved_memory_valid_length],
         target_length=config.memory_length,
-        frame_width=config.frame_width,
-        frame_height=config.frame_height,
+        frame_width=frame_width,
+        frame_height=frame_height,
         allow_single_frame_fallback=config.allow_single_frame_fallback,
     )
     padded_recent_frames = _pad_clip_frames(
         recent_frames[:resolved_recent_valid_length],
         target_length=config.recent_frames_length,
-        frame_width=config.frame_width,
-        frame_height=config.frame_height,
+        frame_width=frame_width,
+        frame_height=frame_height,
         allow_single_frame_fallback=config.allow_single_frame_fallback,
     )
     return LoadedVideoClips(
@@ -294,6 +304,13 @@ def _pad_clip_frames(
 
 def _blank_frame(*, frame_width: int, frame_height: int) -> Image.Image:
     return Image.new("RGB", (frame_width, frame_height), color=(0, 0, 0))
+
+
+def _reference_frame(*frame_groups: list[Image.Image]) -> Image.Image | None:
+    for frames in frame_groups:
+        if frames:
+            return frames[0]
+    return None
 
 
 def _resize_with_pad(frame: Image.Image, *, frame_width: int, frame_height: int) -> Image.Image:

@@ -138,6 +138,45 @@ class BaseHLVLMAdapter:
                 parse_error=parse_error,
             )
 
+    def generate_image_text_response(
+        self,
+        loaded: LoadedHLVLM,
+        *,
+        system_prompt: str,
+        user_text: str,
+        images: list[Any],
+        device: str | torch.device,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        rendered = self._render_image_text_messages(
+            loaded.processor,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            image_count=len(images),
+        )
+        inputs = self._encode_image_text_processor_inputs(loaded.processor, rendered, images)
+        input_ids = inputs["input_ids"].to(device)
+        generation_inputs = {
+            key: value.to(device)
+            for key, value in inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+        generation_kwargs: dict[str, Any] = {}
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = pad_token_id
+        generated_ids = loaded.model.generate(
+            **generation_inputs,
+            max_new_tokens=max_new_tokens or self._generation_max_new_tokens(),
+            do_sample=False,
+            **generation_kwargs,
+        )
+        generated_suffix = generated_ids[:, input_ids.shape[-1] :]
+        return tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
+
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
         thinking_instruction = (
@@ -152,8 +191,10 @@ class BaseHLVLMAdapter:
             "The first clip contains selected historical keyframes: sparse frames of particular importance from "
             "earlier actions the robot has executed.\n"
             "The second clip contains the recent observation window: the most recent actions the robot has executed.\n"
-            f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
-            f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+            f"The historical memory clip has {clips.memory_valid_length} valid frames out of "
+            f"{self.config.memory_length}.\n"
+            f"The recent observation clip has {clips.recent_valid_length} valid frames out of "
+            f"{self.config.recent_frames_length}.\n"
             "In each clip, positions are ordered from oldest to newest.\n"
             f"In the recent observation clip, position 1 is the oldest valid recent frame and position "
             f"{clips.recent_valid_length} is the current frame. If the model internally sees 0-indexed frames, "
@@ -179,7 +220,8 @@ class BaseHLVLMAdapter:
             "Do not advance to the next object until release plus return/transition is visually supported.\n"
             "- If the final recent frame shows an object already released at its slot, do not keep `current_subtask` "
             "as place/release for that object unless release is happening in that final frame. Advance to the visible "
-            "post-release state: retreat/return if a hand is moving back, transition to the next object if one remains, "
+            "post-release state: retreat/return if a hand is moving back, transition to the next object if one "
+            "remains, "
             "or task complete/hold position if all objects are placed and the robot is idle.\n"
             "- Use the nominal plan, if included in the task instruction, only as a segmentation prior. If the "
             "recent video contradicts that plan, correct to the observed manipulation step.\n"
@@ -207,7 +249,8 @@ class BaseHLVLMAdapter:
             "`target_query` and `goal_query` must be short grounding phrases or noun phrases, not questions.\n"
             "`keyframe_candidate_positions` must be 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
-            f"Positions {clips.recent_valid_length + 1} to {self.config.recent_frames_length} are padding/fallback frames "
+            f"Positions {clips.recent_valid_length + 1} to {self.config.recent_frames_length} are padding/fallback "
+            "frames "
             "and must never be returned.\n"
             "Only nominate recent frames that contain information likely needed for future decisions, such as "
             "object locations, counted events, completed actions, failed attempts, or important state transitions. "
@@ -258,6 +301,60 @@ class BaseHLVLMAdapter:
             target_query="",
             goal_query="",
         )
+
+    def _render_image_text_messages(
+        self,
+        processor: Any,
+        *,
+        system_prompt: str,
+        user_text: str,
+        image_count: int,
+    ) -> str:
+        user_content = [{"type": "image"} for _ in range(image_count)]
+        user_content.append({"type": "text", "text": user_text})
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
+            {"role": "user", "content": user_content},
+        ]
+        tokenizer = getattr(processor, "tokenizer", processor)
+        apply_chat_template = getattr(processor, "apply_chat_template", None) or getattr(
+            tokenizer, "apply_chat_template"
+        )
+        kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+            **self._chat_template_kwargs(),
+        }
+        try:
+            return apply_chat_template(messages, **kwargs)
+        except TypeError as exc:
+            if "enable_thinking" not in str(exc):
+                raise
+            kwargs.pop("enable_thinking", None)
+            return apply_chat_template(messages, **kwargs)
+
+    def _encode_image_text_processor_inputs(
+        self,
+        processor: Any,
+        rendered: str,
+        images: list[Any],
+    ) -> Mapping[str, Any]:
+        try:
+            return processor(
+                text=[rendered],
+                images=images,
+                text_kwargs={"padding": True, "return_tensors": "pt"},
+                images_kwargs={"return_tensors": "pt"},
+            )
+        except TypeError as exc:
+            if not _is_structured_processor_kwargs_error(exc):
+                raise
+            return processor(
+                text=[rendered],
+                images=images,
+                padding=True,
+                return_tensors="pt",
+            )
 
     def _resolve_torch_dtype(self) -> torch.dtype:
         if self.config.precision == "bfloat16":
@@ -482,6 +579,7 @@ def _is_structured_processor_kwargs_error(exc: TypeError) -> bool:
         for token in (
             "text_kwargs",
             "videos_kwargs",
+            "images_kwargs",
             "video_metadata",
             "do_sample_frames",
         )
