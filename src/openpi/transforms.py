@@ -498,7 +498,12 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        def maybe_resize(image):
+            if image.shape[-3:-1] == (self.height, self.width):
+                return image
+            return image_tools.resize_with_pad(image, self.height, self.width)
+
+        data["image"] = {k: maybe_resize(v) for k, v in data["image"].items()}
         return data
 
 
