@@ -165,6 +165,7 @@
 
 import argparse
 import dataclasses
+import json
 import os
 import shutil
 import traceback
@@ -476,6 +477,116 @@ def resize_rgb_no_crop(frame_bgr: np.ndarray, out_hw: int = 224) -> np.ndarray:
     return rgb.astype(np.uint8)
 
 
+def resize_mask_no_crop(mask: np.ndarray, out_hw: int = 224) -> np.ndarray:
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    mask = cv2.resize(mask, (out_hw, out_hw), interpolation=cv2.INTER_NEAREST)
+    return ((mask > 0).astype(np.uint8) * 255)[..., None]
+
+
+def _parse_frame_range(frame_range: str) -> Tuple[int, int]:
+    start, end = frame_range.strip().strip("[]").split(",", maxsplit=1)
+    return int(start), int(end) + 1
+
+
+def _segments_from_subtask_json(path: Path, *, fallback_end_frame: int) -> List[Tuple[int, int, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+
+    segments: List[Tuple[int, int, str]] = []
+    for item in payload.get("subtask_instruction", []):
+        if not isinstance(item, dict):
+            continue
+        for frame_range, subtask in item.items():
+            start, end = _parse_frame_range(str(frame_range))
+            text = str(subtask).strip()
+            if text and start < end:
+                segments.append((start, end, text))
+    if segments:
+        return segments
+
+    subtasks = [str(item).strip() for item in payload.get("subtask", [])]
+    boundaries = [int(item) for item in payload.get("boundaries_frame_indices", [])]
+    if not subtasks:
+        return []
+    starts = [0, *boundaries]
+    ends = [*boundaries, int(fallback_end_frame)]
+    return [
+        (start, end, subtask)
+        for start, end, subtask in zip(starts, ends, subtasks)
+        if subtask and start < end
+    ]
+
+
+def _subtasks_for_frame_indices(session_path: Path, frame_indices: np.ndarray) -> np.ndarray:
+    if frame_indices.size == 0:
+        return np.asarray([], dtype="<U1")
+    candidates = [
+        session_path / "subtask.json",
+        session_path.parent / "subtask.json",
+    ]
+    fallback_end_frame = int(np.max(frame_indices)) + 1
+    segments: List[Tuple[int, int, str]] = []
+    for candidate in candidates:
+        segments = _segments_from_subtask_json(candidate, fallback_end_frame=fallback_end_frame)
+        if segments:
+            break
+
+    values: List[str] = []
+    for frame_index in frame_indices.tolist():
+        value = ""
+        for start, end, subtask in segments:
+            if start <= int(frame_index) < end:
+                value = subtask
+                break
+        values.append(value)
+    max_len = max([1, *(len(value) for value in values)])
+    return np.asarray(values, dtype=f"<U{max_len}")
+
+
+def _masks_for_frame_indices(session_path: Path, frame_indices: np.ndarray) -> np.ndarray:
+    mask_dir = session_path / "annotation" / "masks"
+    masks = np.zeros((len(frame_indices), 224, 224, 1), dtype=np.uint8)
+    if not mask_dir.exists():
+        return masks
+    for out_index, frame_index in enumerate(frame_indices.tolist()):
+        mask_path = mask_dir / f"{int(frame_index):06d}.png"
+        if not mask_path.exists():
+            continue
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        masks[out_index] = resize_mask_no_crop(mask, out_hw=224)
+    return masks
+
+
+def _segments_from_subtask_array(subtasks: np.ndarray) -> List[Dict[str, object]]:
+    values = [str(value).strip() for value in subtasks.tolist()]
+    segments: List[Dict[str, object]] = []
+    start = 0
+    current = values[0] if values else ""
+    for index, value in enumerate(values[1:], start=1):
+        if value == current:
+            continue
+        if current:
+            segments.append({"start_frame": start, "end_frame": index, "subtask": current})
+        start = index
+        current = value
+    if current:
+        segments.append({"start_frame": start, "end_frame": len(values), "subtask": current})
+    return segments
+
+
+def _subtask_segments_from_npz(npz_path: Path) -> List[Dict[str, object]]:
+    z = np.load(npz_path, allow_pickle=False)
+    if "subtask" not in z.files:
+        return []
+    return _segments_from_subtask_array(z["subtask"])
+
+
 def nearest_indices(sorted_ts: np.ndarray, query_ts: np.ndarray) -> np.ndarray:
     """
     sorted_ts must be ascending.
@@ -547,6 +658,7 @@ def create_empty_dataset(
     fps: int,
     mode: Literal["video", "image"],
     bimanual: bool,
+    include_guidance: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
     features: Dict[str, Dict[str, object]] = {}
@@ -560,6 +672,12 @@ def create_empty_dataset(
             "shape": (224, 224, 3),
             "names": ["height", "width", "channels"],
         }
+        if include_guidance:
+            features["observation.masks.front_mask"] = {
+                "dtype": "uint8",
+                "shape": (224, 224, 1),
+                "names": ["height", "width", "channels"],
+            }
     else:
         state_names_16 = [f"robot_0_{n}" for n in STATE_NAMES_8] + [f"robot_1_{n}" for n in STATE_NAMES_8]
         features["observation.state"] = {"dtype": "float32", "shape": (16,), "names": state_names_16}
@@ -576,6 +694,17 @@ def create_empty_dataset(
             "shape": (224, 224, 3),
             "names": ["height", "width", "channels"],
         }
+        if include_guidance:
+            features["observation.masks.robot_0_mask"] = {
+                "dtype": "uint8",
+                "shape": (224, 224, 1),
+                "names": ["height", "width", "channels"],
+            }
+            features["observation.masks.robot_1_mask"] = {
+                "dtype": "uint8",
+                "shape": (224, 224, 1),
+                "names": ["height", "width", "channels"],
+            }
 
     if (HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
@@ -602,6 +731,7 @@ def _extract_single_to_npz(
     traj_source: str,
     use_next: bool,
     step1_cfg: Dict[str, float],
+    include_guidance: bool,
 ) -> Tuple[bool, str]:
     data_path = str(data_path)
     out_npz = str(out_npz)
@@ -648,7 +778,18 @@ def _extract_single_to_npz(
 
         actions = build_actions_from_states(states, use_next)
 
-        np.savez_compressed(out_npz, kind=np.array("single"), states=states, actions=actions, images=imgs)
+        payload = {
+            "kind": np.array("single"),
+            "states": states,
+            "actions": actions,
+            "images": imgs,
+        }
+        if include_guidance:
+            path_obj = Path(data_path)
+            payload["front_mask"] = _masks_for_frame_indices(path_obj, fidx_arr)
+            payload["subtask"] = _subtasks_for_frame_indices(path_obj, fidx_arr)
+
+        np.savez_compressed(out_npz, **payload)
         return True, "ok"
     except Exception as e:
         return False, f"exception: {e}\n{traceback.format_exc()}"
@@ -664,6 +805,7 @@ def _extract_dual_to_npz(
     use_next: bool,
     step1_cfg_robot0: Dict[str, float],
     step1_cfg_robot1: Dict[str, float],
+    include_guidance: bool,
 ) -> Tuple[bool, str]:
     left_path = str(left_path)
     right_path = str(right_path)
@@ -739,17 +881,34 @@ def _extract_dual_to_npz(
         states = np.concatenate([s0, s1], axis=1).astype(np.float32)  # (T,16)
         actions = build_actions_from_states(states, use_next)
 
-        np.savez_compressed(out_npz, kind=np.array("dual"), s0=s0, s1=s1, states=states, actions=actions, img_l=imgs_l, img_r=imgs_r)
+        payload = {
+            "kind": np.array("dual"),
+            "s0": s0,
+            "s1": s1,
+            "states": states,
+            "actions": actions,
+            "img_l": imgs_l,
+            "img_r": imgs_r,
+        }
+        if include_guidance:
+            left_path_obj = Path(left_path)
+            right_path_obj = Path(right_path)
+            payload["robot_0_mask"] = _masks_for_frame_indices(left_path_obj, fidx_l[:T])
+            payload["robot_1_mask"] = _masks_for_frame_indices(right_path_obj, fidx_r[:T])
+            payload["subtask"] = _subtasks_for_frame_indices(left_path_obj, fidx_l[:T])
+
+        np.savez_compressed(out_npz, **payload)
         return True, "ok"
     except Exception as e:
         return False, f"exception: {e}\n{traceback.format_exc()}"
 
 
-def write_single_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -> bool:
+def write_single_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str, include_guidance: bool) -> bool:
     z = np.load(npz_path, allow_pickle=False)
     states = z["states"].astype(np.float32)
     actions = z["actions"].astype(np.float32)
     images = z["images"].astype(np.uint8)
+    masks = z["front_mask"].astype(np.uint8) if include_guidance and "front_mask" in z.files else None
 
     T = states.shape[0]
     for i in range(T):
@@ -760,12 +919,14 @@ def write_single_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str)
             "robot_0_state": torch.from_numpy(states[i]).to(torch.float32),
             "observation.images.front": images[i],
         }
+        if include_guidance:
+            frame["observation.masks.front_mask"] = masks[i] if masks is not None else np.zeros((224, 224, 1), dtype=np.uint8)
         dataset.add_frame(frame)
     dataset.save_episode()
     return True
 
 
-def write_dual_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -> bool:
+def write_dual_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str, include_guidance: bool) -> bool:
     z = np.load(npz_path, allow_pickle=False)
     s0 = z["s0"].astype(np.float32)
     s1 = z["s1"].astype(np.float32)
@@ -773,6 +934,8 @@ def write_dual_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -
     actions = z["actions"].astype(np.float32)
     img_l = z["img_l"].astype(np.uint8)
     img_r = z["img_r"].astype(np.uint8)
+    mask_l = z["robot_0_mask"].astype(np.uint8) if include_guidance and "robot_0_mask" in z.files else None
+    mask_r = z["robot_1_mask"].astype(np.uint8) if include_guidance and "robot_1_mask" in z.files else None
 
     T = states.shape[0]
     for i in range(T):
@@ -785,13 +948,16 @@ def write_dual_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -
             "observation.images.robot_0_image": img_l[i],
             "observation.images.robot_1_image": img_r[i],
         }
+        if include_guidance:
+            frame["observation.masks.robot_0_mask"] = mask_l[i] if mask_l is not None else np.zeros((224, 224, 1), dtype=np.uint8)
+            frame["observation.masks.robot_1_mask"] = mask_r[i] if mask_r is not None else np.zeros((224, 224, 1), dtype=np.uint8)
         dataset.add_frame(frame)
     dataset.save_episode()
     return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FastUMI rawdata -> LeRobot v2.0 (safe parallel) with Step1 processing.")
+    parser = argparse.ArgumentParser(description="FastUMI rawdata -> LeRobot v2.1 (safe parallel) with Step1 processing.")
     parser.add_argument("--raw-dir", type=Path, required=True, help="Raw data root (search recursively for session*)")
     parser.add_argument("--repo-id", type=str, required=True, help="LeRobot repo id, e.g. fastumi/task_xxx")
     parser.add_argument("--task", type=str, required=True, help="Task string stored in each frame")
@@ -809,6 +975,11 @@ def main():
     parser.add_argument("--tmp-dir", type=Path, default=None,
                         help="Temp dir for episode .npz (recommend /dev/shm if enough RAM)")
     parser.add_argument("--keep-tmp", action="store_true", help="Keep tmp npz files (debug)")
+    parser.add_argument(
+        "--include-guidance",
+        action="store_true",
+        help="Store optional annotation/masks/*.png and subtask.json fields in the LeRobot 2.1 dataset.",
+    )
 
     # writer config (avoid oversubscribe)
     parser.add_argument("--image-writer-processes", type=int, default=DEFAULT_DATASET_CONFIG.image_writer_processes)
@@ -824,6 +995,7 @@ def main():
     use_next: bool = args.next
     mode: Literal["image", "video"] = args.mode  # type: ignore
     output_dir: Optional[Path] = args.output_dir
+    include_guidance: bool = bool(args.include_guidance)
 
     if not raw_dir.exists():
         raise FileNotFoundError(f"--raw-dir does not exist: {raw_dir}")
@@ -879,12 +1051,14 @@ def main():
         fps=fps,
         mode=mode,
         bimanual=bimanual,
+        include_guidance=include_guidance,
         dataset_config=dataset_cfg,
     )
 
     total = len(valid)
     ok_count = 0
     fail_count = 0
+    subtask_sidecar: Dict[str, Dict[str, List[Dict[str, object]]]] = {"episodes": {}}
 
     ready: Dict[int, Tuple[bool, str, Path]] = {} 
     next_to_write = 0
@@ -901,6 +1075,7 @@ def main():
                 traj_source=traj_source,
                 use_next=use_next,
                 step1_cfg=step1_cfg,
+                include_guidance=include_guidance,
             )
         else:
             fut = ex.submit(
@@ -913,6 +1088,7 @@ def main():
                 use_next=use_next,
                 step1_cfg_robot0=step1_cfg_robot0,
                 step1_cfg_robot1=step1_cfg_robot1,
+                include_guidance=include_guidance,
             )
         return fut, npz_path
 
@@ -963,10 +1139,14 @@ def main():
 
                     # write episode
                     try:
+                        episode_index = ok_count
+                        segments = _subtask_segments_from_npz(npz2) if include_guidance else []
                         if not bimanual:
-                            write_single_from_npz(dataset, npz2, task=task)
+                            write_single_from_npz(dataset, npz2, task=task, include_guidance=include_guidance)
                         else:
-                            write_dual_from_npz(dataset, npz2, task=task)
+                            write_dual_from_npz(dataset, npz2, task=task, include_guidance=include_guidance)
+                        if segments:
+                            subtask_sidecar["episodes"][str(episode_index)] = {"segments": segments}
                         ok_count += 1
                     except Exception as e:
                         fail_count += 1
@@ -988,6 +1168,13 @@ def main():
         dataset.finalize()
     elif hasattr(dataset, "close"):
         dataset.close()
+
+    if include_guidance and subtask_sidecar["episodes"]:
+        sidecar_path = HF_LEROBOT_HOME / repo_id / "subtask_segments.json"
+        with sidecar_path.open("w", encoding="utf-8") as stream:
+            json.dump(subtask_sidecar, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        print(f"[Info] Wrote subtask sidecar: {sidecar_path}")
 
     # copy out
     if output_dir is not None:

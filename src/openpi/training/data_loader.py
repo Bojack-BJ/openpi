@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 from typing import TYPE_CHECKING, Any
@@ -151,11 +153,91 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    dataset_root = dataset.root
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    if data_config.subtask_segments_path is not None:
+        dataset = TransformedDataset(
+            dataset,
+            [_transforms.SubtaskFromSegments(_load_subtask_segments(data_config.subtask_segments_path, dataset_root))],
+        )
 
     return dataset
+
+
+def _load_subtask_segments(path: str, dataset_root: pathlib.Path) -> dict[int, tuple[tuple[int, int, str], ...]]:
+    segment_path = pathlib.Path(path)
+    if not segment_path.is_absolute():
+        segment_path = dataset_root / segment_path
+    if not segment_path.exists():
+        logging.warning("Subtask segments file not found: %s; continuing without subtask guidance.", segment_path)
+        return {}
+    with segment_path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    return _parse_subtask_segments(payload)
+
+
+def _parse_subtask_segments(payload: Any) -> dict[int, tuple[tuple[int, int, str], ...]]:
+    if isinstance(payload, list):
+        episodes = payload
+    elif isinstance(payload, dict) and "episodes" in payload:
+        episodes_payload = payload["episodes"]
+        if isinstance(episodes_payload, dict):
+            episodes = [
+                {"episode_index": int(episode_index), **episode_payload}
+                for episode_index, episode_payload in episodes_payload.items()
+            ]
+        elif isinstance(episodes_payload, list):
+            episodes = episodes_payload
+        else:
+            raise ValueError(f"Unsupported episodes payload type: {type(episodes_payload)!r}")
+    elif isinstance(payload, dict):
+        episodes = [{"episode_index": int(payload.get("episode_index", 0)), **payload}]
+    else:
+        raise ValueError(f"Unsupported subtask segment payload type: {type(payload)!r}")
+
+    parsed: dict[int, tuple[tuple[int, int, str], ...]] = {}
+    for episode in episodes:
+        episode_index = int(episode.get("episode_index", 0))
+        parsed[episode_index] = tuple(_parse_episode_subtask_segments(episode))
+    return parsed
+
+
+def _parse_episode_subtask_segments(episode: dict[str, Any]) -> list[tuple[int, int, str]]:
+    if "segments" in episode:
+        return [
+            (int(segment["start_frame"]), int(segment["end_frame"]), str(segment["subtask"]).strip())
+            for segment in episode["segments"]
+            if str(segment.get("subtask", "")).strip()
+        ]
+
+    subtasks = [str(item).strip() for item in episode.get("subtask", [])]
+    boundaries = [int(item) for item in episode.get("boundaries_frame_indices", [])]
+    if not subtasks:
+        return []
+
+    episode_end = episode.get("num_frames") or episode.get("end_frame") or episode.get("episode_length")
+    if episode_end is None:
+        ranges = episode.get("subtask_instruction", [])
+        for item in ranges:
+            if not isinstance(item, dict):
+                continue
+            for frame_range in item:
+                try:
+                    episode_end = max(int(frame_range.strip("[]").split(",")[1]) + 1, int(episode_end or 0))
+                except (IndexError, ValueError):
+                    continue
+    if episode_end is None:
+        raise ValueError("Subtask segments with `boundaries_frame_indices` also need `num_frames` or ranges.")
+
+    starts = [0, *boundaries]
+    ends = [*boundaries, int(episode_end)]
+    return [
+        (start, end, subtask)
+        for start, end, subtask in zip(starts, ends, subtasks, strict=False)
+        if subtask and start < end
+    ]
 
 
 def create_rlds_dataset(

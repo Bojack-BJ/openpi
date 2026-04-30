@@ -167,6 +167,261 @@ class InjectDefaultPrompt(DataTransformFn):
         return data
 
 
+def _to_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, str):
+        return value
+    if isinstance(value, np.ndarray):
+        if value.shape == ():
+            return _to_text(value.item())
+        if value.size == 1:
+            return _to_text(value.reshape(()).item())
+        return " ".join(_to_text(item) for item in value.tolist())
+    if hasattr(value, "item"):
+        try:
+            return _to_text(value.item())
+        except ValueError:
+            pass
+    return str(value)
+
+
+def _spatial_shape_from_image(image: np.ndarray) -> tuple[int, int]:
+    if image.ndim != 3:
+        raise ValueError(f"Expected image rank 3, got shape={image.shape}")
+    if image.shape[-1] in (1, 3, 4):
+        return int(image.shape[0]), int(image.shape[1])
+    if image.shape[0] in (1, 3, 4):
+        return int(image.shape[1]), int(image.shape[2])
+    raise ValueError(f"Could not infer image layout from shape={image.shape}")
+
+
+@dataclasses.dataclass(frozen=True)
+class InjectOptionalGuidanceFields(DataTransformFn):
+    """Inject default optional mask/subtask fields before a strict repack transform."""
+
+    image_to_mask_paths: Mapping[str, str]
+    subtask_input_paths: Sequence[str] = ("subtask", "current_subtask")
+    subtask_output_path: str = "subtask"
+
+    def __call__(self, data: DataDict) -> DataDict:
+        out = dict(data)
+
+        for image_path, mask_path in self.image_to_mask_paths.items():
+            if mask_path in out or image_path not in out:
+                continue
+            height, width = _spatial_shape_from_image(np.asarray(out[image_path]))
+            out[mask_path] = np.zeros((height, width, 1), dtype=np.uint8)
+
+        if self.subtask_output_path not in out:
+            out[self.subtask_output_path] = np.asarray("")
+        for input_path in self.subtask_input_paths:
+            if input_path not in out:
+                continue
+            subtask = _to_text(out[input_path]).strip()
+            if subtask:
+                out[self.subtask_output_path] = out[input_path]
+                break
+
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class ComposePromptWithSubtask(DataTransformFn):
+    """Append an optional current subtask to the language prompt."""
+
+    prompt_key: str = "prompt"
+    subtask_keys: Sequence[str] = ("subtask", "current_subtask")
+    template: str = "Overall instruction: {prompt}\nCurrent subtask: {subtask}"
+    drop_subtask_keys: bool = True
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.prompt_key not in data:
+            return data
+
+        out = dict(data)
+        prompt = _to_text(out[self.prompt_key]).strip()
+        subtask = ""
+        for key in self.subtask_keys:
+            if key not in out:
+                continue
+            subtask = _to_text(out[key]).strip()
+            if subtask:
+                break
+
+        if subtask:
+            out[self.prompt_key] = self.template.format(prompt=prompt, subtask=subtask)
+
+        if self.drop_subtask_keys:
+            for key in self.subtask_keys:
+                out.pop(key, None)
+
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
+class SubtaskFromSegments(DataTransformFn):
+    """Attach a frame-level subtask from episode-level half-open frame segments."""
+
+    segments_by_episode: Mapping[int, Sequence[tuple[int, int, str]]]
+    episode_index_key: str = "episode_index"
+    frame_index_key: str = "frame_index"
+    output_key: str = "subtask"
+    overwrite: bool = False
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if not self.overwrite and _to_text(data.get(self.output_key)).strip():
+            return data
+        if self.episode_index_key not in data or self.frame_index_key not in data:
+            return data
+
+        episode_index = int(np.asarray(data[self.episode_index_key]).item())
+        frame_index = int(np.asarray(data[self.frame_index_key]).item())
+        for start, end, subtask in self.segments_by_episode.get(episode_index, ()):
+            if int(start) <= frame_index < int(end):
+                out = dict(data)
+                out[self.output_key] = np.asarray(str(subtask))
+                return out
+        return data
+
+
+def _image_to_hwc(image: np.ndarray) -> tuple[np.ndarray, str]:
+    if image.ndim != 3:
+        raise ValueError(f"Expected image rank 3, got shape={image.shape}")
+    if image.shape[-1] in (3, 4):
+        return image, "hwc"
+    if image.shape[0] in (3, 4):
+        return np.moveaxis(image, 0, -1), "chw"
+    raise ValueError(f"Expected RGB/RGBA image in HWC or CHW layout, got shape={image.shape}")
+
+
+def _image_from_hwc(image: np.ndarray, layout: str) -> np.ndarray:
+    if layout == "hwc":
+        return image
+    if layout == "chw":
+        return np.moveaxis(image, -1, 0)
+    raise ValueError(f"Unsupported image layout: {layout}")
+
+
+def _mask_to_bool(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        if mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        elif mask.shape[0] == 1:
+            mask = mask[0]
+        elif mask.shape[-1] in (3, 4):
+            mask = np.max(mask[..., :3], axis=-1)
+        elif mask.shape[0] in (3, 4):
+            mask = np.max(mask[:3], axis=0)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected mask rank 2 or single-channel rank 3, got shape={mask.shape}")
+    if mask.dtype == np.bool_:
+        return mask
+    if np.issubdtype(mask.dtype, np.floating):
+        return mask > 0.5
+    return mask > 0
+
+
+def _mask_contour(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+    eroded = mask.astype(bool).copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            eroded &= padded[1 + dy : 1 + dy + mask.shape[0], 1 + dx : 1 + dx + mask.shape[1]]
+    return mask & ~eroded
+
+
+def _overlay_rgb_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    alpha: float,
+    color: tuple[int, int, int],
+    draw_contour: bool,
+    contour_alpha: float,
+    contour_color: tuple[int, int, int],
+) -> np.ndarray:
+    image_hwc, layout = _image_to_hwc(np.asarray(image))
+    mask_bool = _mask_to_bool(mask)
+    if mask_bool.shape != image_hwc.shape[:2]:
+        raise ValueError(f"Mask shape {mask_bool.shape} does not match image shape {image_hwc.shape[:2]}.")
+    if not np.any(mask_bool):
+        return np.array(image, copy=True)
+
+    input_dtype = image_hwc.dtype
+    work = image_hwc.astype(np.float32, copy=True)
+    if np.issubdtype(input_dtype, np.floating):
+        if np.nanmin(work) < 0:
+            rgb_color = np.asarray(color, dtype=np.float32) / 255.0 * 2.0 - 1.0
+            rgb_contour_color = np.asarray(contour_color, dtype=np.float32) / 255.0 * 2.0 - 1.0
+            min_value, max_value = -1.0, 1.0
+        else:
+            rgb_color = np.asarray(color, dtype=np.float32) / 255.0
+            rgb_contour_color = np.asarray(contour_color, dtype=np.float32) / 255.0
+            min_value, max_value = 0.0, 1.0
+    else:
+        rgb_color = np.asarray(color, dtype=np.float32)
+        rgb_contour_color = np.asarray(contour_color, dtype=np.float32)
+        min_value, max_value = 0.0, 255.0
+
+    work[mask_bool, :3] = (1.0 - alpha) * work[mask_bool, :3] + alpha * rgb_color
+
+    if draw_contour:
+        contour = _mask_contour(mask_bool)
+        if np.any(contour):
+            work[contour, :3] = (1.0 - contour_alpha) * work[contour, :3] + contour_alpha * rgb_contour_color
+
+    work = np.clip(work, min_value, max_value)
+    if np.issubdtype(input_dtype, np.integer):
+        work = np.rint(work)
+    work = work.astype(input_dtype, copy=False)
+    return _image_from_hwc(work, layout)
+
+
+@dataclasses.dataclass(frozen=True)
+class OverlayMasksOnImages(DataTransformFn):
+    """Overlay optional binary masks onto RGB images for LL visual guidance."""
+
+    image_to_mask_keys: Mapping[str, str]
+    image_key: str = "image"
+    mask_key: str = "mask"
+    alpha: float = 0.35
+    color: tuple[int, int, int] = (0, 255, 0)
+    draw_contour: bool = True
+    contour_alpha: float = 0.85
+    contour_color: tuple[int, int, int] = (255, 255, 255)
+    drop_mask: bool = True
+
+    def __call__(self, data: DataDict) -> DataDict:
+        images = data.get(self.image_key)
+        masks = data.get(self.mask_key)
+        if not isinstance(images, dict) or not isinstance(masks, dict):
+            return data
+
+        out = dict(data)
+        out_images = dict(images)
+        for image_name, mask_name in self.image_to_mask_keys.items():
+            if image_name not in out_images or mask_name not in masks:
+                continue
+            out_images[image_name] = _overlay_rgb_mask(
+                out_images[image_name],
+                masks[mask_name],
+                alpha=self.alpha,
+                color=self.color,
+                draw_contour=self.draw_contour,
+                contour_alpha=self.contour_alpha,
+                contour_color=self.contour_color,
+            )
+
+        out[self.image_key] = out_images
+        if self.drop_mask:
+            out.pop(self.mask_key, None)
+        return out
+
+
 @dataclasses.dataclass(frozen=True)
 class Normalize(DataTransformFn):
     norm_stats: Any | None

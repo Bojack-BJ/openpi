@@ -792,3 +792,54 @@ FRAME_SUBSAMPLE=1
 MEMORY_LENGTH=8
 MERGE_DISTANCE=1
 ```
+
+## LL mask / subtask guidance
+
+LL 侧不新增模型结构字段，仍然走现有 `prompt + observation.images` 输入：
+
+- LeRobot 数据可以保留 raw RGB、可选二值 mask、可选 subtask。
+- `FastUMIData7DRPYGuidedConfig` 和 `FastUMIdualData14DRPYGuidedConfig` 会在 dataloader transform 阶段动态把 mask overlay 到 RGB 上。
+- 有 `subtask` 或 `current_subtask` 时，transform 会把它拼进 prompt；没有则保持原始 instruction-only 行为。
+- mask 字段缺失时会自动补零 mask，等价于直接使用原图。
+
+推荐 LeRobot 字段：
+
+```text
+observation.images.front
+observation.masks.front_mask                 # single-view optional
+observation.images.robot_0_image
+observation.images.robot_1_image
+observation.masks.robot_0_mask               # dual-view optional
+observation.masks.robot_1_mask               # dual-view optional
+subtask                                      # optional frame-level string, if the dataset format supports it
+```
+
+当前 LeRobot 2.1 转换脚本保持默认 schema 不变；只有显式打开 guidance 才会额外写 mask 字段，并把 subtask 分割保存成 dataset root 下的 `subtask_segments.json`：
+
+```bash
+python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+  --raw-dir /path/to/raw_sessions \
+  --repo-id fastumi/my_guided_task \
+  --task "Put the object into the target slot" \
+  --fps 20 \
+  --traj-source merge \
+  --mode image \
+  --include-guidance
+```
+
+LeRobot 2.1 pipeline 里不额外写 frame-level string feature，训练时通过 `DataConfig(subtask_segments_path=...)` 读取 episode-level JSON，再动态注入当前帧 subtask；文件不存在时会退化成无 subtask guidance。支持格式：
+
+```json
+{
+  "episodes": {
+    "0": {
+      "segments": [
+        {"start_frame": 0, "end_frame": 168, "subtask": "pick up the sponge"},
+        {"start_frame": 168, "end_frame": 462, "subtask": "place the sponge in the grid"}
+      ]
+    }
+  }
+}
+```
+
+也兼容现有 `subtask.json` 风格的 `boundaries_frame_indices + subtask + subtask_instruction`。区间语义统一为半开区间 `[start_frame, end_frame)`。

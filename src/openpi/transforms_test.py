@@ -128,3 +128,84 @@ def test_extract_prompt_from_task():
 
     with pytest.raises(ValueError, match="task_index=2 not found in task mapping"):
         transform({"task_index": 2})
+
+
+def test_inject_optional_guidance_fields_adds_empty_masks_and_subtask():
+    image = np.zeros((4, 5, 3), dtype=np.uint8)
+    transform = _transforms.InjectOptionalGuidanceFields(
+        image_to_mask_paths={"observation.images.robot_0_image": "observation.masks.robot_0_mask"},
+    )
+
+    data = transform(
+        {
+            "observation.images.robot_0_image": image,
+            "current_subtask": np.asarray("pick up the sponge"),
+        }
+    )
+
+    assert data["observation.masks.robot_0_mask"].shape == (4, 5, 1)
+    assert data["observation.masks.robot_0_mask"].dtype == np.uint8
+    assert data["subtask"].item() == "pick up the sponge"
+
+
+def test_compose_prompt_with_subtask_appends_optional_subtask():
+    transform = _transforms.ComposePromptWithSubtask()
+
+    data = transform({"prompt": np.asarray("clean the board"), "subtask": np.asarray("pick up the sponge")})
+
+    assert data["prompt"] == "Overall instruction: clean the board\nCurrent subtask: pick up the sponge"
+    assert "subtask" not in data
+
+
+def test_compose_prompt_with_subtask_noops_without_subtask():
+    transform = _transforms.ComposePromptWithSubtask()
+
+    data = transform({"prompt": "clean the board", "subtask": ""})
+
+    assert data["prompt"] == "clean the board"
+    assert "subtask" not in data
+
+
+def test_overlay_masks_on_images_overlays_mask_and_drops_mask():
+    image = np.zeros((4, 4, 3), dtype=np.uint8)
+    mask = np.zeros((4, 4, 1), dtype=np.uint8)
+    mask[1:3, 1:3, 0] = 255
+    transform = _transforms.OverlayMasksOnImages(
+        image_to_mask_keys={"front": "front"},
+        alpha=1.0,
+        color=(10, 20, 30),
+        draw_contour=False,
+    )
+
+    data = transform({"image": {"front": image}, "mask": {"front": mask}})
+
+    assert np.all(data["image"]["front"][1:3, 1:3] == np.array([10, 20, 30], dtype=np.uint8))
+    assert np.all(data["image"]["front"][0, 0] == 0)
+    assert "mask" not in data
+
+
+def test_overlay_masks_on_images_rejects_mismatched_mask_shape():
+    transform = _transforms.OverlayMasksOnImages(image_to_mask_keys={"front": "front"})
+
+    with pytest.raises(ValueError, match="does not match image shape"):
+        transform(
+            {
+                "image": {"front": np.zeros((4, 4, 3), dtype=np.uint8)},
+                "mask": {"front": np.zeros((3, 3), dtype=np.uint8)},
+            }
+        )
+
+
+def test_subtask_from_segments_uses_half_open_frame_ranges():
+    transform = _transforms.SubtaskFromSegments(
+        {
+            7: (
+                (0, 10, "pick up the sponge"),
+                (10, 20, "place the sponge"),
+            )
+        }
+    )
+
+    data = transform({"episode_index": np.asarray(7), "frame_index": np.asarray(10)})
+
+    assert data["subtask"].item() == "place the sponge"
