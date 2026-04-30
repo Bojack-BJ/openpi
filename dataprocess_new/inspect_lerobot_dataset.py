@@ -8,7 +8,13 @@ Examples:
         --repo-id fastumi/20260312H081Ba_toy_block
 
     python dataprocess_new/inspect_lerobot_dataset.py \
-        --dataset-root /path/to/lerobot_home/fastumi/20260312H081Ba_toy_block \
+        --dataset-root /root/Users/dataset/lerobot_home/fastumi/sponge_visual_guided \
+        --sample-indices 0,100,-1 \
+        --preview-dir /tmp/lerobot_preview
+    
+    python dataprocess_new/inspect_lerobot_dataset.py \
+        --dataset-root /root/Users/dataset/lerobot_home/fastumi/sponge_visual_guided \
+        --episodes 3 \
         --sample-indices 0,100,-1 \
         --preview-dir /tmp/lerobot_preview
 """
