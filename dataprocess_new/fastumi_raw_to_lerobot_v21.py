@@ -41,6 +41,15 @@
             --mode image \
             --workers 8 \
             --max-inflight 16
+            
+        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir /root/Users/pzh/pointVLA_raw_data/20260422 \
+            --repo-id fastumi/sponge_visual_guided \
+            --task "Put the target sponge into the target slot in the grid" \
+            --fps 20 \
+            --traj-source merge \
+            --mode image \
+            --include-guidance
 
         # 示例二：双臂数据，使用 next-step action，并将结果复制到指定目录
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py \

@@ -818,9 +818,9 @@ subtask                                      # optional frame-level string, if t
 
 ```bash
 python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
-  --raw-dir /path/to/raw_sessions \
-  --repo-id fastumi/my_guided_task \
-  --task "Put the object into the target slot" \
+  --raw-dir /root/Users/pzh/pointVLA_raw_data/20260422 \
+  --repo-id fastumi/sponge_visual_guided \
+  --task "Put the target sponge into the target slot in the grid" \
   --fps 20 \
   --traj-source merge \
   --mode image \
