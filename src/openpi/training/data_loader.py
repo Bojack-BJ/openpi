@@ -513,7 +513,8 @@ class TorchDataLoader:
 
         mp_context = None
         if num_workers > 0:
-            mp_context = multiprocessing.get_context("spawn")
+            mp_context_name = os.environ.get("OPENPI_TORCH_DATALOADER_MP_CONTEXT", "spawn")
+            mp_context = multiprocessing.get_context(mp_context_name)
 
         generator = torch.Generator()
         generator.manual_seed(seed)
