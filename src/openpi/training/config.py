@@ -1160,6 +1160,8 @@ class TrainConfig:
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
+    # Number of already-materialized training batches to keep in a host/device-side prefetch buffer.
+    train_prefetch_batches: int = 2
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -2279,7 +2281,7 @@ _CONFIGS = [
         num_train_steps=120_000,
         ema_decay=None,
         batch_size=32,
-        num_workers=32,
+        num_workers=8,
     ),
     TrainConfig(
         name="sponge_visual_guided_pi05",
@@ -2298,7 +2300,7 @@ _CONFIGS = [
         num_train_steps=120_000,
         ema_decay=None,
         batch_size=32,
-        num_workers=32,
+        num_workers=8,
     ),
     TrainConfig(
         name="sponge_visual_guided_qwen2_5_3b_400m",
@@ -2322,7 +2324,7 @@ _CONFIGS = [
         num_train_steps=120_000,
         ema_decay=None,
         batch_size=32,
-        num_workers=32,
+        num_workers=8,
     ),
     TrainConfig(
         name="sponge_visual_guided_qwen3_5_2b_400m",
@@ -2346,7 +2348,7 @@ _CONFIGS = [
         num_train_steps=120_000,
         ema_decay=None,
         batch_size=32,
-        num_workers=32,
+        num_workers=8,
         qwen3_5_remat_mode="linear_only",
     ),
     TrainConfig(

@@ -3,10 +3,12 @@ import functools
 import logging
 import os
 import platform
+import queue
 import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterator
 from typing import Any
 
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
@@ -57,6 +59,37 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
+
+
+def _prefetch_iterator(iterator: Iterator[Any], buffer_size: int) -> Iterator[Any]:
+    if buffer_size <= 0:
+        return iterator
+
+    items: queue.Queue[Any] = queue.Queue(maxsize=buffer_size)
+    done = object()
+
+    def producer():
+        try:
+            for item in iterator:
+                items.put(item)
+        except BaseException as exc:
+            items.put(exc)
+        finally:
+            items.put(done)
+
+    thread = threading.Thread(target=producer, name="train-batch-prefetch", daemon=True)
+    thread.start()
+
+    def consumer():
+        while True:
+            item = items.get()
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    return consumer()
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -380,7 +413,9 @@ def main(config: _config.TrainConfig):
     )
     logging.info("Fetching first batch from data loader...")
     first_batch_t0 = time.perf_counter()
-    data_iter = iter(data_loader)
+    data_iter = _prefetch_iterator(iter(data_loader), config.train_prefetch_batches)
+    if config.train_prefetch_batches > 0:
+        logging.info("Training batch prefetch enabled: %d batches.", config.train_prefetch_batches)
     batch = next(data_iter)
     logging.info("Fetched first batch in %.1f seconds.", time.perf_counter() - first_batch_t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")

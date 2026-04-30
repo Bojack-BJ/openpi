@@ -5,6 +5,7 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 import os
+import pathlib
 import time
 import contextlib
 from itertools import chain
@@ -238,6 +239,16 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
+def _get_output_path(config: _config.TrainConfig, data_config: _config.DataConfig):
+    asset_id = data_config.asset_id or data_config.repo_id
+    if asset_id is None:
+        raise ValueError("Data config must define either asset_id or repo_id to save normalization statistics.")
+
+    data_factory_assets = getattr(getattr(config.data, "assets", None), "assets_dir", None)
+    assets_dir = pathlib.Path(data_factory_assets) if data_factory_assets is not None else config.assets_dirs
+    return assets_dir / asset_id
+
+
 def main(config_name: str, max_frames: int | None = None, num_workers: int | None = None):
     os.environ.setdefault("OPENPI_TORCH_DATALOADER_MP_CONTEXT", "fork")
     config = _config.get_config(config_name)
@@ -279,7 +290,7 @@ def main(config_name: str, max_frames: int | None = None, num_workers: int | Non
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = _get_output_path(config, data_config)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
