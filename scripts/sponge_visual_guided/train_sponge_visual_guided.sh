@@ -32,7 +32,7 @@ conda activate "${CONDA_ENV:-pi0_suzhou}"
 cd "$repo"
 
 # First run only, if assets/norm stats do not exist yet:
-python scripts/compute_norm_stats.py --config-name "$cfg" --num-workers 64
+# python scripts/compute_norm_stats.py --config-name "$cfg" --num-workers 64
 
 XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9} \
 python scripts/train.py "$cfg" \
