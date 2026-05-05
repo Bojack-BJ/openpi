@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import pathlib
 
 import torch
@@ -63,10 +64,22 @@ class ZeroShotArgs:
     enable_thinking: bool = False
     thinking_budget_tokens: int = 128
     thinking_max_new_tokens: int = 1024
+    parallel_mode: str = "none"
+    device_map: str = "auto"
+    tensor_parallel_plan: str = "auto"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def main(args: ZeroShotArgs) -> None:
+    is_primary_process = _is_primary_process()
+    if not is_primary_process:
+        args = dataclasses.replace(
+            args,
+            output_json=None,
+            rollout_jsonl=None,
+            rollout_pretty_json=None,
+            debug_dir=None,
+        )
     _resolve_video_paths(args)
     if args.task_config_path is not None:
         _load_task_config(args.task_config_path)
@@ -84,6 +97,9 @@ def main(args: ZeroShotArgs) -> None:
         enable_thinking=args.enable_thinking,
         thinking_budget_tokens=args.thinking_budget_tokens,
         thinking_max_new_tokens=args.thinking_max_new_tokens,
+        parallel_mode=args.parallel_mode,
+        device_map=args.device_map,
+        tensor_parallel_plan=args.tensor_parallel_plan,
     )
     adapter = create_hf_adapter(config)
     resolved_model_path = args.model_path
@@ -109,7 +125,8 @@ def main(args: ZeroShotArgs) -> None:
         )
 
     rendered = json.dumps(payload, indent=2, ensure_ascii=True)
-    print(rendered)
+    if is_primary_process:
+        print(rendered)
     if args.output_json is not None:
         args.output_json.write_text(rendered + "\n")
 
@@ -416,6 +433,10 @@ def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
 
 def _payload_video_paths_from_args(args: ZeroShotArgs) -> dict[str, str]:
     return {view_name: str(path) for view_name, path in _resolve_video_paths(args).items()}
+
+
+def _is_primary_process() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
 
 
 def _sample_video_path(args: ZeroShotArgs) -> pathlib.Path:

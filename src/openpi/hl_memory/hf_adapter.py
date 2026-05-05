@@ -58,7 +58,14 @@ class BaseHLVLMAdapter:
         pretrained_path = model_path or self.config.resolved_model_id
         processor = transformers.AutoProcessor.from_pretrained(pretrained_path, trust_remote_code=True)
         model = self._load_model(transformers, pretrained_path, torch_dtype=torch_dtype)
-        model.to(device)
+        if self._uses_parallel_model_loading():
+            logging.info(
+                "Loaded HL VLM with parallel_mode=%s; skipping explicit model.to(%s).",
+                self.config.parallel_mode,
+                device,
+            )
+        else:
+            model.to(device)
         model.eval()
         return LoadedHLVLM(processor=processor, model=model)
 
@@ -75,12 +82,13 @@ class BaseHLVLMAdapter:
         labels = full_inputs["input_ids"].clone()
         prompt_length = min(int(prompt_inputs["input_ids"].shape[-1]), int(labels.shape[-1]))
         labels[..., :prompt_length] = -100
+        input_device = self._resolve_input_device(loaded.model, device)
         tensors = {
-            key: value.to(device)
+            key: value.to(input_device)
             for key, value in full_inputs.items()
             if isinstance(value, torch.Tensor)
         }
-        tensors["labels"] = labels.to(device)
+        tensors["labels"] = labels.to(input_device)
         return tensors
 
     def predict(
@@ -102,9 +110,10 @@ class BaseHLVLMAdapter:
         device: str | torch.device,
     ) -> HLVLMGeneration:
         inputs = self._encode_prompt_only(loaded.processor, sample, clips)
-        input_ids = inputs["input_ids"].to(device)
+        input_device = self._resolve_input_device(loaded.model, device)
+        input_ids = inputs["input_ids"].to(input_device)
         generation_inputs = {
-            key: value.to(device)
+            key: value.to(input_device)
             for key, value in inputs.items()
             if isinstance(value, torch.Tensor)
         }
@@ -155,9 +164,10 @@ class BaseHLVLMAdapter:
             image_count=len(images),
         )
         inputs = self._encode_image_text_processor_inputs(loaded.processor, rendered, images)
-        input_ids = inputs["input_ids"].to(device)
+        input_device = self._resolve_input_device(loaded.model, device)
+        input_ids = inputs["input_ids"].to(input_device)
         generation_inputs = {
-            key: value.to(device)
+            key: value.to(input_device)
             for key, value in inputs.items()
             if isinstance(value, torch.Tensor)
         }
@@ -368,6 +378,30 @@ class BaseHLVLMAdapter:
             return max(self.config.max_new_tokens, self.config.thinking_max_new_tokens)
         return self.config.max_new_tokens
 
+    def _uses_parallel_model_loading(self) -> bool:
+        return self.config.parallel_mode in {"device_map", "tensor_parallel"}
+
+    def _parallel_from_pretrained_kwargs(self) -> dict[str, Any]:
+        if self.config.parallel_mode == "none":
+            return {}
+        if self.config.parallel_mode == "device_map":
+            return {"device_map": self.config.device_map}
+        if self.config.parallel_mode == "tensor_parallel":
+            return {"tp_plan": self.config.tensor_parallel_plan}
+        raise ValueError(f"Unsupported parallel_mode: {self.config.parallel_mode}")
+
+    def _resolve_input_device(self, model: Any, requested_device: str | torch.device) -> torch.device:
+        if self._uses_parallel_model_loading():
+            model_device = getattr(model, "device", None)
+            if model_device is not None:
+                resolved = torch.device(model_device)
+                if resolved.type != "meta":
+                    return resolved
+            for parameter in model.parameters():
+                if parameter.device.type != "meta":
+                    return parameter.device
+        return torch.device(requested_device)
+
     def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
         raise NotImplementedError
 
@@ -394,6 +428,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
             pretrained_path,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
+            **self._parallel_from_pretrained_kwargs(),
         )
 
     def _encode_prompt_only(
@@ -544,6 +579,7 @@ class Qwen35HLAdapter(Qwen25HLAdapter):
                 pretrained_path,
                 dtype=torch_dtype,
                 trust_remote_code=True,
+                **self._parallel_from_pretrained_kwargs(),
             )
         except TypeError as exc:
             if "dtype" not in str(exc):
@@ -552,6 +588,7 @@ class Qwen35HLAdapter(Qwen25HLAdapter):
                 pretrained_path,
                 torch_dtype=torch_dtype,
                 trust_remote_code=True,
+                **self._parallel_from_pretrained_kwargs(),
             )
 
 

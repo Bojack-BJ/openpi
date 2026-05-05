@@ -6,6 +6,7 @@ from typing import Literal
 
 HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl"]
 Precision = Literal["bfloat16", "float16", "float32"]
+HLVLMParallelMode = Literal["none", "device_map", "tensor_parallel"]
 
 _DEFAULT_VARIANTS: dict[HLVLMBackend, str | None] = {
     "paligemma": None,
@@ -50,12 +51,21 @@ class HLMemoryConfig:
     enable_thinking: bool = False
     thinking_budget_tokens: int = 128
     thinking_max_new_tokens: int = 1024
+    parallel_mode: HLVLMParallelMode = "none"
+    device_map: str = "auto"
+    tensor_parallel_plan: str = "auto"
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
             raise ValueError(f"Unsupported HL VLM backend: {self.vlm_backend}")
         if self.precision not in {"bfloat16", "float16", "float32"}:
             raise ValueError("`precision` must be one of `bfloat16`, `float16`, or `float32`.")
+        if self.parallel_mode not in {"none", "device_map", "tensor_parallel"}:
+            raise ValueError("`parallel_mode` must be one of `none`, `device_map`, or `tensor_parallel`.")
+        if not self.device_map.strip():
+            raise ValueError("device_map must be non-empty.")
+        if not self.tensor_parallel_plan.strip():
+            raise ValueError("tensor_parallel_plan must be non-empty.")
         resolved_variant = _resolve_variant(self.vlm_backend, self.vlm_variant)
         object.__setattr__(self, "vlm_variant", resolved_variant)
         if self.vlm_hf_model_id is None:

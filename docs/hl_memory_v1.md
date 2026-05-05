@@ -212,6 +212,51 @@ Qwen3.5 precision 选择：
 - 如果遇到 Qwen3.5 vision `conv3d` 的 `CUDNN_STATUS_NOT_INITIALIZED`，优先显式加 `--precision float16`。
 - 如果仍然失败，再用 `--precision float32` 判断是否是半精度/cuDNN 兼容问题；`float32` 显存占用更高。
 
+Qwen3.5 27B 并行加载：
+
+- 默认 `--parallel-mode none`，保持 2B/4B 的单卡行为不变。
+- 如果 27B 单卡 OOM，先用 `--parallel-mode device_map --device-map auto`。这是单进程多卡 module placement，
+  不是严格 tensor parallel，但通常是最直接的显存解法。
+- 如果要真正 tensor parallel，用 `--parallel-mode tensor_parallel --tensor-parallel-plan auto`，并通过
+  `torchrun --nproc-per-node <num_gpus>` 启动。不要同时设置 `device_map` 和 `tp_plan`；Transformers 会在
+  weight loading 层面冲突。
+- `tensor_parallel` 依赖当前 Transformers 和 checkpoint config 支持 `tp_plan`。如果 Qwen3.5 27B 的当前环境不支持，
+  会在 `from_pretrained` 阶段报错；此时回退到 `device_map` 或考虑 vLLM。
+
+27B device_map 示例：
+
+```bash
+python scripts/run_hl_memory_zero_shot.py \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
+  --instruction "Put the crescent and square blocks into their corresponding slots" \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_27b \
+  --local-vlm-ckpt-path /path/to/Qwen3.5-27B \
+  --precision float16 \
+  --parallel-mode device_map \
+  --device-map auto \
+  --device cuda \
+  --debug-dir /tmp/hl_qwen35_27b_device_map
+```
+
+27B tensor parallel 示例：
+
+```bash
+torchrun --nproc-per-node 4 scripts/run_hl_memory_zero_shot.py \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
+  --instruction "Put the crescent and square blocks into their corresponding slots" \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_27b \
+  --local-vlm-ckpt-path /path/to/Qwen3.5-27B \
+  --precision float16 \
+  --parallel-mode tensor_parallel \
+  --tensor-parallel-plan auto \
+  --device cuda \
+  --debug-dir /tmp/hl_qwen35_27b_tp
+```
+
 Qwen3.5 thinking 控制：
 
 - HL memory 默认 `--no-enable-thinking`，也就是关闭 thinking。

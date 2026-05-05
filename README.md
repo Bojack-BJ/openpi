@@ -62,6 +62,9 @@ This repo also contains a standalone high-level memory / subtask pipeline under 
   - recent observation window
 - Runtime backends currently include `qwen2_5_vl` and `qwen3_5_vl`; Qwen3.5 supports `vlm_variant` values
   `qwen3_5_2b` / `qwen3_5_4b` / `qwen3_5_27b`.
+- For Qwen3.5 27B OOM, use `--parallel-mode device_map --device-map auto` first. Native tensor parallel is exposed as
+  `--parallel-mode tensor_parallel --tensor-parallel-plan auto` and should be launched with `torchrun` when supported by
+  the active Transformers/checkpoint config.
 - Qwen3.5 thinking is disabled by default for HL memory because this task expects short structured JSON. Use
   `--enable-thinking` only when you explicitly want reasoning traces; the parser will clean the output and extract the
   final JSON.

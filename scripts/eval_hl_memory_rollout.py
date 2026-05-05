@@ -29,6 +29,9 @@ class EvalArgs:
     enable_thinking: bool = False
     thinking_budget_tokens: int = 128
     thinking_max_new_tokens: int = 1024
+    parallel_mode: str = "none"
+    device_map: str = "auto"
+    tensor_parallel_plan: str = "auto"
     output_json: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -47,6 +50,9 @@ def main(args: EvalArgs) -> None:
         enable_thinking=args.enable_thinking,
         thinking_budget_tokens=args.thinking_budget_tokens,
         thinking_max_new_tokens=args.thinking_max_new_tokens,
+        parallel_mode=args.parallel_mode,
+        device_map=args.device_map,
+        tensor_parallel_plan=args.tensor_parallel_plan,
     )
     adapter = create_hf_adapter(hl_config)
     loaded = adapter.load(model_path=str(resolved_model_path), device=args.device)

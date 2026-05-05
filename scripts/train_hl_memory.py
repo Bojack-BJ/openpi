@@ -29,6 +29,9 @@ class TrainArgs:
     enable_thinking: bool = False
     thinking_budget_tokens: int = 128
     thinking_max_new_tokens: int = 1024
+    parallel_mode: str = "none"
+    device_map: str = "auto"
+    tensor_parallel_plan: str = "auto"
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
     batch_size: int = 1
@@ -56,6 +59,9 @@ def main(args: TrainArgs) -> None:
         enable_thinking=args.enable_thinking,
         thinking_budget_tokens=args.thinking_budget_tokens,
         thinking_max_new_tokens=args.thinking_max_new_tokens,
+        parallel_mode=args.parallel_mode,
+        device_map=args.device_map,
+        tensor_parallel_plan=args.tensor_parallel_plan,
     )
     adapter = create_hf_adapter(hl_config)
     loaded = adapter.load(

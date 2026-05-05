@@ -12,6 +12,9 @@ def test_qwen3_5_defaults_to_2b_model_id():
     assert not config.enable_thinking
     assert config.thinking_budget_tokens == 128
     assert config.thinking_max_new_tokens == 1024
+    assert config.parallel_mode == "none"
+    assert config.device_map == "auto"
+    assert config.tensor_parallel_plan == "auto"
 
 
 def test_qwen3_5_4b_variant_sets_model_id():
@@ -36,3 +39,22 @@ def test_qwen3_5_rejects_unknown_variant():
 def test_thinking_budget_must_be_positive():
     with pytest.raises(ValueError, match="thinking_budget_tokens"):
         HLMemoryConfig(thinking_budget_tokens=0)
+
+
+def test_parallel_mode_accepts_device_map():
+    config = HLMemoryConfig(parallel_mode="device_map", device_map="balanced")
+
+    assert config.parallel_mode == "device_map"
+    assert config.device_map == "balanced"
+
+
+def test_parallel_mode_accepts_tensor_parallel():
+    config = HLMemoryConfig(parallel_mode="tensor_parallel", tensor_parallel_plan="auto")
+
+    assert config.parallel_mode == "tensor_parallel"
+    assert config.tensor_parallel_plan == "auto"
+
+
+def test_parallel_mode_rejects_unknown_value():
+    with pytest.raises(ValueError, match="parallel_mode"):
+        HLMemoryConfig(parallel_mode="fsdp")  # type: ignore[arg-type]
