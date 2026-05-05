@@ -203,11 +203,16 @@ class InjectOptionalGuidanceFields(DataTransformFn):
     """Inject default optional mask/subtask fields before a strict repack transform."""
 
     image_to_mask_paths: Mapping[str, str]
+    image_default_paths: Mapping[str, str] = dataclasses.field(default_factory=dict)
     subtask_input_paths: Sequence[str] = ("subtask", "current_subtask")
     subtask_output_path: str = "subtask"
 
     def __call__(self, data: DataDict) -> DataDict:
         out = dict(data)
+
+        for target_path, source_path in self.image_default_paths.items():
+            if target_path not in out and source_path in out:
+                out[target_path] = out[source_path]
 
         for image_path, mask_path in self.image_to_mask_paths.items():
             if mask_path in out or image_path not in out:

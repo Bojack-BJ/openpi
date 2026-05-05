@@ -134,6 +134,7 @@ def test_inject_optional_guidance_fields_adds_empty_masks_and_subtask():
     image = np.zeros((4, 5, 3), dtype=np.uint8)
     transform = _transforms.InjectOptionalGuidanceFields(
         image_to_mask_paths={"observation.images.robot_0_image": "observation.masks.robot_0_mask"},
+        image_default_paths={"observation.images.robot_0_overlay": "observation.images.robot_0_image"},
     )
 
     data = transform(
@@ -145,6 +146,7 @@ def test_inject_optional_guidance_fields_adds_empty_masks_and_subtask():
 
     assert data["observation.masks.robot_0_mask"].shape == (4, 5, 1)
     assert data["observation.masks.robot_0_mask"].dtype == np.uint8
+    assert data["observation.images.robot_0_overlay"] is image
     assert data["subtask"].item() == "pick up the sponge"
 
 

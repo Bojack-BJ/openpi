@@ -94,6 +94,9 @@ class DataConfig:
     # a frame-level "subtask" field before the normal repack/model transforms.
     subtask_segments_path: str | None = None
 
+    # Optional column projection for LeRobot parquet loading. Use this to avoid decoding unused image/video columns.
+    dataset_columns: Sequence[str] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -800,34 +803,73 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
     """Single-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
 
     overlay_alpha: float = 0.35
+    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay"] = "online_overlay"
 
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay"):
+            raise ValueError(f"Unsupported guidance_image_mode: {self.guidance_image_mode}")
+        image_path = (
+            "observation.images.front_overlay"
+            if self.guidance_image_mode == "offline_overlay"
+            else "observation.images.front"
+        )
+        use_online_overlay = self.guidance_image_mode == "online_overlay"
+        image_structure: dict[str, Any] = {"front": image_path}
+        repack_structure: dict[str, Any] = {
+            "state": "observation.state",
+            "actions": "action",
+            "image": image_structure,
+            "subtask": "subtask",
+            "prompt": "prompt",
+        }
+        if use_online_overlay:
+            repack_structure["mask"] = {"front": "observation.masks.front_mask"}
+
+        dataset_columns = [
+            "observation.state",
+            "action",
+            "robot_0_state",
+            image_path,
+            "subtask",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        ]
+        if use_online_overlay:
+            dataset_columns.append("observation.masks.front_mask")
+
         repack = _transforms.Group(
             inputs=[
                 _transforms.InjectOptionalGuidanceFields(
                     image_to_mask_paths={
                         "observation.images.front": "observation.masks.front_mask",
-                    },
-                ),
-                _transforms.RepackTransform(
-                    {
-                        "state": "observation.state",
-                        "actions": "action",
-                        "image": {"front": "observation.images.front"},
-                        "mask": {"front": "observation.masks.front_mask"},
-                        "subtask": "subtask",
-                        "prompt": "prompt",
                     }
+                    if use_online_overlay
+                    else {},
+                    image_default_paths={
+                        "observation.images.front_overlay": "observation.images.front",
+                    }
+                    if self.guidance_image_mode == "offline_overlay"
+                    else {},
                 ),
+                _transforms.RepackTransform(repack_structure),
             ]
         )
 
         data_transforms = _transforms.Group(
             inputs=[
                 _transforms.ToNumpy(),
-                _transforms.OverlayMasksOnImages(
-                    image_to_mask_keys={"front": "front"},
-                    alpha=self.overlay_alpha,
+                *(
+                    [
+                        _transforms.OverlayMasksOnImages(
+                            image_to_mask_keys={"front": "front"},
+                            alpha=self.overlay_alpha,
+                        )
+                    ]
+                    if self.guidance_image_mode == "online_overlay"
+                    else []
                 ),
                 _transforms.ComposePromptWithSubtask(),
                 fastumi_policy.FastUMIInputs(
@@ -879,6 +921,7 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=keys,
+            dataset_columns=tuple(dataset_columns),
         )
 
 
@@ -887,44 +930,95 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
     """Dual-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
 
     overlay_alpha: float = 0.35
+    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay"] = "online_overlay"
 
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay"):
+            raise ValueError(f"Unsupported guidance_image_mode: {self.guidance_image_mode}")
+        robot_0_image_path = (
+            "observation.images.robot_0_overlay"
+            if self.guidance_image_mode == "offline_overlay"
+            else "observation.images.robot_0_image"
+        )
+        robot_1_image_path = (
+            "observation.images.robot_1_overlay"
+            if self.guidance_image_mode == "offline_overlay"
+            else "observation.images.robot_1_image"
+        )
+        use_online_overlay = self.guidance_image_mode == "online_overlay"
+        repack_structure: dict[str, Any] = {
+            "state": "observation.state",
+            "actions": "action",
+            "image": {
+                "robot_0": robot_0_image_path,
+                "robot_1": robot_1_image_path,
+            },
+            "subtask": "subtask",
+            "prompt": "prompt",
+        }
+        if use_online_overlay:
+            repack_structure["mask"] = {
+                "robot_0": "observation.masks.robot_0_mask",
+                "robot_1": "observation.masks.robot_1_mask",
+            }
+
+        dataset_columns = [
+            "observation.state",
+            "action",
+            "robot_0_state",
+            "robot_1_state",
+            robot_0_image_path,
+            robot_1_image_path,
+            "subtask",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        ]
+        if use_online_overlay:
+            dataset_columns.extend(
+                [
+                    "observation.masks.robot_0_mask",
+                    "observation.masks.robot_1_mask",
+                ]
+            )
+
         repack = _transforms.Group(
             inputs=[
                 _transforms.InjectOptionalGuidanceFields(
                     image_to_mask_paths={
                         "observation.images.robot_0_image": "observation.masks.robot_0_mask",
                         "observation.images.robot_1_image": "observation.masks.robot_1_mask",
-                    },
-                ),
-                _transforms.RepackTransform(
-                    {
-                        "state": "observation.state",
-                        "actions": "action",
-                        "image": {
-                            "robot_0": "observation.images.robot_0_image",
-                            "robot_1": "observation.images.robot_1_image",
-                        },
-                        "mask": {
-                            "robot_0": "observation.masks.robot_0_mask",
-                            "robot_1": "observation.masks.robot_1_mask",
-                        },
-                        "subtask": "subtask",
-                        "prompt": "prompt",
                     }
+                    if use_online_overlay
+                    else {},
+                    image_default_paths={
+                        "observation.images.robot_0_overlay": "observation.images.robot_0_image",
+                        "observation.images.robot_1_overlay": "observation.images.robot_1_image",
+                    }
+                    if self.guidance_image_mode == "offline_overlay"
+                    else {},
                 ),
+                _transforms.RepackTransform(repack_structure),
             ]
         )
 
         data_transforms = _transforms.Group(
             inputs=[
                 _transforms.ToNumpy(),
-                _transforms.OverlayMasksOnImages(
-                    image_to_mask_keys={
-                        "robot_0": "robot_0",
-                        "robot_1": "robot_1",
-                    },
-                    alpha=self.overlay_alpha,
+                *(
+                    [
+                        _transforms.OverlayMasksOnImages(
+                            image_to_mask_keys={
+                                "robot_0": "robot_0",
+                                "robot_1": "robot_1",
+                            },
+                            alpha=self.overlay_alpha,
+                        )
+                    ]
+                    if self.guidance_image_mode == "online_overlay"
+                    else []
                 ),
                 _transforms.ComposePromptWithSubtask(),
                 fastumi_policy.FastUMIInputs(
@@ -974,6 +1068,7 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=keys,
+            dataset_columns=tuple(dataset_columns),
         )
 
 @dataclasses.dataclass(frozen=True)
@@ -1162,6 +1257,8 @@ class TrainConfig:
     num_workers: int = 2
     # Number of already-materialized training batches to keep in a host/device-side prefetch buffer.
     train_prefetch_batches: int = 2
+    # If true, log host-side efficiency metrics such as data wait time and examples/sec to W&B.
+    log_efficiency_metrics: bool = True
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -2267,6 +2364,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(),
         data=FastUMIData7DRPYGuidedConfig(
             repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="offline_overlay",
             assets=AssetsConfig(
                 assets_dir="./assets/sponge_visual_guided",
                 asset_id="fastumi/sponge_visual_guided",
@@ -2288,6 +2386,7 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(pi05=True),
         data=FastUMIData7DRPYGuidedConfig(
             repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="offline_overlay",
             assets=AssetsConfig(
                 assets_dir="./assets/sponge_visual_guided",
                 asset_id="fastumi/sponge_visual_guided",
@@ -2312,6 +2411,7 @@ _CONFIGS = [
         ),
         data=FastUMIData7DRPYGuidedConfig(
             repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="offline_overlay",
             assets=AssetsConfig(
                 assets_dir="./assets/sponge_visual_guided",
                 asset_id="fastumi/sponge_visual_guided",
@@ -2336,6 +2436,7 @@ _CONFIGS = [
         ),
         data=FastUMIData7DRPYGuidedConfig(
             repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="offline_overlay",
             assets=AssetsConfig(
                 assets_dir="./assets/sponge_visual_guided",
                 asset_id="fastumi/sponge_visual_guided",

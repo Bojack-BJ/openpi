@@ -147,11 +147,13 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    selected_columns = _resolve_dataset_columns(data_config, dataset_meta)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        selected_columns=selected_columns,
     )
     dataset_root = dataset.root
 
@@ -164,6 +166,39 @@ def create_torch_dataset(
         )
 
     return dataset
+
+
+_DATASET_COLUMN_FALLBACKS = {
+    "observation.images.front_overlay": "observation.images.front",
+    "observation.images.robot_0_overlay": "observation.images.robot_0_image",
+    "observation.images.robot_1_overlay": "observation.images.robot_1_image",
+}
+
+
+def _resolve_dataset_columns(data_config: _config.DataConfig, dataset_meta: Any) -> tuple[str, ...] | None:
+    if data_config.dataset_columns is None:
+        return None
+
+    features = dict(getattr(dataset_meta, "features", {}) or {})
+    existing_columns = set(features)
+    selected: list[str] = []
+    missing: list[str] = []
+    for column in data_config.dataset_columns:
+        if column in existing_columns:
+            selected.append(column)
+            continue
+        fallback = _DATASET_COLUMN_FALLBACKS.get(column)
+        if fallback is not None and fallback in existing_columns:
+            selected.append(fallback)
+            continue
+        missing.append(column)
+
+    selected = list(dict.fromkeys(selected))
+    if missing:
+        logging.info("LeRobot dataset column projection skipped missing columns: %s", ", ".join(missing))
+    if selected:
+        logging.info("LeRobot dataset column projection enabled: %s", ", ".join(selected))
+    return tuple(selected) if selected else None
 
 
 def _load_subtask_segments(path: str, dataset_root: pathlib.Path) -> dict[int, tuple[tuple[int, int, str], ...]]:
