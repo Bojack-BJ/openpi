@@ -162,7 +162,7 @@ python scripts/train_hl_memory.py \
 当前约束：
 
 - `qwen2_5_vl`：已实现 Torch/HF runtime adapter
-- `qwen3_5_vl`：已实现 Torch/HF runtime adapter，支持 `vlm_variant=qwen3_5_2b` / `qwen3_5_4b`
+- `qwen3_5_vl`：已实现 Torch/HF runtime adapter，支持 `vlm_variant=qwen3_5_2b` / `qwen3_5_4b` / `qwen3_5_27b`
 - `paligemma`：明确不支持这条双 clip / 视频式 HL 路径，会直接报错
 
 Qwen3.5 variant 选择：
@@ -198,6 +198,7 @@ python scripts/run_hl_memory_zero_shot.py \
 
 - `--vlm-variant 2b` -> `Qwen/Qwen3.5-2B`
 - `--vlm-variant 4b` -> `Qwen/Qwen3.5-4B`
+- `--vlm-variant 27b` -> `Qwen/Qwen3.5-27B`
 
 如果传了 `--local-vlm-ckpt-path`，会优先从本地路径加载；否则用 variant 对应的默认 HF model id。
 
@@ -765,6 +766,18 @@ DEVICE=cuda \
 MODEL_BACKEND=qwen3_5_vl \
 MODEL_VARIANT=qwen3_5_4b \
 MODEL_ID=Qwen/Qwen3.5-4B \
+TRAIN_STEPS=20 \
+scripts/hl_memory_crosstask_smoke.sh
+```
+
+Qwen3.5 27B smoke：
+
+```bash
+DATA_ROOT=/path/to/data/crosstask \
+DEVICE=cuda \
+MODEL_BACKEND=qwen3_5_vl \
+MODEL_VARIANT=qwen3_5_27b \
+MODEL_ID=Qwen/Qwen3.5-27B \
 TRAIN_STEPS=20 \
 scripts/hl_memory_crosstask_smoke.sh
 ```

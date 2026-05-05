@@ -18,13 +18,16 @@ _MODEL_IDS_BY_VARIANT: dict[str, str] = {
     "qwen2_5_3b": "Qwen/Qwen2.5-VL-3B-Instruct",
     "qwen3_5_2b": "Qwen/Qwen3.5-2B",
     "qwen3_5_4b": "Qwen/Qwen3.5-4B",
+    "qwen3_5_27b": "Qwen/Qwen3.5-27B",
 }
 
 _VARIANT_ALIASES: dict[str, str] = {
     "2b": "qwen3_5_2b",
     "4b": "qwen3_5_4b",
+    "27b": "qwen3_5_27b",
     "qwen35_2b": "qwen3_5_2b",
     "qwen35_4b": "qwen3_5_4b",
+    "qwen35_27b": "qwen3_5_27b",
 }
 
 _SUPPORTED_RUNTIME_BACKENDS = {"qwen2_5_vl", "qwen3_5_vl"}
@@ -103,10 +106,10 @@ def _resolve_variant(vlm_backend: HLVLMBackend, variant: str | None) -> str | No
             raise ValueError("`vlm_backend=qwen2_5_vl` currently supports only `vlm_variant=qwen2_5_3b`.")
         return normalized
     if vlm_backend == "qwen3_5_vl":
-        if normalized not in {"qwen3_5_2b", "qwen3_5_4b"}:
+        if normalized not in {"qwen3_5_2b", "qwen3_5_4b", "qwen3_5_27b"}:
             raise ValueError(
-                "`vlm_backend=qwen3_5_vl` supports `vlm_variant=qwen3_5_2b` or `qwen3_5_4b` "
-                "(aliases: `2b`, `4b`)."
+                "`vlm_backend=qwen3_5_vl` supports `vlm_variant=qwen3_5_2b`, `qwen3_5_4b`, "
+                "or `qwen3_5_27b` (aliases: `2b`, `4b`, `27b`)."
             )
         return normalized
     raise ValueError(f"Unsupported HL VLM backend: {vlm_backend}")
