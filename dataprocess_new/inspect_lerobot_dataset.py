@@ -178,9 +178,15 @@ def _flatten(prefix: str, value: Any) -> Iterable[tuple[str, Any]]:
 
 def _summarize_value(value: Any) -> dict[str, Any]:
     summary: dict[str, Any] = {"type": type(value).__name__}
+    array = _to_numpy(value)
     shape = _shape_of(value)
     dtype = _dtype_of(value)
-    value_range = _numeric_range(value)
+    if array is not None:
+        shape = shape or tuple(array.shape)
+        dtype = dtype or str(array.dtype)
+    value_range = None
+    if array is not None and array.size > 0 and np.issubdtype(array.dtype, np.number):
+        value_range = float(np.nanmin(array)), float(np.nanmax(array))
     if shape is not None:
         summary["shape"] = shape
     if dtype is not None:
@@ -188,7 +194,9 @@ def _summarize_value(value: Any) -> dict[str, Any]:
     if value_range is not None:
         summary["min"] = value_range[0]
         summary["max"] = value_range[1]
-    if shape is None or shape == ():
+    if array is not None and array.shape != () and array.size <= 32:
+        summary["value"] = _short_value(array.tolist())
+    elif shape is None or shape == ():
         summary["value"] = _short_value(value)
     return summary
 
@@ -533,6 +541,7 @@ def _save_previews(
     sample_index: int,
     preview_dir: Path,
     dataset_root: Path | None = None,
+    include_masks: bool = True,
 ) -> list[Path]:
     try:
         from PIL import Image
@@ -545,6 +554,8 @@ def _save_previews(
     seen: set[str] = set()
     for key, value in _iter_preview_candidates("", sample):
         if key in seen:
+            continue
+        if not include_masks and "mask" in key.lower():
             continue
         array = _image_array(value, dataset_root=dataset_root)
         if array is None:
@@ -582,6 +593,7 @@ def main() -> None:
     parser.add_argument("--max-features", type=int, default=80, help="Max feature/task entries to print.")
     parser.add_argument("--max-episodes", type=int, default=20, help="Max episode rows to print.")
     parser.add_argument("--preview-dir", type=Path, default=None, help="Optional directory to save image/mask previews.")
+    parser.add_argument("--no-mask-preview", action="store_true", help="Do not export mask previews.")
     parser.add_argument("--json-out", type=Path, default=None, help="Optional path to write machine-readable summary JSON.")
     args = parser.parse_args()
 
@@ -681,7 +693,13 @@ def main() -> None:
         samples_summary[sample_index] = sample_summary
 
         if args.preview_dir is not None:
-            preview_paths = _save_previews(sample, sample_index, args.preview_dir, dataset_root=root)
+            preview_paths = _save_previews(
+                sample,
+                sample_index,
+                args.preview_dir,
+                dataset_root=root,
+                include_masks=not args.no_mask_preview,
+            )
             if preview_paths:
                 print("  preview_files:")
                 for path in preview_paths:
