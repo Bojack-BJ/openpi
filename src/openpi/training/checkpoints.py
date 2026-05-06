@@ -138,10 +138,26 @@ def restore_state(
                 step=step,
                 legacy_root=True,
             )
-        restored = {
-            "train_state": _device_put_like_tree(restored["train_state"], state_sharding),
-            "params": _device_put_like_tree(restored["params"], {"params": state_sharding.params}),
-        }
+        try:
+            restored = {
+                "train_state": _device_put_like_tree(restored["train_state"], state_sharding),
+                "params": _device_put_like_tree(restored["params"], {"params": state_sharding.params}),
+            }
+        except ValueError as exc:
+            if not _looks_like_sharding_structure_mismatch(exc):
+                raise
+            logging.warning(
+                "Checkpoint train state is structurally incompatible with current sharding tree; "
+                "restoring params only and reinitializing optimizer state."
+            )
+            return _restore_params_only_state(
+                checkpoint_manager,
+                state,
+                state_sharding,
+                params=params,
+                step=step,
+                legacy_root=False,
+            )
     return _merge_params(restored["train_state"], restored["params"])
 
 
@@ -219,6 +235,10 @@ def _looks_like_legacy_vlm_root_mismatch(exc: ValueError, reference_params: Mapp
 def _looks_like_opt_state_structure_mismatch(exc: ValueError) -> bool:
     msg = str(exc)
     return "tree structures do not match" in msg and "opt_state" in msg
+
+
+def _looks_like_sharding_structure_mismatch(exc: ValueError) -> bool:
+    return "Sharding tree is not structurally compatible with restored item" in str(exc)
 
 
 def _remap_restored_params_item(
