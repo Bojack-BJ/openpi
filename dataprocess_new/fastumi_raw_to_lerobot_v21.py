@@ -548,6 +548,23 @@ def resize_mask_no_crop(mask: np.ndarray, out_hw: int = 224) -> np.ndarray:
     return ((mask > 0).astype(np.uint8) * 255)[..., None]
 
 
+def mask_to_rgb(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        if mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        elif mask.shape[0] == 1:
+            mask = mask[0]
+        elif mask.shape[-1] in (3, 4):
+            mask = np.max(mask[..., :3], axis=-1)
+        elif mask.shape[0] in (3, 4):
+            mask = np.max(mask[:3], axis=0)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected mask rank 2 or single-channel/rgb rank 3, got shape={mask.shape}")
+    mask_u8 = ((mask > 0).astype(np.uint8) * 255)
+    return np.repeat(mask_u8[..., None], 3, axis=-1)
+
+
 def _mask_contour(mask: np.ndarray) -> np.ndarray:
     padded = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
     eroded = mask.astype(bool).copy()
@@ -805,8 +822,8 @@ def create_empty_dataset(
                 "names": ["text"],
             }
             features["observation.masks.front_mask"] = {
-                "dtype": "uint8",
-                "shape": (224, 224, 1),
+                "dtype": mode,
+                "shape": (224, 224, 3),
                 "names": ["height", "width", "channels"],
             }
             if include_overlay_images:
@@ -838,13 +855,13 @@ def create_empty_dataset(
                 "names": ["text"],
             }
             features["observation.masks.robot_0_mask"] = {
-                "dtype": "uint8",
-                "shape": (224, 224, 1),
+                "dtype": mode,
+                "shape": (224, 224, 3),
                 "names": ["height", "width", "channels"],
             }
             features["observation.masks.robot_1_mask"] = {
-                "dtype": "uint8",
-                "shape": (224, 224, 1),
+                "dtype": mode,
+                "shape": (224, 224, 3),
                 "names": ["height", "width", "channels"],
             }
             if include_overlay_images:
@@ -1098,7 +1115,9 @@ def write_single_from_npz(
         }
         if include_guidance:
             frame["subtask"] = subtask
-            frame["observation.masks.front_mask"] = masks[i] if masks is not None else np.zeros((224, 224, 1), dtype=np.uint8)
+            frame["observation.masks.front_mask"] = (
+                mask_to_rgb(masks[i]) if masks is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+            )
             if include_overlay_images and overlay_target == "extra":
                 frame["observation.images.front_overlay"] = (
                     overlays[i] if overlays is not None else images[i]
@@ -1146,8 +1165,12 @@ def write_dual_from_npz(
         }
         if include_guidance:
             frame["subtask"] = subtask
-            frame["observation.masks.robot_0_mask"] = mask_l[i] if mask_l is not None else np.zeros((224, 224, 1), dtype=np.uint8)
-            frame["observation.masks.robot_1_mask"] = mask_r[i] if mask_r is not None else np.zeros((224, 224, 1), dtype=np.uint8)
+            frame["observation.masks.robot_0_mask"] = (
+                mask_to_rgb(mask_l[i]) if mask_l is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+            )
+            frame["observation.masks.robot_1_mask"] = (
+                mask_to_rgb(mask_r[i]) if mask_r is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+            )
             if include_overlay_images and overlay_target == "extra":
                 frame["observation.images.robot_0_overlay"] = overlay_l[i] if overlay_l is not None else img_l[i]
                 frame["observation.images.robot_1_overlay"] = overlay_r[i] if overlay_r is not None else img_r[i]
