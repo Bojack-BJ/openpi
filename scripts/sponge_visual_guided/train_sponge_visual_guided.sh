@@ -40,4 +40,4 @@ python scripts/train.py "$cfg" \
   --project_name "${PROJECT_NAME:-umi-openpi}" \
   --fsdp_devices "${FSDP_DEVICES:-8}" \
   --jax-compilation-cache-dir "${JAX_COMPILATION_CACHE_DIR:-/root/Users/.cache/jax/openpi}" \
-  --overwrite
+  --resume
