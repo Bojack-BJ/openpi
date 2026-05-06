@@ -148,6 +148,7 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     selected_columns = _resolve_dataset_columns(data_config, dataset_meta)
+    selected_columns = None
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
