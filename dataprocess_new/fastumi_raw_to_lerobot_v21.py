@@ -1044,7 +1044,7 @@ def write_single_from_npz(
             "observation.images.front": image,
         }
         if include_guidance:
-            frame["subtask"] = np.asarray([subtask])
+            frame["subtask"] = subtask
             frame["observation.masks.front_mask"] = masks[i] if masks is not None else np.zeros((224, 224, 1), dtype=np.uint8)
             if include_overlay_images and overlay_target == "extra":
                 frame["observation.images.front_overlay"] = (
@@ -1092,7 +1092,7 @@ def write_dual_from_npz(
             "observation.images.robot_1_image": image_r,
         }
         if include_guidance:
-            frame["subtask"] = np.asarray([subtask])
+            frame["subtask"] = subtask
             frame["observation.masks.robot_0_mask"] = mask_l[i] if mask_l is not None else np.zeros((224, 224, 1), dtype=np.uint8)
             frame["observation.masks.robot_1_mask"] = mask_r[i] if mask_r is not None else np.zeros((224, 224, 1), dtype=np.uint8)
             if include_overlay_images and overlay_target == "extra":
