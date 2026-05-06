@@ -27,7 +27,7 @@
 
 运行方式：
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
-            --raw-dir <raw_dir> \
+            --raw-dir <raw_dir> [<raw_dir> ...] \
             --repo-id <repo_id> \
             --task <task_name> \
             --robot-type <robot_type>
@@ -46,6 +46,16 @@
             --mode image \
             --workers 8 \
             --max-inflight 16
+
+        # raw data 分散存储时，可以一次传多个根目录，也可以直接传 session 目录
+        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir /data/fastumi/part_a /data/fastumi/part_b \
+            --repo-id fastumi/my_task \
+            --task "My task" \
+            --robot-type robotiq \
+            --fps 20 \
+            --traj-source merge \
+            --mode image
             
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
             --raw-dir /root/Users/pzh/pointVLA_raw_data/20260422 \
@@ -75,10 +85,10 @@
 
 参数说明：
         --raw-dir
-            含义：FastUMI 原始数据根目录，脚本会递归查找所有 session* 子目录。
-            类型：Path
+            含义：FastUMI 原始数据根目录或 session 目录；可一次传多个路径，也可重复传参。
+            类型：Path+
             是否必填：是
-            示例：--raw-dir /data/fastumi/task_20260121H011
+            示例：--raw-dir /data/fastumi/task_a /data/fastumi/task_b
 
         --repo-id
             含义：LeRobot 数据集仓库 ID（相对 HF_LEROBOT_HOME 的目标路径）。
@@ -336,11 +346,27 @@ def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, object]) -> Tuple[Dict[str, o
 
 def find_all_sessions(raw_root: Path) -> List[Path]:
     found: List[Path] = []
+    if raw_root.name.startswith("session") and detect_layout(raw_root)[0] != "invalid":
+        found.append(raw_root)
     for r, dirs, _files in os.walk(raw_root):
         for d in dirs:
             if d.startswith("session"):
                 found.append(Path(r) / d)
     return sorted(found)
+
+
+def find_all_sessions_in_roots(raw_roots: List[Path]) -> List[Path]:
+    found_by_path: Dict[Path, Path] = {}
+    for raw_root in raw_roots:
+        if not raw_root.exists():
+            raise FileNotFoundError(f"--raw-dir does not exist: {raw_root}")
+        for session_path in find_all_sessions(raw_root):
+            try:
+                key = session_path.resolve()
+            except OSError:
+                key = session_path
+            found_by_path.setdefault(key, session_path)
+    return sorted(found_by_path.values())
 
 
 def detect_layout(session_path: Path) -> Tuple[str, Dict[str, Path]]:
@@ -1181,7 +1207,14 @@ def write_dual_from_npz(
 
 def main():
     parser = argparse.ArgumentParser(description="FastUMI rawdata -> LeRobot v2.1 (safe parallel) with Step1 processing.")
-    parser.add_argument("--raw-dir", type=Path, required=True, help="Raw data root (search recursively for session*)")
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        required=True,
+        nargs="+",
+        action="append",
+        help="Raw data root(s) or session dir(s). Searches recursively for session*. Can be repeated.",
+    )
     parser.add_argument("--repo-id", type=str, required=True, help="LeRobot repo id, e.g. fastumi/task_xxx")
     parser.add_argument("--task", type=str, required=True, help="Task string stored in each frame")
     parser.add_argument(
@@ -1231,7 +1264,7 @@ def main():
 
     args = parser.parse_args()
 
-    raw_dir: Path = args.raw_dir
+    raw_dirs: List[Path] = [path for group in args.raw_dir for path in group]
     repo_id: str = args.repo_id
     task: str = args.task
     robot_type: str = args.robot_type
@@ -1248,12 +1281,10 @@ def main():
         include_guidance = True
     store_extra_overlay_images = include_overlay_images and overlay_target == "extra"
 
-    if not raw_dir.exists():
-        raise FileNotFoundError(f"--raw-dir does not exist: {raw_dir}")
-
-    sessions = find_all_sessions(raw_dir)
+    sessions = find_all_sessions_in_roots(raw_dirs)
     if not sessions:
-        raise RuntimeError(f"No session* directories found under: {raw_dir}")
+        raise RuntimeError(f"No session* directories found under: {', '.join(str(path) for path in raw_dirs)}")
+    print(f"[Info] Found {len(sessions)} session(s) under {len(raw_dirs)} raw root(s).")
 
     layout = None
     valid: List[Tuple[Path, str, Dict[str, Path]]] = []
@@ -1266,12 +1297,12 @@ def main():
             layout = m
         elif layout != m:
             raise RuntimeError(
-                f"Mixed layouts under {raw_dir}: already '{layout}', but session {s} is '{m}'. "
+                f"Mixed layouts under raw roots: already '{layout}', but session {s} is '{m}'. "
                 f"Please convert single/dual tasks separately."
             )
 
     if not valid or layout is None:
-        raise RuntimeError(f"No valid sessions found under: {raw_dir}")
+        raise RuntimeError(f"No valid sessions found under: {', '.join(str(path) for path in raw_dirs)}")
 
     bimanual = (layout == "dual")
     step1_cfg, step1_cfg_dual = resolve_step1_configs(robot_type)
