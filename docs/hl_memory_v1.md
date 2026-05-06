@@ -283,6 +283,30 @@ python scripts/run_hl_memory_zero_shot.py \
   --thinking-budget-tokens 128 \
   --thinking-max-new-tokens 1024 \
   --device cuda
+
+python scripts/run_hl_memory_zero_shot.py \
+  --left-video-path /root/Users/lixiaotong/openpi/cross_task_datasets/block_left.mp4 \
+  --right-video-path /root/Users/lixiaotong/openpi/cross_task_datasets/block_right.mp4 \
+  --instruction "Put the crescent and square blocks into their corresponding slots" \
+  --language-memory "Task started." \
+  --rollout-interval-sec 2 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 20 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_27b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-27B \
+  --precision float16 \
+  --parallel-mode device_map \
+  --device-map auto \
+  --device cuda \
+  --debug-dir cross_task_datasets/debug_rollout_block \
+  --output-json cross_task_datasets/debug_rollout_block/summary.json \
+  --enable-thinking \
+  --thinking-budget-tokens 128 \
+  --thinking-max-new-tokens 1024 \
+  --parallel-mode device_map \
+  --device-map auto
 ```
 
 ## 离线 rollout 评估
