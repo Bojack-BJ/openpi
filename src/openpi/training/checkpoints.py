@@ -384,7 +384,9 @@ def _restore_params_only_state(
     params_sharding = state_sharding.params.to_pure_dict() if hasattr(state_sharding.params, "to_pure_dict") else state_sharding.params
     restored_params_pure = _device_put_like_tree(restored_params_pure, params_sharding)
     restored_params_state = _rehydrate_params_like_reference(params, restored_params_pure)
-    restored_state = _merge_params(base_state, {"params": restored_params_state})
+    restored_state = dataclasses.replace(base_state, params=restored_params_state)
+    if restored_state.ema_decay is not None:
+        restored_state = dataclasses.replace(restored_state, ema_params=restored_params_state)
     return dataclasses.replace(restored_state, step=np.asarray(restore_step, dtype=np.int32))
 
 
