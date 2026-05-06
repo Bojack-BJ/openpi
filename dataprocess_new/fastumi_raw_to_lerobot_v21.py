@@ -26,7 +26,11 @@
         4. 最后执行 consolidate/finalize/close，并按需复制输出、清理临时文件。
 
 运行方式：
-        python dataprocess_new/fastumi_raw_to_lerobot_v21.py --raw-dir <raw_dir> --repo-id <repo_id> --task <task_name>
+        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir <raw_dir> \
+            --repo-id <repo_id> \
+            --task <task_name> \
+            --robot-type <robot_type>
 
 运行示例：
         export HF_LEROBOT_HOME=/root/Users/dataset/lerobot_home
@@ -36,6 +40,7 @@
             --raw-dir /data/fastumi/task_20260121H011 \
             --repo-id fastumi_new/Fold_square_towels \
             --task "Fold square towels" \
+            --robot-type robotiq \
             --fps 20 \
             --traj-source merge \
             --mode image \
@@ -46,6 +51,7 @@
             --raw-dir /root/Users/pzh/pointVLA_raw_data/20260422 \
             --repo-id fastumi/sponge_visual_guided \
             --task "Put the target sponge into the target slot in the grid" \
+            --robot-type fasttouch \
             --fps 20 \
             --traj-source merge \
             --mode image \
@@ -58,6 +64,7 @@
             --raw-dir /root/Users/dataset/task_20260310H072Aa/good \
             --repo-id fastumi/Waste_sorting_a \
             --task "Sort the recyclable waste and hazardous waste into the corresponding bins" \
+            --robot-type fasttouch \
             --fps 30 \
             --traj-source merge \
             --mode image \
@@ -84,6 +91,13 @@
             类型：字符串
             是否必填：是
             示例：--task "Fold square towels"
+
+        --robot-type
+            含义：机器人类型，用于选择 Step1 坐标变换与夹爪归一化参数。
+            类型：字符串
+            是否必填：是
+            可选值：xarm6 / robotiq / fasttouch
+            示例：--robot-type fasttouch
 
         --fps
             含义：目标输出帧率（从 60Hz 原始相机帧下采样）。
@@ -213,7 +227,7 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 SOURCE_CAMERA_FPS = 60
 STATE_NAMES_8 = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_width"]
 
-STEP1_CFG = {
+STEP1_CFG_ROBOTIQ = {
     "base_x": 0.3,
     "base_y": 0.0,
     "base_z": 0.145,
@@ -221,22 +235,28 @@ STEP1_CFG = {
     "max_gripper": 88.0, # 84 for acone/fasttouch, 88 for robotiq
 }
 
-# # Xarm6
-# STEP1_CFG_DUAL = {
-#     "base_x_0": 0.250,
-#     "base_y_0": 0.2,
-#     "base_z_0": 0.145,
-#     "base_euler_deg_0": [180, -90, 0.0],
-#     "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
-#     "base_x_1": 0.250,
-#     "base_y_1": -0.2,
-#     "base_z_1": 0.145,
-#     "base_euler_deg_1": [180, -90, 0.0],
-#     "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
-# }
+STEP1_CFG_DUAL_ROBOTIQ = {
+    "base_x_0": 0.250,
+    "base_y_0": 0.2,
+    "base_z_0": 0.145,
+    "base_euler_deg_0": [180, -90, 0.0],
+    "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+    "base_x_1": 0.250,
+    "base_y_1": -0.2,
+    "base_z_1": 0.145,
+    "base_euler_deg_1": [180, -90, 0.0],
+    "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+}
 
-# fasttouch
-STEP1_CFG_DUAL = {
+STEP1_CFG_FASTTOUCH = {
+    "base_x": 0.3,
+    "base_y": 0.0,
+    "base_z": 0.16,
+    "base_euler_deg": [0.0, 0.0, 0.0],
+    "max_gripper": 84.0,
+}
+
+STEP1_CFG_DUAL_FASTTOUCH = {
     "base_x_0": 0.3,
     "base_y_0": 0.04,
     "base_z_0": 0.16,
@@ -249,37 +269,69 @@ STEP1_CFG_DUAL = {
     "max_gripper_1": 84.0, # 84 for acone/fasttouch, 88 for robotiq
 }
 
+STEP1_CONFIGS = {
+    "xarm6": {
+        "single": STEP1_CFG_ROBOTIQ,
+        "dual": STEP1_CFG_DUAL_ROBOTIQ,
+    },
+    "robotiq": {
+        "single": STEP1_CFG_ROBOTIQ,
+        "dual": STEP1_CFG_DUAL_ROBOTIQ,
+    },
+    "fasttouch": {
+        "single": STEP1_CFG_FASTTOUCH,
+        "dual": STEP1_CFG_DUAL_FASTTOUCH,
+    },
+}
 
-def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """Create per-arm step1 configs from explicit dual-arm keys.
 
-        Expected keys:
-            base_x_0, base_y_0, base_z_0, base_euler_deg_0, max_gripper_0
-            base_x_1, base_y_1, base_z_1, base_euler_deg_1, max_gripper_1
-        """
-        required = [
-            "base_x_0", "base_y_0", "base_z_0", "base_euler_deg_0", "max_gripper_0",
-            "base_x_1", "base_y_1", "base_z_1", "base_euler_deg_1", "max_gripper_1",
-        ]
-        missing = [k for k in required if k not in step1_cfg_dual]
-        if missing:
-            raise ValueError(f"Dual Step1 config missing keys: {missing}")
+def _copy_step1_cfg(step1_cfg: Dict[str, object]) -> Dict[str, object]:
+    result = dict(step1_cfg)
+    for key, value in list(result.items()):
+        if key.startswith("base_euler_deg"):
+            result[key] = list(value)
+    return result
 
-        cfg0 = {
-            "base_x": float(step1_cfg_dual["base_x_0"]),
-            "base_y": float(step1_cfg_dual["base_y_0"]),
-            "base_z": float(step1_cfg_dual["base_z_0"]),
-            "base_euler_deg": step1_cfg_dual["base_euler_deg_0"],
-            "max_gripper": float(step1_cfg_dual["max_gripper_0"]),
-        }
-        cfg1 = {
-            "base_x": float(step1_cfg_dual["base_x_1"]),
-            "base_y": float(step1_cfg_dual["base_y_1"]),
-            "base_z": float(step1_cfg_dual["base_z_1"]),
-            "base_euler_deg": step1_cfg_dual["base_euler_deg_1"],
-            "max_gripper": float(step1_cfg_dual["max_gripper_1"]),
-        }
-        return cfg0, cfg1
+
+def resolve_step1_configs(robot_type: str) -> Tuple[Dict[str, object], Dict[str, object]]:
+    try:
+        config = STEP1_CONFIGS[robot_type]
+    except KeyError as exc:
+        choices = ", ".join(sorted(STEP1_CONFIGS))
+        raise ValueError(f"Unsupported robot_type={robot_type!r}. Available robot types: {choices}") from exc
+    return _copy_step1_cfg(config["single"]), _copy_step1_cfg(config["dual"])
+
+
+def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, object]) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Create per-arm step1 configs from explicit dual-arm keys.
+
+    Expected keys:
+        base_x_0, base_y_0, base_z_0, base_euler_deg_0, max_gripper_0
+        base_x_1, base_y_1, base_z_1, base_euler_deg_1, max_gripper_1
+    """
+    required = [
+        "base_x_0", "base_y_0", "base_z_0", "base_euler_deg_0", "max_gripper_0",
+        "base_x_1", "base_y_1", "base_z_1", "base_euler_deg_1", "max_gripper_1",
+    ]
+    missing = [k for k in required if k not in step1_cfg_dual]
+    if missing:
+        raise ValueError(f"Dual Step1 config missing keys: {missing}")
+
+    cfg0 = {
+        "base_x": float(step1_cfg_dual["base_x_0"]),
+        "base_y": float(step1_cfg_dual["base_y_0"]),
+        "base_z": float(step1_cfg_dual["base_z_0"]),
+        "base_euler_deg": step1_cfg_dual["base_euler_deg_0"],
+        "max_gripper": float(step1_cfg_dual["max_gripper_0"]),
+    }
+    cfg1 = {
+        "base_x": float(step1_cfg_dual["base_x_1"]),
+        "base_y": float(step1_cfg_dual["base_y_1"]),
+        "base_z": float(step1_cfg_dual["base_z_1"]),
+        "base_euler_deg": step1_cfg_dual["base_euler_deg_1"],
+        "max_gripper": float(step1_cfg_dual["max_gripper_1"]),
+    }
+    return cfg0, cfg1
 
 
 def find_all_sessions(raw_root: Path) -> List[Path]:
@@ -728,6 +780,7 @@ def create_empty_dataset(
     *,
     repo_id: str,
     fps: int,
+    robot_type: str,
     mode: Literal["video", "image"],
     bimanual: bool,
     include_guidance: bool = False,
@@ -812,7 +865,7 @@ def create_empty_dataset(
     return LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
-        robot_type="fastumi",
+        robot_type=robot_type,
         features=features,
         use_videos=(mode == "video"),
         tolerance_s=dataset_config.tolerance_s,
@@ -1108,6 +1161,13 @@ def main():
     parser.add_argument("--raw-dir", type=Path, required=True, help="Raw data root (search recursively for session*)")
     parser.add_argument("--repo-id", type=str, required=True, help="LeRobot repo id, e.g. fastumi/task_xxx")
     parser.add_argument("--task", type=str, required=True, help="Task string stored in each frame")
+    parser.add_argument(
+        "--robot-type",
+        type=str,
+        required=True,
+        choices=sorted(STEP1_CONFIGS),
+        help="Robot type used to select Step1 coordinate/gripper configs.",
+    )
     parser.add_argument("--fps", type=int, default=20, choices=[20, 30, 60], help="Target fps (downsample from 60Hz)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Optional copy-out directory")
     parser.add_argument("--mode", type=str, default="image", choices=["image", "video"], help="Store images as image or video")
@@ -1151,6 +1211,7 @@ def main():
     raw_dir: Path = args.raw_dir
     repo_id: str = args.repo_id
     task: str = args.task
+    robot_type: str = args.robot_type
     fps: int = args.fps
     traj_source: str = args.traj_source
     use_next: bool = args.next
@@ -1190,8 +1251,7 @@ def main():
         raise RuntimeError(f"No valid sessions found under: {raw_dir}")
 
     bimanual = (layout == "dual")
-    step1_cfg = STEP1_CFG
-    step1_cfg_dual = STEP1_CFG_DUAL
+    step1_cfg, step1_cfg_dual = resolve_step1_configs(robot_type)
     step1_cfg_robot0, step1_cfg_robot1 = make_dual_step1_cfgs(step1_cfg_dual)
 
     # tmp dir
@@ -1216,6 +1276,7 @@ def main():
     dataset = create_empty_dataset(
         repo_id=repo_id,
         fps=fps,
+        robot_type=robot_type,
         mode=mode,
         bimanual=bimanual,
         include_guidance=include_guidance,
