@@ -16,7 +16,7 @@ SAM3 is included as a submodule:
 git submodule update --init --recursive third_party/sam3
 ```
 
-SAM3 is imported lazily only when `scripts/serve_policy.py --mask-overlay` is used.
+SAM3 is only used when `scripts/serve_policy.py --mask-overlay` is enabled. In that mode the server imports SAM3, checks the checkpoint path, and loads the model before accepting client requests, so dependency or weight failures surface at startup instead of during the first rollout step.
 
 SAM3 upstream currently requires a CUDA PyTorch environment and access to the checkpoint on Hugging Face. If `--sam3-checkpoint-path` is not provided, SAM3 will use its default Hugging Face download path, so make sure the server environment is authenticated.
 
@@ -30,6 +30,7 @@ python scripts/serve_policy.py \
   --mask-overlay \
   --mask-overlay-view robot_0 \
   --mask-overlay-alpha 0.35 \
+  --sam3-checkpoint-path /path/to/sam3.pt \
   policy:checkpoint \
   --policy.config sponge_visual_guided_pi05 \
   --policy.dir /path/to/checkpoint/step
@@ -43,6 +44,8 @@ Useful server options:
 - `--sam3-checkpoint-path`: optional local SAM3 checkpoint path.
 - `--sam3-device`: SAM3 device, default `cuda`.
 - `--sam3-path`: optional SAM3 source path; defaults to `third_party/sam3`.
+
+Startup will fail fast if the local checkpoint path does not exist or if SAM3 cannot be imported. If `--sam3-checkpoint-path` is omitted, SAM3 may download its default checkpoint during server startup.
 
 ## Start Rollout With Click Prompt
 

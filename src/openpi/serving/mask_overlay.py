@@ -4,6 +4,7 @@ import dataclasses
 import logging
 import pathlib
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -45,6 +46,9 @@ class Sam3ImageMaskOverlay:
         self._last_logits = None
         self._last_mask: np.ndarray | None = None
         self._last_bbox: tuple[int, int, int, int] | None = None
+
+    def preload(self) -> None:
+        self._ensure_loaded()
 
     def reset(self) -> None:
         self._state = None
@@ -140,22 +144,40 @@ class Sam3ImageMaskOverlay:
         if self._model is not None:
             return
 
+        if self._checkpoint_path is not None:
+            checkpoint_path_str = str(self._checkpoint_path)
+            checkpoint_path = pathlib.Path(checkpoint_path_str).expanduser()
+            if "://" not in checkpoint_path_str and not checkpoint_path.exists():
+                raise FileNotFoundError(f"SAM3 checkpoint does not exist: {checkpoint_path}")
+            self._checkpoint_path = str(checkpoint_path)
+
         if self._sam3_path.exists():
-            sys.path.insert(0, str(self._sam3_path))
+            sam3_path = str(self._sam3_path)
+            if sam3_path not in sys.path:
+                sys.path.insert(0, sam3_path)
 
         import sam3
         from sam3 import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
 
-        sam3_root = pathlib.Path(sam3.__file__).resolve().parent.parent
-        bpe_path = sam3_root / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-        self._model = build_sam3_image_model(
-            bpe_path=str(bpe_path),
-            checkpoint_path=self._checkpoint_path,
-            device=self._device,
-            enable_inst_interactivity=True,
+        sam3_package_dir = pathlib.Path(sam3.__file__).resolve().parent
+        bpe_path = sam3_package_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+        build_kwargs = {
+            "checkpoint_path": self._checkpoint_path,
+            "device": self._device,
+            "enable_inst_interactivity": True,
+        }
+        if bpe_path.exists():
+            build_kwargs["bpe_path"] = str(bpe_path)
+        logging.info(
+            "Loading SAM3 mask overlay model on %s from %s",
+            self._device,
+            self._checkpoint_path or "Hugging Face default checkpoint",
         )
+        start_time = time.monotonic()
+        self._model = build_sam3_image_model(**build_kwargs)
         self._processor = Sam3Processor(self._model)
+        logging.info("SAM3 mask overlay model loaded in %.1fs", time.monotonic() - start_time)
 
 
 class MaskOverlayPolicy(_base_policy.BasePolicy):
@@ -179,6 +201,9 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
             multimask_output=multimask_output,
             sam3_path=sam3_path,
         )
+
+    def preload(self) -> None:
+        self._segmenter.preload()
 
     def infer(self, obs: dict) -> dict:
         request = obs.get(MASK_OVERLAY_KEY)
