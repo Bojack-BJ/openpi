@@ -258,6 +258,39 @@ def _dump_mask_preview_debug(
     print(f"[MASK DEBUG] saved preview images under {debug_dir}")
 
 
+def _dump_mask_rollout_debug(
+    *,
+    debug_dir: pathlib.Path,
+    view: str,
+    infer_index: int,
+    payload: dict,
+) -> None:
+    overlay = payload.get("overlay")
+    if overlay is None:
+        print(f"[MASK DEBUG] infer={infer_index:06d} has no overlay payload; keys={sorted(payload)}")
+        return
+
+    overlay = np.asarray(overlay)
+    mask = np.asarray(payload.get("mask", np.zeros(overlay.shape[:2], dtype=np.uint8)))
+    server_image = payload.get("image")
+    print(
+        "[MASK DEBUG]",
+        f"infer={infer_index:06d}",
+        f"view={view}",
+        f"initialized={payload.get('initialized')}",
+        f"score={payload.get('score')}",
+        f"bbox={payload.get('bbox_xyxy')}",
+        _array_stats("overlay", overlay),
+        _array_stats("mask", mask),
+    )
+
+    prefix = debug_dir / "rollout" / f"{infer_index:06d}_{view}"
+    if server_image is not None:
+        _save_debug_image(prefix.with_name(prefix.name + "_server.png"), np.asarray(server_image))
+    _save_debug_image(prefix.with_name(prefix.name + "_overlay.png"), overlay)
+    cv2.imwrite(str(prefix.with_name(prefix.name + "_mask.png")), mask)
+
+
 def _preview_mask_overlay(
     policy_client,
     *,
@@ -551,6 +584,7 @@ def main():
     print("[INFO] 摄像头预热完成，开始循环")
 
     input("按 Enter 开始")
+    mask_debug_dir = pathlib.Path(args.mask_debug_dir) if args.mask_debug_dir else None
     if args.mask_overlay:
         if is_dual:
             preview_images = {
@@ -568,7 +602,7 @@ def main():
             view=effective_mask_view,
             point_xy=_parse_xy(args.mask_prompt_point),
             alpha=args.mask_alpha,
-            debug_dir=pathlib.Path(args.mask_debug_dir) if args.mask_debug_dir else None,
+            debug_dir=mask_debug_dir,
         )
         print("[INFO] SAM3 mask overlay 已确认，后续推理会持续请求 overlay")
 
@@ -581,6 +615,7 @@ def main():
         print("[INFO] 按 s：复位到初始位姿并暂停推理；按 c：继续推理")
 
         paused = False
+        infer_index = 0
         while True:
             ch = _stdin_read_char_nonblocking()
             if ch in ("s", "S"):
@@ -668,8 +703,18 @@ def main():
                     "view": effective_mask_view,
                     "alpha": args.mask_alpha,
                 }
+                if mask_debug_dir is not None:
+                    obs[MASK_OVERLAY_KEY]["return_image"] = True
 
             resp = policy_client.infer(obs)
+            if args.mask_overlay and mask_debug_dir is not None:
+                _dump_mask_rollout_debug(
+                    debug_dir=mask_debug_dir,
+                    view=effective_mask_view,
+                    infer_index=infer_index,
+                    payload=resp.get(MASK_OVERLAY_KEY, {}),
+                )
+            infer_index += 1
             actions_all = resp["actions"] if "actions" in resp else resp["action"]
             actions_all = np.array(actions_all, dtype=np.float64, copy=True)
             if actions_all.ndim == 1:

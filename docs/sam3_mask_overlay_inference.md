@@ -91,12 +91,14 @@ Normal preview requests only return the overlay and mask. To debug black preview
 --mask_debug_dir /tmp/openpi_mask_overlay_preview
 ```
 
-With `--mask_debug_dir`, the client asks the server to echo the image it received and saves four debug files:
+With `--mask_debug_dir`, the client asks the server to echo the image it received during preview and normal rollout inference. Preview saves four debug files:
 
 - `*_client.png`: image before websocket send.
 - `*_server.png`: image received by the policy server.
 - `*_overlay.png`: server-generated overlay.
 - `*_mask.png`: server-generated mask.
+
+During rollout, every policy inference also saves `rollout/<infer_index>_<view>_server.png`, `rollout/<infer_index>_<view>_overlay.png`, and `rollout/<infer_index>_<view>_mask.png`.
 
 If the returned preview is black, compare these files first. If `*_client.png` is already black, the issue is camera capture or device mapping. If `*_client.png` is normal but `*_server.png` is black, the issue is serialization/input conversion. If both are normal but `*_overlay.png` is black, the issue is in server-side SAM3 overlay generation.
 
