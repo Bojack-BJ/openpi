@@ -641,10 +641,16 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
         tracking_mode: str = "image",
         video_window_size: int = 8,
         video_version: str = "sam3",
+        output_mode: str = "overlay",
+        mask_key_suffix: str = "_mask",
     ) -> None:
         self._policy = policy
         self._default_view = default_view
         self._tracking_mode = tracking_mode
+        if output_mode not in {"overlay", "mask_image"}:
+            raise ValueError(f"Unsupported mask overlay output mode: {output_mode!r}")
+        self._output_mode = output_mode
+        self._mask_key_suffix = mask_key_suffix
         if tracking_mode == "image":
             self._segmenter = Sam3ImageMaskOverlay(
                 checkpoint_path=checkpoint_path,
@@ -702,19 +708,30 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
             alpha=request.get("alpha"),
         )
 
+        preview_only = bool(request.get("preview_only", False))
+        track_only = bool(request.get("track_only", False))
+        include_image = bool(request.get("return_image", False))
+        include_visuals = preview_only or include_image or bool(request.get("return_overlay", False))
         response_payload = _result_payload(
             result,
             view=view,
             tracking_mode=self._tracking_mode,
-            include_image=bool(request.get("return_image", False)),
+            include_image=include_image,
+            include_visuals=include_visuals,
         )
-        if bool(request.get("preview_only", False)):
+        if preview_only or track_only:
             return {MASK_OVERLAY_KEY: response_payload}
         if result.needs_reprompt:
             return {MASK_OVERLAY_KEY: response_payload}
 
         image_dict = dict(image_dict)
-        image_dict[view] = result.overlay
+        if self._output_mode == "mask_image":
+            image_dict[_mask_image_key(view, self._mask_key_suffix)] = _mask_to_rgb_image(
+                result.mask,
+                reference=image_dict[view],
+            )
+        else:
+            image_dict[view] = result.overlay
         policy_obs = dict(policy_obs)
         policy_obs["image"] = image_dict
         output = self._policy.infer(policy_obs)
@@ -736,18 +753,21 @@ def _strip_mask_request(obs: dict) -> dict:
     return {key: value for key, value in obs.items() if key != MASK_OVERLAY_KEY}
 
 
+def _mask_image_key(view: str, suffix: str) -> str:
+    return f"{view}{suffix}"
+
+
 def _result_payload(
     result: MaskOverlayResult,
     *,
     view: str,
     tracking_mode: str,
     include_image: bool = False,
+    include_visuals: bool = True,
 ) -> dict[str, Any]:
     payload = {
         "view": view,
         "tracking_mode": tracking_mode,
-        "mask": result.mask,
-        "overlay": result.overlay,
         "score": result.score,
         "bbox_xyxy": result.bbox_xyxy,
         "initialized": result.initialized,
@@ -756,6 +776,9 @@ def _result_payload(
         "selected_obj_id": result.selected_obj_id,
         "candidate_count": result.candidate_count,
     }
+    if include_visuals:
+        payload["mask"] = result.mask
+        payload["overlay"] = result.overlay
     if include_image:
         payload["image"] = result.image
     return payload
@@ -1010,3 +1033,24 @@ def _overlay_mask(image: np.ndarray, mask: np.ndarray, *, alpha: float) -> np.nd
     mask_bool = np.asarray(mask, dtype=bool)
     overlay[mask_bool] = (1.0 - alpha) * overlay[mask_bool] + alpha * color
     return np.clip(np.rint(overlay), 0, 255).astype(np.uint8)
+
+
+def _mask_to_rgb_image(mask: np.ndarray, *, reference: Any) -> np.ndarray:
+    reference_np = _as_uint8_hwc(reference)
+    mask_np = np.asarray(mask)
+    if mask_np.ndim == 3:
+        if mask_np.shape[-1] == 1:
+            mask_np = mask_np[..., 0]
+        elif mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        elif mask_np.shape[-1] in (3, 4):
+            mask_np = np.max(mask_np[..., :3], axis=-1)
+        elif mask_np.shape[0] in (3, 4):
+            mask_np = np.max(mask_np[:3], axis=0)
+    if mask_np.ndim != 2:
+        raise ValueError(f"Expected mask rank 2 or single-channel/rgb rank 3, got shape={mask_np.shape}")
+    if mask_np.shape != reference_np.shape[:2]:
+        raise ValueError(f"Mask shape {mask_np.shape} does not match image shape {reference_np.shape[:2]}")
+    mask_rgb = np.zeros_like(reference_np, dtype=np.uint8)
+    mask_rgb[np.asarray(mask_np, dtype=bool)] = 255
+    return mask_rgb

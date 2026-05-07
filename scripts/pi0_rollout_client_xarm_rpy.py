@@ -345,6 +345,55 @@ def _preview_mask_overlay(
         point_xy = None
 
 
+def _capture_mask_view_image(caps, *, view: str, is_dual: bool, single_arm: str | None) -> np.ndarray:
+    if is_dual:
+        if view not in caps:
+            raise KeyError(f"mask view {view!r} 没有对应摄像头；available={sorted(caps)}")
+        return image_tools.convert_to_uint8(_capture_resized(caps[view]))
+    if single_arm is None:
+        raise ValueError("single-arm mask tracking requires single_arm")
+    return image_tools.convert_to_uint8(_capture_resized(caps[single_arm]))
+
+
+def _send_mask_track_only(
+    policy_client,
+    *,
+    image_rgb: np.ndarray,
+    view: str,
+    text_prompt: str | None,
+    alpha: float,
+    debug_dir: pathlib.Path | None,
+    track_index: int,
+) -> dict:
+    mask_request = {
+        "enabled": True,
+        "view": view,
+        "track_only": True,
+        "alpha": float(alpha),
+    }
+    if text_prompt:
+        mask_request["text"] = text_prompt
+    if debug_dir is not None:
+        mask_request["return_image"] = True
+        mask_request["return_overlay"] = True
+
+    resp = policy_client.infer(
+        {
+            "image": {view: image_tools.convert_to_uint8(image_rgb)},
+            MASK_OVERLAY_KEY: mask_request,
+        }
+    )
+    payload = resp.get(MASK_OVERLAY_KEY, {})
+    if debug_dir is not None:
+        _dump_mask_rollout_debug(
+            debug_dir=debug_dir,
+            view=view,
+            infer_index=track_index,
+            payload=payload,
+        )
+    return payload
+
+
 def parse_pose_xyz_rpy_deg(value: str) -> tuple[list[float], list[float]]:
     parts = [float(v) for v in value.split(",")]
     if len(parts) != 6:
@@ -611,6 +660,8 @@ def main():
     parser.add_argument("--mask_prompt_text", default=None, help="SAM3 text prompt，例如 sponge；text_select_video 模式必填")
     parser.add_argument("--mask_alpha", type=float, default=0.35, help="SAM3 overlay alpha")
     parser.add_argument("--mask_debug_dir", default=None, help="显式提供目录时，保存 SAM3 preview 输入/输出调试图并请求 server 回传原图")
+    parser.add_argument("--mask_track_between_actions", action="store_true", help="每执行若干 action 后额外发送一帧给 SAM3 追踪，只更新 mask 不跑 policy")
+    parser.add_argument("--mask_track_every_n_actions", type=int, default=1, help="开启 --mask_track_between_actions 后，每 N 个 action 发送一次 tracking-only 图像")
     args = parser.parse_args()
 
     is_dual = args.arm_mode == "dual"
@@ -618,6 +669,10 @@ def main():
         parser.error("--arm_mode single 需要显式指定 --single_arm robot_0 或 robot_1，避免误用默认 robot_0")
     if args.mask_overlay and is_dual and args.mask_view is None:
         parser.error("--arm_mode dual 开启 --mask_overlay 时需要显式指定 --mask_view robot_0 或 robot_1")
+    if args.mask_track_between_actions and not args.mask_overlay:
+        parser.error("--mask_track_between_actions 需要同时开启 --mask_overlay")
+    if args.mask_track_every_n_actions < 1:
+        parser.error("--mask_track_every_n_actions 必须 >= 1")
 
     single_arm = args.single_arm
     single_arm_index = _arm_index(single_arm) if single_arm is not None else 0
@@ -704,6 +759,7 @@ def main():
             debug_dir=mask_debug_dir,
         )
         print("[INFO] SAM3 mask overlay 已确认，后续推理会持续请求 overlay")
+    mask_track_index = 0
 
     stdin_fd = sys.stdin.fileno()
     old_term = None
@@ -779,6 +835,7 @@ def main():
                     obs[MASK_OVERLAY_KEY]["text"] = args.mask_prompt_text
                 if mask_debug_dir is not None:
                     obs[MASK_OVERLAY_KEY]["return_image"] = True
+                    obs[MASK_OVERLAY_KEY]["return_overlay"] = True
 
             resp = policy_client.infer(obs)
             mask_payload = resp.get(MASK_OVERLAY_KEY, {}) if args.mask_overlay else {}
@@ -880,6 +937,40 @@ def main():
                         _set_xarm_pose(arms[single_arm], target_pos, target_rpy, wait=False)
                         _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
                     cur_pos_single, cur_rpy_single = target_pos, target_rpy
+
+                if (
+                    args.mask_overlay
+                    and args.mask_track_between_actions
+                    and ((step_idx - lo + 1) % args.mask_track_every_n_actions == 0)
+                ):
+                    track_image = _capture_mask_view_image(
+                        caps,
+                        view=effective_mask_view,
+                        is_dual=is_dual,
+                        single_arm=single_arm,
+                    )
+                    track_payload = _send_mask_track_only(
+                        policy_client,
+                        image_rgb=track_image,
+                        view=effective_mask_view,
+                        text_prompt=args.mask_prompt_text,
+                        alpha=args.mask_alpha,
+                        debug_dir=mask_debug_dir,
+                        track_index=1_000_000 + mask_track_index,
+                    )
+                    mask_track_index += 1
+                    if track_payload.get("needs_reprompt"):
+                        print(f"[MASK] dense tracking 丢失，重新打点: {track_payload.get('reprompt_reason')}")
+                        _preview_mask_overlay(
+                            policy_client,
+                            image_rgb=track_image,
+                            view=effective_mask_view,
+                            point_xy=None,
+                            text_prompt=args.mask_prompt_text,
+                            alpha=args.mask_alpha,
+                            debug_dir=mask_debug_dir,
+                        )
+                        print("[INFO] SAM3 mask overlay 已重新初始化，继续执行当前 rollout")
 
     finally:
         if old_term is not None:
