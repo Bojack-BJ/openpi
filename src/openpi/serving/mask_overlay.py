@@ -420,7 +420,7 @@ class Sam3VideoWindowMaskOverlay(Sam3ImageMaskOverlay):
 
 
 class Sam3TextSelectVideoMaskOverlay(Sam3VideoWindowMaskOverlay):
-    """Text-detect all instances, select one by point/location, then track only that instance."""
+    """Text-detect all instances, select one by point/location, then continuity-select it."""
 
     def __init__(
         self,
@@ -553,23 +553,10 @@ class Sam3TextSelectVideoMaskOverlay(Sam3VideoWindowMaskOverlay):
                 )
 
             selected_obj_id = selected.obj_id
+            current_bbox = selected.bbox_xyxy or anchor_bbox
             masks_by_frame[0] = selected.mask
             scores_by_frame[0] = selected.score
             bboxes_by_frame[0] = selected.bbox_xyxy
-            for candidate in candidates:
-                if candidate.obj_id == selected_obj_id:
-                    continue
-                try:
-                    self._video_model.handle_request(
-                        {
-                            "type": "remove_object",
-                            "session_id": session_id,
-                            "frame_index": 0,
-                            "obj_id": int(candidate.obj_id),
-                        }
-                    )
-                except Exception:
-                    logging.exception("Failed to remove non-selected SAM3 object id=%s", candidate.obj_id)
 
             if len(self._video_frames) > 1:
                 for event in self._video_model.handle_stream_request(
@@ -585,11 +572,18 @@ class Sam3TextSelectVideoMaskOverlay(Sam3VideoWindowMaskOverlay):
                     outputs = event.get("outputs", {})
                     if frame_index is None or not isinstance(outputs, dict):
                         continue
-                    candidate = _video_candidate_by_obj_id(outputs, selected_obj_id)
-                    if candidate is not None:
-                        masks_by_frame[int(frame_index)] = candidate.mask
-                        scores_by_frame[int(frame_index)] = candidate.score
-                        bboxes_by_frame[int(frame_index)] = candidate.bbox_xyxy
+                    frame_index_int = int(frame_index)
+                    if frame_index_int == 0:
+                        continue
+                    frame_candidates = _video_candidates_from_outputs(outputs)
+                    candidate = _select_video_candidate(frame_candidates, bbox_xyxy=current_bbox)
+                    if candidate is None:
+                        continue
+                    selected_obj_id = candidate.obj_id
+                    current_bbox = candidate.bbox_xyxy or current_bbox
+                    masks_by_frame[frame_index_int] = candidate.mask
+                    scores_by_frame[frame_index_int] = candidate.score
+                    bboxes_by_frame[frame_index_int] = candidate.bbox_xyxy
         finally:
             self._video_model.handle_request(
                 {
@@ -880,13 +874,6 @@ def _video_candidates_from_outputs(outputs: dict[str, Any]) -> list[_VideoCandid
             )
         )
     return candidates
-
-
-def _video_candidate_by_obj_id(outputs: dict[str, Any], obj_id: int) -> _VideoCandidate | None:
-    for candidate in _video_candidates_from_outputs(outputs):
-        if candidate.obj_id == int(obj_id):
-            return candidate
-    return None
 
 
 def _select_video_candidate(

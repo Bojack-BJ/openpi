@@ -6,7 +6,7 @@ This note documents the optional SAM3 mask-overlay path for testing policies tra
 
 During robot rollout, the client sends a normal OpenPI observation plus an optional `__mask_overlay` request. The policy server uses SAM3 to segment the target object, overlays the mask onto the selected camera image, and then runs the policy on that overlaid image.
 
-The first request can contain a clicked point prompt. The server returns an overlay preview for confirmation. After confirmation, rollout requests omit the point prompt. The default `image` tracking mode reuses the previous mask/logits/bounding box as the next image prompt. The optional `video_window` tracking mode uses SAM3's video predictor over a short rolling frame window to propagate the initially selected object to the latest frame. The `text_select_video` mode first detects all instances matching a text prompt, selects the instance closest to the clicked point, removes other instances, and then tracks the selected object.
+The first request can contain a clicked point prompt. The server returns an overlay preview for confirmation. After confirmation, rollout requests omit the point prompt. The default `image` tracking mode reuses the previous mask/logits/bounding box as the next image prompt. The optional `video_window` tracking mode uses SAM3's video predictor over a short rolling frame window to propagate the initially selected object to the latest frame. The `text_select_video` mode first detects all instances matching a text prompt, selects the instance closest to the clicked point, and then keeps selecting the propagated instance that best matches the previous tracked bbox.
 
 The overlay server is image-key agnostic: the requested `view` only needs to exist in `obs["image"]`. Current rollout clients use `front` for single-arm policies and `robot_0` / `robot_1` for dual-arm policies.
 
@@ -66,7 +66,7 @@ Startup will fail fast if the local checkpoint path does not exist or if SAM3 ca
 
 `video_window` mode loads both the SAM3 image interactivity model and the SAM3 video predictor. The image model is used only for the initial clicked-point segmentation; the resulting bbox becomes the visual prompt for the video tracker. This is more stable than repeatedly prompting the image model with a fixed point or previous bbox, but it is also slower and uses more GPU memory.
 
-`text_select_video` mode uses the SAM3 video predictor's text prompt on the first frame of each short window, selects the target instance using either the initial clicked point or the previous tracked bbox, removes non-selected instances, and propagates only the selected object. It requires the rollout client to pass `--mask_prompt_text`.
+`text_select_video` mode uses the SAM3 video predictor's text prompt on the first frame of each short window, selects the target instance using either the initial clicked point or the previous tracked bbox, propagates all text-matched instances, and keeps the candidate with the strongest bbox continuity. It requires the rollout client to pass `--mask_prompt_text`.
 
 ## Start Rollout With Click Prompt
 
@@ -175,7 +175,7 @@ The server replaces `obs["image"][view]` with the overlay image before calling t
 - The rollout click/preview flow lives in `scripts/pi0_rollout_client_fasttouch_rpy.py` and `scripts/pi0_rollout_client_xarm_rpy.py`.
 - `image` mode uses SAM3 image interactivity with the previous mask/logits/bounding box as the next prompt.
 - `video_window` mode uses SAM3's video predictor, but SAM3 initializes video state from a fixed image list/video path rather than an appendable stream. The server therefore rebuilds a short session from the latest frames for each policy inference, prompts frame 0 with the tracked bbox, and propagates forward to the newest frame.
-- `text_select_video` mode uses text to detect instances in frame 0 of each short session, picks one instance by clicked point or previous bbox, removes the other object IDs, and propagates only the selected object. Point and text are not sent to SAM3 as one combined point prompt; point is used for instance selection after text detection.
+- `text_select_video` mode uses text to detect instances in frame 0 of each short session, picks one instance by clicked point or previous bbox, propagates all text-matched objects, and chooses the best continuity match on each propagated frame. Point and text are not sent to SAM3 as one combined point prompt; point is used for instance selection after text detection.
 
 ## Troubleshooting
 
