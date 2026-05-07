@@ -1,0 +1,127 @@
+# SAM3 Mask Overlay Inference
+
+This note documents the optional SAM3 mask-overlay path for testing policies trained with offline mask-overlaid images.
+
+## Goal
+
+During robot rollout, the client sends a normal OpenPI observation plus an optional `__mask_overlay` request. The policy server uses SAM3 to segment the target object, overlays the mask onto the selected camera image, and then runs the policy on that overlaid image.
+
+The first request can contain a clicked point prompt. The server returns an overlay preview for confirmation. After confirmation, rollout requests omit the point prompt; the server reuses the previous mask/logits/bounding box to continue segmenting the same object.
+
+## Repository Setup
+
+SAM3 is included as a submodule:
+
+```bash
+git submodule update --init --recursive third_party/sam3
+```
+
+SAM3 is imported lazily only when `scripts/serve_policy.py --mask-overlay` is used.
+
+SAM3 upstream currently requires a CUDA PyTorch environment and access to the checkpoint on Hugging Face. If `--sam3-checkpoint-path` is not provided, SAM3 will use its default Hugging Face download path, so make sure the server environment is authenticated.
+
+## Start The Server
+
+Example:
+
+```bash
+python scripts/serve_policy.py \
+  --port 8009 \
+  --mask-overlay \
+  --mask-overlay-view robot_0 \
+  --mask-overlay-alpha 0.35 \
+  policy:checkpoint \
+  --policy.config sponge_visual_guided_pi05 \
+  --policy.dir /path/to/checkpoint/step
+```
+
+Useful server options:
+
+- `--mask-overlay`: enables SAM3 overlay before policy inference.
+- `--mask-overlay-view`: image key to overlay, for example `front`, `robot_0`, or `robot_1`.
+- `--mask-overlay-alpha`: green overlay alpha.
+- `--sam3-checkpoint-path`: optional local SAM3 checkpoint path.
+- `--sam3-device`: SAM3 device, default `cuda`.
+- `--sam3-path`: optional SAM3 source path; defaults to `third_party/sam3`.
+
+## Start Rollout With Click Prompt
+
+Example:
+
+```bash
+python scripts/pi0_rollout_serve_pro_v1_remote_rpy.py \
+  --description "..." \
+  --mask_overlay \
+  --mask_view robot_0
+```
+
+The rollout script will:
+
+1. Capture one resized frame from the selected camera view.
+2. Open a click window if `--mask_prompt_point` is not provided.
+3. Send the clicked point to the policy server with `preview_only=True`.
+4. Display the server-returned mask overlay.
+5. Continue rollout only after user confirmation.
+
+To skip the click window:
+
+```bash
+--mask_prompt_point 120,90
+```
+
+Use `--mask_view robot_1` if the target object should be segmented from the second camera.
+
+## Wire Protocol
+
+The client adds a reserved key to the observation:
+
+```python
+obs["__mask_overlay"] = {
+    "enabled": True,
+    "view": "robot_0",
+    "reset": True,
+    "points": np.asarray([[120, 90]], dtype=np.float32),
+    "point_labels": np.asarray([1], dtype=np.int32),
+    "preview_only": True,
+    "alpha": 0.35,
+}
+```
+
+Preview response:
+
+```python
+resp["__mask_overlay"] = {
+    "view": "robot_0",
+    "mask": mask_uint8,
+    "overlay": overlay_rgb_uint8,
+    "score": score_or_none,
+    "bbox_xyxy": bbox_or_none,
+    "initialized": True,
+}
+```
+
+For normal rollout after confirmation, the client sends:
+
+```python
+obs["__mask_overlay"] = {
+    "enabled": True,
+    "view": "robot_0",
+    "alpha": 0.35,
+}
+```
+
+The server replaces `obs["image"][view]` with the overlay image before calling the policy, and attaches the latest overlay payload to the policy response for debugging.
+
+## Implementation Notes
+
+- The SAM3 wrapper lives in `src/openpi/serving/mask_overlay.py`.
+- The server integration lives in `scripts/serve_policy.py`.
+- The rollout click/preview flow lives in `scripts/pi0_rollout_serve_pro_v1_remote_rpy.py`.
+- The current live path uses SAM3 image interactivity with the previous mask/logits/bounding box as the next prompt. It does not use the SAM3 video file session API because rollout frames arrive online over websocket rather than as a fixed video file.
+
+## Troubleshooting
+
+- If the client raises `server 未启用 --mask-overlay`, restart `serve_policy.py` with `--mask-overlay`.
+- If SAM3 cannot download weights, authenticate Hugging Face or pass `--sam3-checkpoint-path`.
+- If segmentation drifts, restart the rollout or provide a new initial point with `--mask_prompt_point`.
+- If GPU memory is tight, run SAM3 and OpenPI on a larger GPU or use a separate server process/GPU for overlay experiments.

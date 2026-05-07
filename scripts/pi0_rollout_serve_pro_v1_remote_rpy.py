@@ -103,6 +103,7 @@ PORT = 8009             # DevA=8002、DevB=8003、DevC=8004、DevD=8005、本地
 # ====== 摄像头（YU12 / I420）参数 ======
 DEV = 0                   # /dev/video0
 W, H, FPS = 1280, 1280, 100
+MASK_OVERLAY_KEY = "__mask_overlay"
 
 
 def init_yu12_camera(DEV):
@@ -172,6 +173,76 @@ def _stdin_read_char_nonblocking():
 def _stdin_wants_reset_pause() -> bool:
     ch = _stdin_read_char_nonblocking()
     return ch in ("s", "S")
+
+
+def _parse_xy(value: str | None) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    x_str, y_str = value.split(",", maxsplit=1)
+    return int(float(x_str)), int(float(y_str))
+
+
+def _select_point(image_rgb: np.ndarray, *, title: str) -> tuple[int, int]:
+    clicked: list[tuple[int, int]] = []
+    display = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            clicked[:] = [(int(x), int(y))]
+
+    cv2.namedWindow(title, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(title, on_mouse)
+    while not clicked:
+        frame = display.copy()
+        cv2.putText(frame, "Click target point, q/esc to cancel", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imshow(title, frame)
+        key = cv2.waitKey(20) & 0xFF
+        if key in (27, ord("q")):
+            cv2.destroyWindow(title)
+            raise RuntimeError("Mask prompt selection cancelled.")
+    cv2.destroyWindow(title)
+    return clicked[0]
+
+
+def _preview_mask_overlay(
+    policy_client,
+    *,
+    image_rgb: np.ndarray,
+    view: str,
+    point_xy: tuple[int, int] | None,
+    alpha: float,
+) -> None:
+    while True:
+        if point_xy is None:
+            point_xy = _select_point(image_rgb, title=f"Select SAM3 point: {view}")
+        obs = {
+            "image": {view: image_tools.convert_to_uint8(image_rgb)},
+            MASK_OVERLAY_KEY: {
+                "enabled": True,
+                "view": view,
+                "reset": True,
+                "points": np.asarray([point_xy], dtype=np.float32),
+                "point_labels": np.asarray([1], dtype=np.int32),
+                "preview_only": True,
+                "alpha": float(alpha),
+            },
+        }
+        resp = policy_client.infer(obs)
+        payload = resp.get(MASK_OVERLAY_KEY, {})
+        overlay = payload.get("overlay")
+        if overlay is None:
+            raise RuntimeError(f"Policy server did not return mask overlay preview: keys={sorted(resp)}")
+
+        window = f"SAM3 overlay preview: {view}"
+        cv2.imshow(window, cv2.cvtColor(np.asarray(overlay), cv2.COLOR_RGB2BGR))
+        cv2.waitKey(1)
+        answer = input("SAM3 overlay 是否正确？[y=确认 / r=重新点击 / q=退出]: ").strip().lower()
+        cv2.destroyWindow(window)
+        if answer in ("y", "yes", ""):
+            return
+        if answer in ("q", "quit"):
+            raise RuntimeError("Mask overlay preview rejected.")
+        point_xy = None
 
 
 def reset_arms_to_init(arm0: SingleArm, arm1: SingleArm,
@@ -256,6 +327,10 @@ def main():
         default=20,
         help="结束下标（0 起算，含）；与 action_start 闭区间，若超出序列长度则截断到末尾",
     )
+    parser.add_argument("--mask_overlay", action="store_true", help="请求 policy server 使用 SAM3 mask overlay 后再推理")
+    parser.add_argument("--mask_view", default="robot_0", help="需要做 SAM3 overlay 的 image key，例如 robot_0 或 robot_1")
+    parser.add_argument("--mask_prompt_point", default=None, help="初始正点 prompt，格式 x,y；不填则弹窗点击")
+    parser.add_argument("--mask_alpha", type=float, default=0.35, help="SAM3 overlay alpha")
     args = parser.parse_args()
 
     tcp_off = parse_tool_offset_xyz(args.tcp_offset)
@@ -292,6 +367,10 @@ def main():
         port=PORT,
     )
     print(f"[INFO] 已连接策略服务器：ws://{SERVER_IP}:{PORT}")
+    if args.mask_overlay:
+        metadata = policy_client.get_server_metadata()
+        if not metadata.get("mask_overlay", {}).get("enabled", False):
+            raise RuntimeError("client 开启了 --mask_overlay，但 server 未启用 --mask-overlay")
 
     # ---- 摄像头 ----
     cam0 = init_yu12_camera(DEV)
@@ -304,6 +383,20 @@ def main():
     print("[INFO] 摄像头预热完成，开始循环")
 
     input("按 Enter 开始")
+    if args.mask_overlay:
+        img_rgb0 = cv2.resize(grab_rgb_latest(cam0), (224, 224), interpolation=cv2.INTER_AREA)
+        img_rgb1 = cv2.resize(grab_rgb_latest(cam1), (224, 224), interpolation=cv2.INTER_AREA)
+        preview_images = {"robot_0": img_rgb0, "robot_1": img_rgb1}
+        if args.mask_view not in preview_images:
+            raise ValueError(f"--mask_view must be one of {sorted(preview_images)}, got {args.mask_view}")
+        _preview_mask_overlay(
+            policy_client,
+            image_rgb=preview_images[args.mask_view],
+            view=args.mask_view,
+            point_xy=_parse_xy(args.mask_prompt_point),
+            alpha=args.mask_alpha,
+        )
+        print("[INFO] SAM3 mask overlay 已确认，后续推理会持续请求 overlay")
 
     stdin_fd = sys.stdin.fileno()
     old_term = None
@@ -399,6 +492,12 @@ def main():
                 },
                 "prompt": args.description,
             }
+            if args.mask_overlay:
+                obs[MASK_OVERLAY_KEY] = {
+                    "enabled": True,
+                    "view": args.mask_view,
+                    "alpha": args.mask_alpha,
+                }
             # cv2.putText(img_rgb0, f"robot0  /dev/video{cam0}", (10, 30),
             #     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             # cv2.putText(img_rgb1, f"robot1  /dev/video{cam1}", (10, 30),
