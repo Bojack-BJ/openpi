@@ -803,10 +803,10 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
     """Single-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
 
     overlay_alpha: float = 0.35
-    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay"] = "online_overlay"
+    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay", "mask_images"] = "online_overlay"
 
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay"):
+        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay", "mask_images"):
             raise ValueError(f"Unsupported guidance_image_mode: {self.guidance_image_mode}")
         image_path = (
             "observation.images.front_overlay"
@@ -814,6 +814,7 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
             else "observation.images.front"
         )
         use_online_overlay = self.guidance_image_mode == "online_overlay"
+        use_mask_images = self.guidance_image_mode == "mask_images"
         image_structure: dict[str, Any] = {"front": image_path}
         repack_structure: dict[str, Any] = {
             "state": "observation.state",
@@ -822,7 +823,7 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
             "subtask": "subtask",
             "prompt": "prompt",
         }
-        if use_online_overlay:
+        if use_online_overlay or use_mask_images:
             repack_structure["mask"] = {"front": "observation.masks.front_mask"}
 
         dataset_columns = [
@@ -837,7 +838,7 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
             "index",
             "task_index",
         ]
-        if use_online_overlay:
+        if use_online_overlay or use_mask_images:
             dataset_columns.append("observation.masks.front_mask")
 
         repack = _transforms.Group(
@@ -846,7 +847,7 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
                     image_to_mask_paths={
                         "observation.images.front": "observation.masks.front_mask",
                     }
-                    if use_online_overlay
+                    if use_online_overlay or use_mask_images
                     else {},
                     image_default_paths={
                         "observation.images.front_overlay": "observation.images.front",
@@ -875,6 +876,7 @@ class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
                 fastumi_policy.FastUMIInputs(
                     action_dim=model_config.action_dim,
                     model_type=model_config.model_type,
+                    include_mask_images=use_mask_images,
                 ),
                 _transforms.ChunkRelDeltaPoseRPY(
                     pos_slice=slice(0, 3),
@@ -930,10 +932,10 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
     """Dual-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
 
     overlay_alpha: float = 0.35
-    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay"] = "online_overlay"
+    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay", "mask_images"] = "online_overlay"
 
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay"):
+        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay", "mask_images"):
             raise ValueError(f"Unsupported guidance_image_mode: {self.guidance_image_mode}")
         robot_0_image_path = (
             "observation.images.robot_0_overlay"
@@ -946,6 +948,7 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
             else "observation.images.robot_1_image"
         )
         use_online_overlay = self.guidance_image_mode == "online_overlay"
+        use_mask_images = self.guidance_image_mode == "mask_images"
         repack_structure: dict[str, Any] = {
             "state": "observation.state",
             "actions": "action",
@@ -956,7 +959,7 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
             "subtask": "subtask",
             "prompt": "prompt",
         }
-        if use_online_overlay:
+        if use_online_overlay or use_mask_images:
             repack_structure["mask"] = {
                 "robot_0": "observation.masks.robot_0_mask",
                 "robot_1": "observation.masks.robot_1_mask",
@@ -976,7 +979,7 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
             "index",
             "task_index",
         ]
-        if use_online_overlay:
+        if use_online_overlay or use_mask_images:
             dataset_columns.extend(
                 [
                     "observation.masks.robot_0_mask",
@@ -991,7 +994,7 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
                         "observation.images.robot_0_image": "observation.masks.robot_0_mask",
                         "observation.images.robot_1_image": "observation.masks.robot_1_mask",
                     }
-                    if use_online_overlay
+                    if use_online_overlay or use_mask_images
                     else {},
                     image_default_paths={
                         "observation.images.robot_0_overlay": "observation.images.robot_0_image",
@@ -1024,6 +1027,7 @@ class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
                 fastumi_policy.FastUMIInputs(
                     action_dim=model_config.action_dim,
                     model_type=model_config.model_type,
+                    include_mask_images=use_mask_images,
                 ),
                 _transforms.ChunkRelDeltaRPYBimanual(
                     left_state_slice=slice(0, 8),
@@ -2382,11 +2386,55 @@ _CONFIGS = [
         num_workers=8,
     ),
     TrainConfig(
+        name="sponge_visual_mask_keys_pi0",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
         name="sponge_visual_guided_pi05",
         model=pi0_config.Pi0Config(pi05=True),
         data=FastUMIData7DRPYGuidedConfig(
             repo_id="fastumi/sponge_visual_guided",
             guidance_image_mode="offline_overlay",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi05",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="mask_images",
             assets=AssetsConfig(
                 assets_dir="./assets/sponge_visual_guided",
                 asset_id="fastumi/sponge_visual_guided",
