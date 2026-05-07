@@ -238,7 +238,7 @@ SOURCE_CAMERA_FPS = 60
 STATE_NAMES_8 = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_width"]
 
 STEP1_CFG_ROBOTIQ = {
-    "base_x": 0.3,
+    "base_x": 0.4,
     "base_y": 0.0,
     "base_z": 0.145,
     "base_euler_deg": [180, -90, 0.0],
