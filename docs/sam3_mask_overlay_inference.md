@@ -8,6 +8,8 @@ During robot rollout, the client sends a normal OpenPI observation plus an optio
 
 The first request can contain a clicked point prompt. The server returns an overlay preview for confirmation. After confirmation, rollout requests omit the point prompt; the server reuses the previous mask/logits/bounding box to continue segmenting the same object.
 
+The overlay server is image-key agnostic: the requested `view` only needs to exist in `obs["image"]`. Current rollout clients use `front` for single-arm policies and `robot_0` / `robot_1` for dual-arm policies.
+
 ## Repository Setup
 
 SAM3 is included as a submodule:
@@ -34,6 +36,14 @@ python scripts/serve_policy.py \
   policy:checkpoint \
   --policy.config sponge_visual_guided_pi05 \
   --policy.dir /path/to/checkpoint/step
+
+python scripts/serve_policy.py \
+  --mask-overlay \
+  --mask-overlay-view robot_0 \
+  --sam3-checkpoint-path /root/Users/lixiaotong/openpi/third_party/sam3/ckpt/sam3.pt \
+  policy:checkpoint \
+  --policy.config sponge_visual_guided_pi05 \
+  --policy.dir /root/Users/lixiaotong/openpi/checkpoints/sponge_visual_guided_pi05/sponge_visual_guided_pi05/34000
 ```
 
 Useful server options:
@@ -52,8 +62,9 @@ Startup will fail fast if the local checkpoint path does not exist or if SAM3 ca
 Example:
 
 ```bash
-python scripts/pi0_rollout_serve_pro_v1_remote_rpy.py \
+python scripts/pi0_rollout_client_fasttouch_rpy.py \
   --description "..." \
+  --arm_mode dual \
   --mask_overlay \
   --mask_view robot_0
 ```
@@ -72,7 +83,7 @@ To skip the click window:
 --mask_prompt_point 120,90
 ```
 
-Use `--mask_view robot_1` if the target object should be segmented from the second camera.
+Use `--mask_view robot_1` if the target object should be segmented from the second camera. For single-arm rollout, use `--arm_mode single --single_arm robot_0` or `--single_arm robot_1`; the client sends the selected camera as `image["front"]`, so `--mask_view` can be omitted and defaults to `front`.
 
 ## Wire Protocol
 
@@ -119,7 +130,7 @@ The server replaces `obs["image"][view]` with the overlay image before calling t
 
 - The SAM3 wrapper lives in `src/openpi/serving/mask_overlay.py`.
 - The server integration lives in `scripts/serve_policy.py`.
-- The rollout click/preview flow lives in `scripts/pi0_rollout_serve_pro_v1_remote_rpy.py`.
+- The rollout click/preview flow lives in `scripts/pi0_rollout_client_fasttouch_rpy.py` and `scripts/pi0_rollout_client_xarm_rpy.py`.
 - The current live path uses SAM3 image interactivity with the previous mask/logits/bounding box as the next prompt. It does not use the SAM3 video file session API because rollout frames arrive online over websocket rather than as a fixed video file.
 
 ## Troubleshooting
