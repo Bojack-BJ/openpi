@@ -2364,14 +2364,14 @@ _CONFIGS = [
         qwen3_5_remat_mode="linear_only",
     ),
     TrainConfig(
-        name="sponge_visual_guided_pi0",
+        name="sponge_visual_guided_pi0_xarm",
         model=pi0_config.Pi0Config(),
         data=FastUMIData7DRPYGuidedConfig(
-            repo_id="fastumi/sponge_visual_guided",
+            repo_id="fastumi/sponge_visual_guided_xarm",
             guidance_image_mode="offline_overlay",
             assets=AssetsConfig(
-                assets_dir="./assets/sponge_visual_guided",
-                asset_id="fastumi/sponge_visual_guided",
+                assets_dir="./assets/sponge_visual_guided_xarm",
+                asset_id="fastumi/sponge_visual_guided_xarm",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -2386,10 +2386,10 @@ _CONFIGS = [
         num_workers=8,
     ),
     TrainConfig(
-        name="sponge_visual_mask_keys_pi0",
+        name="sponge_visual_mask_keys_pi0_xarm",
         model=pi0_config.Pi0Config(),
         data=FastUMIData7DRPYGuidedConfig(
-            repo_id="fastumi/sponge_visual_guided",
+            repo_id="fastumi/sponge_visual_guided_xarm",
             guidance_image_mode="mask_images",
             assets=AssetsConfig(
                 assets_dir="./assets/sponge_visual_guided",
@@ -2408,14 +2408,36 @@ _CONFIGS = [
         num_workers=8,
     ),
     TrainConfig(
-        name="sponge_visual_guided_pi05",
+        name="sponge_visual_mask_keys_pi0_touch",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_touch",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_touch",
+                asset_id="fastumi/sponge_visual_guided_touch",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_pi05_touch",
         model=pi0_config.Pi0Config(pi05=True),
         data=FastUMIData7DRPYGuidedConfig(
-            repo_id="fastumi/sponge_visual_guided",
+            repo_id="fastumi/sponge_visual_guided_touch",
             guidance_image_mode="offline_overlay",
             assets=AssetsConfig(
-                assets_dir="./assets/sponge_visual_guided",
-                asset_id="fastumi/sponge_visual_guided",
+                assets_dir="./assets/sponge_visual_guided_touch",
+                asset_id="fastumi/sponge_visual_guided_touch",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
@@ -2430,14 +2452,36 @@ _CONFIGS = [
         num_workers=8,
     ),
     TrainConfig(
-        name="sponge_visual_mask_keys_pi05",
+        name="sponge_visual_mask_keys_pi05_xarm",
         model=pi0_config.Pi0Config(pi05=True),
         data=FastUMIData7DRPYGuidedConfig(
-            repo_id="fastumi/sponge_visual_guided",
+            repo_id="fastumi/sponge_visual_guided_xarm",
             guidance_image_mode="mask_images",
             assets=AssetsConfig(
-                assets_dir="./assets/sponge_visual_guided",
-                asset_id="fastumi/sponge_visual_guided",
+                assets_dir="./assets/sponge_visual_guided_xarm",
+                asset_id="fastumi/sponge_visual_guided_xarm",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi05_touch",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_touch",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_touch",
+                asset_id="fastumi/sponge_visual_guided_touch",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
