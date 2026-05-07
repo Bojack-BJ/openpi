@@ -24,6 +24,18 @@ class MaskOverlayResult:
     score: float | None
     bbox_xyxy: tuple[int, int, int, int] | None
     initialized: bool
+    needs_reprompt: bool = False
+    reprompt_reason: str | None = None
+    selected_obj_id: int | None = None
+    candidate_count: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class _VideoCandidate:
+    obj_id: int
+    mask: np.ndarray
+    score: float | None
+    bbox_xyxy: tuple[int, int, int, int] | None
 
 
 class Sam3ImageMaskOverlay:
@@ -63,9 +75,11 @@ class Sam3ImageMaskOverlay:
         *,
         points: Any = None,
         point_labels: Any = None,
+        text: str | None = None,
         reset: bool = False,
         alpha: float | None = None,
     ) -> MaskOverlayResult:
+        del text
         if reset:
             self.reset()
 
@@ -235,9 +249,11 @@ class Sam3VideoWindowMaskOverlay(Sam3ImageMaskOverlay):
         *,
         points: Any = None,
         point_labels: Any = None,
+        text: str | None = None,
         reset: bool = False,
         alpha: float | None = None,
     ) -> MaskOverlayResult:
+        del text
         if reset:
             self.reset()
 
@@ -403,6 +419,220 @@ class Sam3VideoWindowMaskOverlay(Sam3ImageMaskOverlay):
             self._video_prompt_bbox = self._video_frame_bboxes[0] or self._video_prompt_bbox
 
 
+class Sam3TextSelectVideoMaskOverlay(Sam3VideoWindowMaskOverlay):
+    """Text-detect all instances, select one by point/location, then track only that instance."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint_path: str | None = None,
+        device: str = "cuda",
+        alpha: float = 0.35,
+        multimask_output: bool = True,
+        sam3_path: str | pathlib.Path | None = None,
+        video_window_size: int = 8,
+        video_version: str = "sam3",
+    ) -> None:
+        super().__init__(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            alpha=alpha,
+            multimask_output=multimask_output,
+            sam3_path=sam3_path,
+            video_window_size=video_window_size,
+            video_version=video_version,
+        )
+        self._text_prompt: str | None = None
+
+    def reset(self) -> None:
+        super().reset()
+        self._text_prompt = None
+
+    def apply(
+        self,
+        image: Any,
+        *,
+        points: Any = None,
+        point_labels: Any = None,
+        text: str | None = None,
+        reset: bool = False,
+        alpha: float | None = None,
+    ) -> MaskOverlayResult:
+        del point_labels
+        if reset:
+            self.reset()
+
+        image_np = _as_uint8_hwc(image)
+        text_prompt = _optional_text(text) or self._text_prompt
+        points_np = _optional_points(points)
+        tracking_alpha = self._alpha if alpha is None else float(alpha)
+
+        if points_np is not None:
+            if text_prompt is None:
+                return _needs_reprompt_result(
+                    image_np,
+                    alpha=tracking_alpha,
+                    reason="text_select_video requires a text prompt with the clicked point.",
+                )
+            self._ensure_video_loaded()
+            self._text_prompt = text_prompt
+            self._video_frames = [image_np]
+            self._video_frame_bboxes = [None]
+            self._video_prompt_bbox = None
+            return self._track_with_text_selection(
+                alpha=tracking_alpha,
+                text_prompt=text_prompt,
+                point_xy=tuple(points_np[0].tolist()),
+            )
+
+        if text_prompt is not None:
+            self._text_prompt = text_prompt
+        if self._text_prompt is None:
+            return _needs_reprompt_result(
+                image_np,
+                alpha=tracking_alpha,
+                reason="text_select_video is missing the text prompt.",
+            )
+        if self._last_bbox is None or not self._video_frames:
+            return _needs_reprompt_result(
+                image_np,
+                alpha=tracking_alpha,
+                reason="text_select_video is not initialized; click the target again.",
+            )
+
+        self._ensure_video_loaded()
+        self._video_frames.append(image_np)
+        self._video_frame_bboxes.append(None)
+        self._trim_video_window()
+        return self._track_with_text_selection(alpha=tracking_alpha, text_prompt=self._text_prompt)
+
+    def _track_with_text_selection(
+        self,
+        *,
+        alpha: float,
+        text_prompt: str,
+        point_xy: tuple[float, float] | None = None,
+    ) -> MaskOverlayResult:
+        assert self._video_model is not None
+
+        frames = [Image.fromarray(frame) for frame in self._video_frames]
+        response = self._video_model.handle_request({"type": "start_session", "resource_path": frames})
+        session_id = response["session_id"]
+        masks_by_frame: dict[int, np.ndarray] = {}
+        scores_by_frame: dict[int, float | None] = {}
+        bboxes_by_frame: dict[int, tuple[int, int, int, int] | None] = {}
+        selected_obj_id: int | None = None
+        candidate_count: int | None = None
+        try:
+            prompt_response = self._video_model.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": 0,
+                    "text": text_prompt,
+                }
+            )
+            prompt_outputs = prompt_response.get("outputs", {})
+            if not isinstance(prompt_outputs, dict):
+                return _needs_reprompt_result(
+                    self._video_frames[-1],
+                    alpha=alpha,
+                    reason=f"SAM3 text prompt did not return candidates for {text_prompt!r}.",
+                )
+
+            candidates = _video_candidates_from_outputs(prompt_outputs)
+            candidate_count = len(candidates)
+            anchor_bbox = self._video_frame_bboxes[0] or self._video_prompt_bbox or self._last_bbox
+            selected = _select_video_candidate(candidates, point_xy=point_xy, bbox_xyxy=anchor_bbox)
+            if selected is None:
+                return _needs_reprompt_result(
+                    self._video_frames[-1],
+                    alpha=alpha,
+                    reason=f"No SAM3 instance matched text={text_prompt!r}; click the target again.",
+                    candidate_count=candidate_count,
+                )
+
+            selected_obj_id = selected.obj_id
+            masks_by_frame[0] = selected.mask
+            scores_by_frame[0] = selected.score
+            bboxes_by_frame[0] = selected.bbox_xyxy
+            for candidate in candidates:
+                if candidate.obj_id == selected_obj_id:
+                    continue
+                try:
+                    self._video_model.handle_request(
+                        {
+                            "type": "remove_object",
+                            "session_id": session_id,
+                            "frame_index": 0,
+                            "obj_id": int(candidate.obj_id),
+                        }
+                    )
+                except Exception:
+                    logging.exception("Failed to remove non-selected SAM3 object id=%s", candidate.obj_id)
+
+            if len(self._video_frames) > 1:
+                for event in self._video_model.handle_stream_request(
+                    {
+                        "type": "propagate_in_video",
+                        "session_id": session_id,
+                        "propagation_direction": "forward",
+                        "start_frame_index": 0,
+                        "max_frame_num_to_track": len(self._video_frames),
+                    }
+                ):
+                    frame_index = event.get("frame_index")
+                    outputs = event.get("outputs", {})
+                    if frame_index is None or not isinstance(outputs, dict):
+                        continue
+                    candidate = _video_candidate_by_obj_id(outputs, selected_obj_id)
+                    if candidate is not None:
+                        masks_by_frame[int(frame_index)] = candidate.mask
+                        scores_by_frame[int(frame_index)] = candidate.score
+                        bboxes_by_frame[int(frame_index)] = candidate.bbox_xyxy
+        finally:
+            self._video_model.handle_request(
+                {
+                    "type": "close_session",
+                    "session_id": session_id,
+                    "run_gc_collect": False,
+                }
+            )
+
+        last_index = len(self._video_frames) - 1
+        mask = masks_by_frame.get(last_index)
+        if mask is None:
+            return _needs_reprompt_result(
+                self._video_frames[-1],
+                alpha=alpha,
+                reason=f"Tracked SAM3 instance id={selected_obj_id} disappeared; click the target again.",
+                candidate_count=candidate_count,
+                selected_obj_id=selected_obj_id,
+            )
+
+        frame_bboxes = []
+        for frame_index, previous_bbox in enumerate(self._video_frame_bboxes):
+            frame_bboxes.append(bboxes_by_frame.get(frame_index, previous_bbox))
+        self._video_frame_bboxes = frame_bboxes
+        self._video_prompt_bbox = self._video_frame_bboxes[0] or self._video_prompt_bbox
+        self._last_mask = mask
+        self._last_bbox = _mask_bbox_xyxy(mask)
+        self._last_logits = None
+
+        image_np = self._video_frames[-1]
+        overlay = _overlay_mask(image_np, mask, alpha=alpha)
+        return MaskOverlayResult(
+            image=image_np,
+            mask=(mask.astype(np.uint8) * 255),
+            overlay=overlay,
+            score=scores_by_frame.get(last_index),
+            bbox_xyxy=self._last_bbox,
+            initialized=True,
+            selected_obj_id=selected_obj_id,
+            candidate_count=candidate_count,
+        )
+
+
 class MaskOverlayPolicy(_base_policy.BasePolicy):
     def __init__(
         self,
@@ -439,6 +669,16 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
                 video_window_size=video_window_size,
                 video_version=video_version,
             )
+        elif tracking_mode == "text_select_video":
+            self._segmenter = Sam3TextSelectVideoMaskOverlay(
+                checkpoint_path=checkpoint_path,
+                device=device,
+                alpha=alpha,
+                multimask_output=multimask_output,
+                sam3_path=sam3_path,
+                video_window_size=video_window_size,
+                video_version=video_version,
+            )
         else:
             raise ValueError(f"Unsupported mask overlay tracking mode: {tracking_mode!r}")
 
@@ -463,6 +703,7 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
             image_dict[view],
             points=request.get("points"),
             point_labels=request.get("point_labels"),
+            text=request.get("text"),
             reset=bool(request.get("reset", False)),
             alpha=request.get("alpha"),
         )
@@ -474,6 +715,8 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
             include_image=bool(request.get("return_image", False)),
         )
         if bool(request.get("preview_only", False)):
+            return {MASK_OVERLAY_KEY: response_payload}
+        if result.needs_reprompt:
             return {MASK_OVERLAY_KEY: response_payload}
 
         image_dict = dict(image_dict)
@@ -514,6 +757,10 @@ def _result_payload(
         "score": result.score,
         "bbox_xyxy": result.bbox_xyxy,
         "initialized": result.initialized,
+        "needs_reprompt": result.needs_reprompt,
+        "reprompt_reason": result.reprompt_reason,
+        "selected_obj_id": result.selected_obj_id,
+        "candidate_count": result.candidate_count,
     }
     if include_image:
         payload["image"] = result.image
@@ -559,28 +806,122 @@ def _optional_point_labels(labels: Any, *, num_points: int) -> np.ndarray:
     return labels_np
 
 
+def _optional_text(text: Any) -> str | None:
+    if text is None:
+        return None
+    text_str = str(text).strip()
+    return text_str or None
+
+
 def _to_numpy(value: Any) -> np.ndarray:
     if hasattr(value, "detach"):
         return value.detach().cpu().numpy()
     return np.asarray(value)
 
 
-def _mask_from_video_outputs(outputs: dict[str, Any]) -> tuple[np.ndarray | None, float | None]:
+def _needs_reprompt_result(
+    image: np.ndarray,
+    *,
+    alpha: float,
+    reason: str,
+    candidate_count: int | None = None,
+    selected_obj_id: int | None = None,
+) -> MaskOverlayResult:
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    return MaskOverlayResult(
+        image=image,
+        mask=mask,
+        overlay=_overlay_mask(image, mask, alpha=alpha),
+        score=None,
+        bbox_xyxy=None,
+        initialized=False,
+        needs_reprompt=True,
+        reprompt_reason=reason,
+        selected_obj_id=selected_obj_id,
+        candidate_count=candidate_count,
+    )
+
+
+def _video_candidates_from_outputs(outputs: dict[str, Any]) -> list[_VideoCandidate]:
     masks = outputs.get("out_binary_masks")
     if masks is None:
-        return None, None
+        return []
+
     masks_np = _to_numpy(masks)
-    if masks_np.size == 0 or masks_np.shape[0] == 0:
-        return None, None
+    if masks_np.size == 0:
+        return []
+    if masks_np.ndim == 2:
+        masks_np = masks_np[None, :, :]
+
+    num_masks = int(masks_np.shape[0])
+    obj_ids = outputs.get("out_obj_ids")
+    obj_ids_np = _to_numpy(obj_ids).reshape(-1) if obj_ids is not None else np.arange(num_masks)
+    if len(obj_ids_np) != num_masks:
+        obj_ids_np = np.arange(num_masks)
 
     scores = outputs.get("out_probs")
     scores_np = _to_numpy(scores).reshape(-1) if scores is not None else np.asarray([], dtype=np.float32)
-    mask_index = int(np.argmax(scores_np)) if len(scores_np) == masks_np.shape[0] else 0
-    mask = np.squeeze(masks_np[mask_index]) > 0
-    if mask.ndim != 2:
-        raise ValueError(f"SAM3 video tracker returned an unsupported mask shape: {mask.shape}")
-    score = float(scores_np[mask_index]) if len(scores_np) == masks_np.shape[0] else None
-    return mask, score
+
+    candidates: list[_VideoCandidate] = []
+    for index in range(num_masks):
+        mask = np.squeeze(masks_np[index]) > 0
+        if mask.ndim != 2:
+            raise ValueError(f"SAM3 video tracker returned an unsupported mask shape: {mask.shape}")
+        mask = _largest_connected_component(mask)
+        if not mask.any():
+            continue
+        score = float(scores_np[index]) if len(scores_np) == num_masks else None
+        candidates.append(
+            _VideoCandidate(
+                obj_id=int(obj_ids_np[index]),
+                mask=mask,
+                score=score,
+                bbox_xyxy=_mask_bbox_xyxy(mask),
+            )
+        )
+    return candidates
+
+
+def _video_candidate_by_obj_id(outputs: dict[str, Any], obj_id: int) -> _VideoCandidate | None:
+    for candidate in _video_candidates_from_outputs(outputs):
+        if candidate.obj_id == int(obj_id):
+            return candidate
+    return None
+
+
+def _select_video_candidate(
+    candidates: list[_VideoCandidate],
+    *,
+    point_xy: tuple[float, float] | None = None,
+    bbox_xyxy: tuple[int, int, int, int] | None = None,
+) -> _VideoCandidate | None:
+    if not candidates:
+        return None
+
+    if point_xy is not None:
+        point_x, point_y = point_xy
+        containing = [candidate for candidate in candidates if _mask_contains_point(candidate.mask, point_x, point_y)]
+        if containing:
+            return max(containing, key=_candidate_score)
+        return min(candidates, key=lambda candidate: _point_distance_to_mask(candidate.mask, point_x, point_y))
+
+    if bbox_xyxy is not None:
+        best_by_iou = max(candidates, key=lambda candidate: _bbox_iou(candidate.bbox_xyxy, bbox_xyxy))
+        if _bbox_iou(best_by_iou.bbox_xyxy, bbox_xyxy) > 0.0:
+            return best_by_iou
+        center_x = (bbox_xyxy[0] + bbox_xyxy[2]) * 0.5
+        center_y = (bbox_xyxy[1] + bbox_xyxy[3]) * 0.5
+        return min(candidates, key=lambda candidate: _candidate_center_distance(candidate, center_x, center_y))
+
+    return max(candidates, key=_candidate_score)
+
+
+def _mask_from_video_outputs(outputs: dict[str, Any]) -> tuple[np.ndarray | None, float | None]:
+    candidates = _video_candidates_from_outputs(outputs)
+    if not candidates:
+        return None, None
+    candidate = max(candidates, key=_candidate_score)
+    return candidate.mask, candidate.score
 
 
 def _mask_bbox_xyxy(mask: np.ndarray, *, padding: int = 4) -> tuple[int, int, int, int] | None:
@@ -612,6 +953,68 @@ def _bbox_xyxy_to_normalized_xywh(
         (x1 - x0) / float(width),
         (y1 - y0) / float(height),
     ]
+
+
+def _candidate_score(candidate: _VideoCandidate) -> float:
+    return float(candidate.score) if candidate.score is not None else 0.0
+
+
+def _mask_contains_point(mask: np.ndarray, point_x: float, point_y: float) -> bool:
+    x = int(round(point_x))
+    y = int(round(point_y))
+    height, width = mask.shape[:2]
+    if x < 0 or y < 0 or x >= width or y >= height:
+        return False
+    return bool(mask[y, x])
+
+
+def _point_distance_to_mask(mask: np.ndarray, point_x: float, point_y: float) -> float:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return float("inf")
+    return float(np.min((xs.astype(np.float32) - point_x) ** 2 + (ys.astype(np.float32) - point_y) ** 2))
+
+
+def _candidate_center_distance(candidate: _VideoCandidate, point_x: float, point_y: float) -> float:
+    if candidate.bbox_xyxy is None:
+        return float("inf")
+    center_x = (candidate.bbox_xyxy[0] + candidate.bbox_xyxy[2]) * 0.5
+    center_y = (candidate.bbox_xyxy[1] + candidate.bbox_xyxy[3]) * 0.5
+    return float((center_x - point_x) ** 2 + (center_y - point_y) ** 2)
+
+
+def _bbox_iou(
+    bbox_a: tuple[int, int, int, int] | None,
+    bbox_b: tuple[int, int, int, int] | None,
+) -> float:
+    if bbox_a is None or bbox_b is None:
+        return 0.0
+    ax0, ay0, ax1, ay1 = bbox_a
+    bx0, by0, bx1, by1 = bbox_b
+    ix0 = max(ax0, bx0)
+    iy0 = max(ay0, by0)
+    ix1 = min(ax1, bx1)
+    iy1 = min(ay1, by1)
+    inter_width = max(ix1 - ix0 + 1, 0)
+    inter_height = max(iy1 - iy0 + 1, 0)
+    intersection = inter_width * inter_height
+    area_a = max(ax1 - ax0 + 1, 0) * max(ay1 - ay0 + 1, 0)
+    area_b = max(bx1 - bx0 + 1, 0) * max(by1 - by0 + 1, 0)
+    union = area_a + area_b - intersection
+    return float(intersection / union) if union > 0 else 0.0
+
+
+def _largest_connected_component(mask: np.ndarray) -> np.ndarray:
+    try:
+        import cv2
+
+        labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        if labels_count <= 1:
+            return mask
+        largest_label = int(1 + np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        return labels == largest_label
+    except Exception:
+        return mask
 
 
 def _overlay_mask(image: np.ndarray, mask: np.ndarray, *, alpha: float) -> np.ndarray:

@@ -215,13 +215,62 @@ def _array_stats(name: str, value) -> str:
     )
 
 
+def _as_uint8_image(image) -> np.ndarray:
+    image_np = np.asarray(image)
+    if image_np.ndim == 3 and image_np.shape[0] in (3, 4) and image_np.shape[-1] not in (3, 4):
+        image_np = np.moveaxis(image_np, 0, -1)
+    if image_np.dtype != np.uint8:
+        if np.issubdtype(image_np.dtype, np.floating):
+            if image_np.size and image_np.min() >= -1.0 and image_np.max() <= 1.0:
+                image_np = (image_np + 1.0) * 127.5
+            elif image_np.size and image_np.min() >= 0.0 and image_np.max() <= 1.0:
+                image_np = image_np * 255.0
+        image_np = np.clip(image_np, 0, 255).astype(np.uint8)
+    return np.ascontiguousarray(image_np)
+
+
+def _rgb_to_bgr_for_cv2(image) -> np.ndarray:
+    image_np = _as_uint8_image(image)
+    if image_np.ndim == 2:
+        return cv2.cvtColor(image_np, cv2.COLOR_GRAY2BGR)
+    if image_np.shape[-1] == 4:
+        image_np = image_np[..., :3]
+    return cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+
+
 def _save_debug_image(path: pathlib.Path, image_rgb: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    image_np = np.asarray(image_rgb)
+    image_np = _as_uint8_image(image_rgb)
     if image_np.ndim == 2:
         cv2.imwrite(str(path), image_np)
     else:
         cv2.imwrite(str(path), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+
+
+def _show_overlay_preview(overlay, *, window: str) -> str:
+    display = _rgb_to_bgr_for_cv2(overlay)
+    cv2.putText(
+        display,
+        "y/Enter: accept   r: retry   q/Esc: quit",
+        (8, 24),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 0),
+        2,
+    )
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    while True:
+        cv2.imshow(window, display)
+        key = cv2.waitKey(20) & 0xFF
+        if key in (ord("y"), 13, 10):
+            cv2.destroyWindow(window)
+            return "y"
+        if key == ord("r"):
+            cv2.destroyWindow(window)
+            return "r"
+        if key in (ord("q"), 27):
+            cv2.destroyWindow(window)
+            return "q"
 
 
 def _dump_mask_preview_debug(
@@ -297,6 +346,7 @@ def _preview_mask_overlay(
     image_rgb: np.ndarray,
     view: str,
     point_xy: tuple[int, int] | None,
+    text_prompt: str | None,
     alpha: float,
     debug_dir: pathlib.Path | None,
 ) -> None:
@@ -312,6 +362,8 @@ def _preview_mask_overlay(
             "preview_only": True,
             "alpha": float(alpha),
         }
+        if text_prompt:
+            mask_request["text"] = text_prompt
         if debug_dir is not None:
             mask_request["return_image"] = True
 
@@ -324,6 +376,13 @@ def _preview_mask_overlay(
         overlay = payload.get("overlay")
         if overlay is None:
             raise RuntimeError(f"Policy server did not return mask overlay preview: keys={sorted(resp)}")
+        if payload.get("needs_reprompt"):
+            print(f"[MASK] server 请求重新打点: {payload.get('reprompt_reason')}")
+            answer = input("SAM3 未得到有效 mask。[r=重新点击 / q=退出]: ").strip().lower()
+            if answer in ("q", "quit"):
+                raise RuntimeError("Mask overlay preview rejected.")
+            point_xy = None
+            continue
         if debug_dir is not None:
             _dump_mask_preview_debug(
                 debug_dir=debug_dir,
@@ -333,14 +392,10 @@ def _preview_mask_overlay(
                 payload=payload,
             )
 
-        window = f"SAM3 overlay preview: {view}"
-        cv2.imshow(window, cv2.cvtColor(np.asarray(overlay), cv2.COLOR_RGB2BGR))
-        cv2.waitKey(1)
-        answer = input("SAM3 overlay 是否正确？[y=确认 / r=重新点击 / q=退出]: ").strip().lower()
-        cv2.destroyWindow(window)
-        if answer in ("y", "yes", ""):
+        answer = _show_overlay_preview(overlay, window=f"SAM3 overlay preview: {view}")
+        if answer == "y":
             return
-        if answer in ("q", "quit"):
+        if answer == "q":
             raise RuntimeError("Mask overlay preview rejected.")
         point_xy = None
 
@@ -502,6 +557,7 @@ def main():
     parser.add_argument("--mask_overlay", action="store_true", help="请求 policy server 使用 SAM3 mask overlay 后再推理")
     parser.add_argument("--mask_view", default=None, help="需要做 SAM3 overlay 的 image key；single 默认 front，dual 下建议显式指定 robot_0/robot_1")
     parser.add_argument("--mask_prompt_point", default=None, help="初始正点 prompt，格式 x,y；不填则弹窗点击")
+    parser.add_argument("--mask_prompt_text", default=None, help="SAM3 text prompt，例如 sponge；text_select_video 模式必填")
     parser.add_argument("--mask_alpha", type=float, default=0.35, help="SAM3 overlay alpha")
     parser.add_argument("--mask_debug_dir", default=None, help="显式提供目录时，保存 SAM3 preview 输入/输出调试图并请求 server 回传原图")
     args = parser.parse_args()
@@ -565,6 +621,8 @@ def main():
         metadata = policy_client.get_server_metadata()
         if not metadata.get("mask_overlay", {}).get("enabled", False):
             raise RuntimeError("client 开启了 --mask_overlay，但 server 未启用 --mask-overlay")
+        if metadata.get("mask_overlay", {}).get("tracking_mode") == "text_select_video" and not args.mask_prompt_text:
+            raise RuntimeError("server 使用 text_select_video，client 需要提供 --mask_prompt_text")
 
     camera_devs = {
         "robot_0": args.camera_dev0,
@@ -601,6 +659,7 @@ def main():
             image_rgb=preview_images[effective_mask_view],
             view=effective_mask_view,
             point_xy=_parse_xy(args.mask_prompt_point),
+            text_prompt=args.mask_prompt_text,
             alpha=args.mask_alpha,
             debug_dir=mask_debug_dir,
         )
@@ -703,17 +762,34 @@ def main():
                     "view": effective_mask_view,
                     "alpha": args.mask_alpha,
                 }
+                if args.mask_prompt_text:
+                    obs[MASK_OVERLAY_KEY]["text"] = args.mask_prompt_text
                 if mask_debug_dir is not None:
                     obs[MASK_OVERLAY_KEY]["return_image"] = True
 
             resp = policy_client.infer(obs)
+            mask_payload = resp.get(MASK_OVERLAY_KEY, {}) if args.mask_overlay else {}
             if args.mask_overlay and mask_debug_dir is not None:
                 _dump_mask_rollout_debug(
                     debug_dir=mask_debug_dir,
                     view=effective_mask_view,
                     infer_index=infer_index,
-                    payload=resp.get(MASK_OVERLAY_KEY, {}),
+                    payload=mask_payload,
                 )
+            if args.mask_overlay and mask_payload.get("needs_reprompt"):
+                print(f"[MASK] tracking 丢失，重新打点: {mask_payload.get('reprompt_reason')}")
+                _preview_mask_overlay(
+                    policy_client,
+                    image_rgb=np.asarray(image_obs[effective_mask_view]),
+                    view=effective_mask_view,
+                    point_xy=None,
+                    text_prompt=args.mask_prompt_text,
+                    alpha=args.mask_alpha,
+                    debug_dir=mask_debug_dir,
+                )
+                print("[INFO] SAM3 mask overlay 已重新初始化，继续推理")
+                infer_index += 1
+                continue
             infer_index += 1
             actions_all = resp["actions"] if "actions" in resp else resp["action"]
             actions_all = np.array(actions_all, dtype=np.float64, copy=True)
