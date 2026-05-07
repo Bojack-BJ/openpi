@@ -227,7 +227,7 @@ class MaskOverlayPolicy(_base_policy.BasePolicy):
             alpha=request.get("alpha"),
         )
 
-        response_payload = _result_payload(result, view=view)
+        response_payload = _result_payload(result, view=view, include_image=bool(request.get("return_image", False)))
         if bool(request.get("preview_only", False)):
             return {MASK_OVERLAY_KEY: response_payload}
 
@@ -254,8 +254,8 @@ def _strip_mask_request(obs: dict) -> dict:
     return {key: value for key, value in obs.items() if key != MASK_OVERLAY_KEY}
 
 
-def _result_payload(result: MaskOverlayResult, *, view: str) -> dict[str, Any]:
-    return {
+def _result_payload(result: MaskOverlayResult, *, view: str, include_image: bool = False) -> dict[str, Any]:
+    payload = {
         "view": view,
         "mask": result.mask,
         "overlay": result.overlay,
@@ -263,6 +263,9 @@ def _result_payload(result: MaskOverlayResult, *, view: str) -> dict[str, Any]:
         "bbox_xyxy": result.bbox_xyxy,
         "initialized": result.initialized,
     }
+    if include_image:
+        payload["image"] = result.image
+    return payload
 
 
 def _as_uint8_hwc(image: Any) -> np.ndarray:

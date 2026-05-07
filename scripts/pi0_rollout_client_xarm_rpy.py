@@ -21,6 +21,7 @@ xArm 在线 rollout client，支持双臂和单臂。
 """
 
 import argparse
+import pathlib
 import select
 import sys
 import termios
@@ -149,6 +150,59 @@ def _select_point(image_rgb: np.ndarray, *, title: str) -> tuple[int, int]:
     return clicked[0]
 
 
+def _array_stats(name: str, value) -> str:
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return f"{name}: shape={arr.shape} dtype={arr.dtype} empty"
+    return (
+        f"{name}: shape={arr.shape} dtype={arr.dtype} "
+        f"min={arr.min()} max={arr.max()} mean={float(arr.mean()):.2f} nonzero={int(np.count_nonzero(arr))}"
+    )
+
+
+def _save_debug_image(path: pathlib.Path, image_rgb: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image_np = np.asarray(image_rgb)
+    if image_np.ndim == 2:
+        cv2.imwrite(str(path), image_np)
+    else:
+        cv2.imwrite(str(path), cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+
+
+def _dump_mask_preview_debug(
+    *,
+    debug_dir: pathlib.Path,
+    view: str,
+    point_xy: tuple[int, int],
+    client_image: np.ndarray,
+    payload: dict,
+) -> None:
+    overlay = np.asarray(payload["overlay"])
+    mask = np.asarray(payload.get("mask", np.zeros(client_image.shape[:2], dtype=np.uint8)))
+    server_image = payload.get("image")
+    print(
+        "[MASK DEBUG]",
+        f"view={view}",
+        f"point={point_xy}",
+        f"initialized={payload.get('initialized')}",
+        f"score={payload.get('score')}",
+        f"bbox={payload.get('bbox_xyxy')}",
+    )
+    print("[MASK DEBUG]", _array_stats("client_image", client_image))
+    if server_image is not None:
+        print("[MASK DEBUG]", _array_stats("server_image", server_image))
+    print("[MASK DEBUG]", _array_stats("overlay", overlay))
+    print("[MASK DEBUG]", _array_stats("mask", mask))
+
+    prefix = debug_dir / f"{view}_x{point_xy[0]}_y{point_xy[1]}"
+    _save_debug_image(prefix.with_name(prefix.name + "_client.png"), client_image)
+    if server_image is not None:
+        _save_debug_image(prefix.with_name(prefix.name + "_server.png"), np.asarray(server_image))
+    _save_debug_image(prefix.with_name(prefix.name + "_overlay.png"), overlay)
+    cv2.imwrite(str(prefix.with_name(prefix.name + "_mask.png")), mask)
+    print(f"[MASK DEBUG] saved preview images under {debug_dir}")
+
+
 def _preview_mask_overlay(
     policy_client,
     *,
@@ -156,27 +210,40 @@ def _preview_mask_overlay(
     view: str,
     point_xy: tuple[int, int] | None,
     alpha: float,
+    debug_dir: pathlib.Path | None,
 ) -> None:
     while True:
         if point_xy is None:
             point_xy = _select_point(image_rgb, title=f"Select SAM3 point: {view}")
+        mask_request = {
+            "enabled": True,
+            "view": view,
+            "reset": True,
+            "points": np.asarray([point_xy], dtype=np.float32),
+            "point_labels": np.asarray([1], dtype=np.int32),
+            "preview_only": True,
+            "alpha": float(alpha),
+        }
+        if debug_dir is not None:
+            mask_request["return_image"] = True
+
         obs = {
             "image": {view: image_tools.convert_to_uint8(image_rgb)},
-            MASK_OVERLAY_KEY: {
-                "enabled": True,
-                "view": view,
-                "reset": True,
-                "points": np.asarray([point_xy], dtype=np.float32),
-                "point_labels": np.asarray([1], dtype=np.int32),
-                "preview_only": True,
-                "alpha": float(alpha),
-            },
+            MASK_OVERLAY_KEY: mask_request,
         }
         resp = policy_client.infer(obs)
         payload = resp.get(MASK_OVERLAY_KEY, {})
         overlay = payload.get("overlay")
         if overlay is None:
             raise RuntimeError(f"Policy server did not return mask overlay preview: keys={sorted(resp)}")
+        if debug_dir is not None:
+            _dump_mask_preview_debug(
+                debug_dir=debug_dir,
+                view=view,
+                point_xy=point_xy,
+                client_image=image_rgb,
+                payload=payload,
+            )
 
         window = f"SAM3 overlay preview: {view}"
         cv2.imshow(window, cv2.cvtColor(np.asarray(overlay), cv2.COLOR_RGB2BGR))
@@ -453,6 +520,7 @@ def main():
     parser.add_argument("--mask_view", default=None, help="需要做 SAM3 overlay 的 image key；single 默认 front，dual 下建议显式指定 robot_0/robot_1")
     parser.add_argument("--mask_prompt_point", default=None, help="初始正点 prompt，格式 x,y；不填则弹窗点击")
     parser.add_argument("--mask_alpha", type=float, default=0.35, help="SAM3 overlay alpha")
+    parser.add_argument("--mask_debug_dir", default=None, help="显式提供目录时，保存 SAM3 preview 输入/输出调试图并请求 server 回传原图")
     args = parser.parse_args()
 
     is_dual = args.arm_mode == "dual"
@@ -539,6 +607,7 @@ def main():
             view=effective_mask_view,
             point_xy=_parse_xy(args.mask_prompt_point),
             alpha=args.mask_alpha,
+            debug_dir=pathlib.Path(args.mask_debug_dir) if args.mask_debug_dir else None,
         )
         print("[INFO] SAM3 mask overlay 已确认，后续推理会持续请求 overlay")
 

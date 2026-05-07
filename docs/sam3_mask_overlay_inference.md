@@ -85,6 +85,21 @@ To skip the click window:
 
 Use `--mask_view robot_1` if the target object should be segmented from the second camera. For single-arm rollout, use `--arm_mode single --single_arm robot_0` or `--single_arm robot_1`; the client sends the selected camera as `image["front"]`, so `--mask_view` can be omitted and defaults to `front`.
 
+Normal preview requests only return the overlay and mask. To debug black previews or transport issues, explicitly pass a debug directory:
+
+```bash
+--mask_debug_dir /tmp/openpi_mask_overlay_preview
+```
+
+With `--mask_debug_dir`, the client asks the server to echo the image it received and saves four debug files:
+
+- `*_client.png`: image before websocket send.
+- `*_server.png`: image received by the policy server.
+- `*_overlay.png`: server-generated overlay.
+- `*_mask.png`: server-generated mask.
+
+If the returned preview is black, compare these files first. If `*_client.png` is already black, the issue is camera capture or device mapping. If `*_client.png` is normal but `*_server.png` is black, the issue is serialization/input conversion. If both are normal but `*_overlay.png` is black, the issue is in server-side SAM3 overlay generation.
+
 ## Wire Protocol
 
 The client adds a reserved key to the observation:
