@@ -509,8 +509,9 @@ def main():
     parser.add_argument("--port", type=int, default=PORT, help="policy server port")
     parser.add_argument("--camera_dev0", type=int, default=DEV, help="robot_0 图像对应的视频设备编号")
     parser.add_argument("--camera_dev1", type=int, default=DEV + 2, help="robot_1 图像对应的视频设备编号")
-    parser.add_argument("--dt", type=float, default=0.025, help="插值每步的睡眠时间（秒）")
-    parser.add_argument("--interp_step_size", type=float, default=0.0025, help="插值最大平移步长（米）；<=0 表示每个 action 直接下发")
+    parser.add_argument("--dt", type=float, default=0.025, help="启用 --enable_interp 时，插值每步的睡眠时间（秒）")
+    parser.add_argument("--enable_interp", action="store_true", help="启用客户端线性插值；默认关闭，交给 xArm SDK 自身规划")
+    parser.add_argument("--interp_step_size", type=float, default=0.0025, help="启用 --enable_interp 时，插值最大平移步长（米）")
     parser.add_argument("--init_pose_left", default="0.4,0.0,0.146,180,-90,0.0", help="robot_0 初始位姿: x,y,z,roll,pitch,yaw（米、度）")
     parser.add_argument("--init_pose_right", default="0.4,0.0,0.146,180,-90,0.0", help="robot_1 初始位姿: x,y,z,roll,pitch,yaw（米、度）")
     parser.add_argument("--skip_init_move", action="store_true", help="启动时不自动移动到 init_pose；s 复位仍使用 init_pose")
@@ -712,22 +713,28 @@ def main():
                     g0 = float(np.clip(g_open0, 0.0, 1.0))
                     g1 = float(np.clip(g_open1, 0.0, 1.0))
 
-                    interp_and_move_both(
-                        arms["robot_0"],
-                        arms["robot_1"],
-                        cur_pos0,
-                        cur_rpy0,
-                        target_pos0,
-                        target_rpy0,
-                        cur_pos1,
-                        cur_rpy1,
-                        target_pos1,
-                        target_rpy1,
-                        g0,
-                        g1,
-                        step_size=args.interp_step_size,
-                        dt=args.dt,
-                    )
+                    if args.enable_interp:
+                        interp_and_move_both(
+                            arms["robot_0"],
+                            arms["robot_1"],
+                            cur_pos0,
+                            cur_rpy0,
+                            target_pos0,
+                            target_rpy0,
+                            cur_pos1,
+                            cur_rpy1,
+                            target_pos1,
+                            target_rpy1,
+                            g0,
+                            g1,
+                            step_size=args.interp_step_size,
+                            dt=args.dt,
+                        )
+                    else:
+                        _set_xarm_pose(arms["robot_0"], target_pos0, target_rpy0, wait=False)
+                        _set_xarm_pose(arms["robot_1"], target_pos1, target_rpy1, wait=False)
+                        _set_xarm_gripper(arms["robot_0"], g0, arm_index=0, wait=False)
+                        _set_xarm_gripper(arms["robot_1"], g1, arm_index=1, wait=False)
                     cur_pos0, cur_rpy0 = target_pos0, target_rpy0
                     cur_pos1, cur_rpy1 = target_pos1, target_rpy1
                 else:
@@ -736,17 +743,21 @@ def main():
                     target_pos = [x_a, y_a, z_a]
                     target_rpy = [roll, pitch, yaw]
                     gripper_open = float(np.clip(g_open, 0.0, 1.0))
-                    interp_and_move_one(
-                        arms[single_arm],
-                        cur_pos_single,
-                        cur_rpy_single,
-                        target_pos,
-                        target_rpy,
-                        gripper_open,
-                        arm_index=single_arm_index,
-                        step_size=args.interp_step_size,
-                        dt=args.dt,
-                    )
+                    if args.enable_interp:
+                        interp_and_move_one(
+                            arms[single_arm],
+                            cur_pos_single,
+                            cur_rpy_single,
+                            target_pos,
+                            target_rpy,
+                            gripper_open,
+                            arm_index=single_arm_index,
+                            step_size=args.interp_step_size,
+                            dt=args.dt,
+                        )
+                    else:
+                        _set_xarm_pose(arms[single_arm], target_pos, target_rpy, wait=False)
+                        _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
                     cur_pos_single, cur_rpy_single = target_pos, target_rpy
 
     finally:
