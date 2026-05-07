@@ -40,7 +40,7 @@ from Bestman_real_xarm6 import Bestman_Real_Xarm6  # noqa: E402
 
 # ====== policy server 参数 ======
 SERVER_IP = "180.184.74.93"
-PORT = 8009
+PORT = 8004
 
 # ====== 摄像头（YU12 / I420）参数 ======
 DEV = 1
@@ -440,12 +440,12 @@ def main():
     parser.add_argument("--robot_ip_2", default="192.168.1.240", help="robot_1 对应 xArm 控制盒 IP")
     parser.add_argument("--server_ip", default=SERVER_IP, help="policy server host")
     parser.add_argument("--port", type=int, default=PORT, help="policy server port")
-    parser.add_argument("--camera_dev0", type=int, default=DEV + 2, help="robot_0 图像对应的视频设备编号")
-    parser.add_argument("--camera_dev1", type=int, default=DEV, help="robot_1 图像对应的视频设备编号")
+    parser.add_argument("--camera_dev0", type=int, default=DEV, help="robot_0 图像对应的视频设备编号")
+    parser.add_argument("--camera_dev1", type=int, default=DEV + 2, help="robot_1 图像对应的视频设备编号")
     parser.add_argument("--dt", type=float, default=0.025, help="插值每步的睡眠时间（秒）")
     parser.add_argument("--interp_step_size", type=float, default=0.0025, help="插值最大平移步长（米）；<=0 表示每个 action 直接下发")
-    parser.add_argument("--init_pose_left", default="0.3,0.0,0.16,0.0,0.0,0.0", help="robot_0 初始位姿: x,y,z,roll,pitch,yaw（米、度）")
-    parser.add_argument("--init_pose_right", default="0.3,0.0,0.16,0.0,0.0,0.0", help="robot_1 初始位姿: x,y,z,roll,pitch,yaw（米、度）")
+    parser.add_argument("--init_pose_left", default="0.4,0.0,0.146,180,-90,0.0", help="robot_0 初始位姿: x,y,z,roll,pitch,yaw（米、度）")
+    parser.add_argument("--init_pose_right", default="0.4,0.0,0.146,180,-90,0.0", help="robot_1 初始位姿: x,y,z,roll,pitch,yaw（米、度）")
     parser.add_argument("--skip_init_move", action="store_true", help="启动时不自动移动到 init_pose；s 复位仍使用 init_pose")
     parser.add_argument("--action_start", type=int, default=0, help="本次推理返回的 action 序列起始下标（含）")
     parser.add_argument("--action_end", type=int, default=20, help="本次推理返回的 action 序列结束下标（含）")
