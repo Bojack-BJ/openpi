@@ -26,7 +26,11 @@
         4. 最后执行 consolidate/finalize/close，并按需复制输出、清理临时文件。
 
 运行方式：
-        python dataprocess_new/fastumi_raw_to_lerobot_v21.py --raw-dir <raw_dir> --repo-id <repo_id> --task <task_name>
+        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir <raw_dir> [<raw_dir> ...] \
+            --repo-id <repo_id> \
+            --task <task_name> \
+            --robot-type <robot_type>
 
 运行示例：
         export HF_LEROBOT_HOME=/root/Users/dataset/lerobot_home
@@ -36,17 +40,41 @@
             --raw-dir /data/fastumi/task_20260121H011 \
             --repo-id fastumi_new/Fold_square_towels \
             --task "Fold square towels" \
+            --robot-type robotiq \
             --fps 20 \
             --traj-source merge \
             --mode image \
             --workers 8 \
             --max-inflight 16
 
+        # raw data 分散存储时，可以一次传多个根目录，也可以直接传 session 目录
+        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir /data/fastumi/part_a /data/fastumi/part_b \
+            --repo-id fastumi/my_task \
+            --task "My task" \
+            --robot-type robotiq \
+            --fps 20 \
+            --traj-source merge \
+            --mode image
+            
+        python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
+            --raw-dir /root/Users/pzh/pointVLA_raw_data/20260422 \
+            --repo-id fastumi/sponge_visual_guided \
+            --task "Put the target sponge into the target slot in the grid" \
+            --robot-type fasttouch \
+            --fps 20 \
+            --traj-source merge \
+            --mode image \
+            --include-guidance \
+            --include-overlay-images \
+            --overlay-target extra
+
         # 示例二：双臂数据，使用 next-step action，并将结果复制到指定目录
         python dataprocess_new/fastumi_raw_to_lerobot_v21.py \
             --raw-dir /root/Users/dataset/task_20260310H072Aa/good \
             --repo-id fastumi/Waste_sorting_a \
             --task "Sort the recyclable waste and hazardous waste into the corresponding bins" \
+            --robot-type fasttouch \
             --fps 30 \
             --traj-source merge \
             --mode image \
@@ -57,10 +85,10 @@
 
 参数说明：
         --raw-dir
-            含义：FastUMI 原始数据根目录，脚本会递归查找所有 session* 子目录。
-            类型：Path
+            含义：FastUMI 原始数据根目录或 session 目录；可一次传多个路径，也可重复传参。
+            类型：Path+
             是否必填：是
-            示例：--raw-dir /data/fastumi/task_20260121H011
+            示例：--raw-dir /data/fastumi/task_a /data/fastumi/task_b
 
         --repo-id
             含义：LeRobot 数据集仓库 ID（相对 HF_LEROBOT_HOME 的目标路径）。
@@ -73,6 +101,13 @@
             类型：字符串
             是否必填：是
             示例：--task "Fold square towels"
+
+        --robot-type
+            含义：机器人类型，用于选择 Step1 坐标变换与夹爪归一化参数。
+            类型：字符串
+            是否必填：是
+            可选值：xarm6 / robotiq / fasttouch
+            示例：--robot-type fasttouch
 
         --fps
             含义：目标输出帧率（从 60Hz 原始相机帧下采样）。
@@ -165,6 +200,7 @@
 
 import argparse
 import dataclasses
+import json
 import os
 import shutil
 import traceback
@@ -201,30 +237,36 @@ DEFAULT_DATASET_CONFIG = DatasetConfig()
 SOURCE_CAMERA_FPS = 60
 STATE_NAMES_8 = ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper_width"]
 
-STEP1_CFG = {
-    "base_x": 0.3,
-    "base_y": 0.0,
+STEP1_CFG_ROBOTIQ = {
+    "base_x": 0.4,
+    "base_y": -0.2,
     "base_z": 0.145,
     "base_euler_deg": [180, -90, 0.0],
     "max_gripper": 88.0, # 84 for acone/fasttouch, 88 for robotiq
 }
 
-# # Xarm6
-# STEP1_CFG_DUAL = {
-#     "base_x_0": 0.250,
-#     "base_y_0": 0.2,
-#     "base_z_0": 0.145,
-#     "base_euler_deg_0": [180, -90, 0.0],
-#     "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
-#     "base_x_1": 0.250,
-#     "base_y_1": -0.2,
-#     "base_z_1": 0.145,
-#     "base_euler_deg_1": [180, -90, 0.0],
-#     "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
-# }
+STEP1_CFG_DUAL_ROBOTIQ = {
+    "base_x_0": 0.250,
+    "base_y_0": 0.2,
+    "base_z_0": 0.145,
+    "base_euler_deg_0": [180, -90, 0.0],
+    "max_gripper_0": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+    "base_x_1": 0.250,
+    "base_y_1": -0.2,
+    "base_z_1": 0.145,
+    "base_euler_deg_1": [180, -90, 0.0],
+    "max_gripper_1": 88.0, # 84 for acone/fasttouch, 88 for robotiq
+}
 
-# fasttouch
-STEP1_CFG_DUAL = {
+STEP1_CFG_FASTTOUCH = {
+    "base_x": 0.3,
+    "base_y": 0.0,
+    "base_z": 0.16,
+    "base_euler_deg": [0.0, 0.0, 0.0],
+    "max_gripper": 84.0,
+}
+
+STEP1_CFG_DUAL_FASTTOUCH = {
     "base_x_0": 0.3,
     "base_y_0": 0.04,
     "base_z_0": 0.16,
@@ -237,46 +279,94 @@ STEP1_CFG_DUAL = {
     "max_gripper_1": 84.0, # 84 for acone/fasttouch, 88 for robotiq
 }
 
+STEP1_CONFIGS = {
+    "xarm6": {
+        "single": STEP1_CFG_ROBOTIQ,
+        "dual": STEP1_CFG_DUAL_ROBOTIQ,
+    },
+    "robotiq": {
+        "single": STEP1_CFG_ROBOTIQ,
+        "dual": STEP1_CFG_DUAL_ROBOTIQ,
+    },
+    "fasttouch": {
+        "single": STEP1_CFG_FASTTOUCH,
+        "dual": STEP1_CFG_DUAL_FASTTOUCH,
+    },
+}
 
-def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, float]) -> Tuple[Dict[str, float], Dict[str, float]]:
-        """Create per-arm step1 configs from explicit dual-arm keys.
 
-        Expected keys:
-            base_x_0, base_y_0, base_z_0, base_euler_deg_0, max_gripper_0
-            base_x_1, base_y_1, base_z_1, base_euler_deg_1, max_gripper_1
-        """
-        required = [
-            "base_x_0", "base_y_0", "base_z_0", "base_euler_deg_0", "max_gripper_0",
-            "base_x_1", "base_y_1", "base_z_1", "base_euler_deg_1", "max_gripper_1",
-        ]
-        missing = [k for k in required if k not in step1_cfg_dual]
-        if missing:
-            raise ValueError(f"Dual Step1 config missing keys: {missing}")
+def _copy_step1_cfg(step1_cfg: Dict[str, object]) -> Dict[str, object]:
+    result = dict(step1_cfg)
+    for key, value in list(result.items()):
+        if key.startswith("base_euler_deg"):
+            result[key] = list(value)
+    return result
 
-        cfg0 = {
-            "base_x": float(step1_cfg_dual["base_x_0"]),
-            "base_y": float(step1_cfg_dual["base_y_0"]),
-            "base_z": float(step1_cfg_dual["base_z_0"]),
-            "base_euler_deg": step1_cfg_dual["base_euler_deg_0"],
-            "max_gripper": float(step1_cfg_dual["max_gripper_0"]),
-        }
-        cfg1 = {
-            "base_x": float(step1_cfg_dual["base_x_1"]),
-            "base_y": float(step1_cfg_dual["base_y_1"]),
-            "base_z": float(step1_cfg_dual["base_z_1"]),
-            "base_euler_deg": step1_cfg_dual["base_euler_deg_1"],
-            "max_gripper": float(step1_cfg_dual["max_gripper_1"]),
-        }
-        return cfg0, cfg1
+
+def resolve_step1_configs(robot_type: str) -> Tuple[Dict[str, object], Dict[str, object]]:
+    try:
+        config = STEP1_CONFIGS[robot_type]
+    except KeyError as exc:
+        choices = ", ".join(sorted(STEP1_CONFIGS))
+        raise ValueError(f"Unsupported robot_type={robot_type!r}. Available robot types: {choices}") from exc
+    return _copy_step1_cfg(config["single"]), _copy_step1_cfg(config["dual"])
+
+
+def make_dual_step1_cfgs(step1_cfg_dual: Dict[str, object]) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Create per-arm step1 configs from explicit dual-arm keys.
+
+    Expected keys:
+        base_x_0, base_y_0, base_z_0, base_euler_deg_0, max_gripper_0
+        base_x_1, base_y_1, base_z_1, base_euler_deg_1, max_gripper_1
+    """
+    required = [
+        "base_x_0", "base_y_0", "base_z_0", "base_euler_deg_0", "max_gripper_0",
+        "base_x_1", "base_y_1", "base_z_1", "base_euler_deg_1", "max_gripper_1",
+    ]
+    missing = [k for k in required if k not in step1_cfg_dual]
+    if missing:
+        raise ValueError(f"Dual Step1 config missing keys: {missing}")
+
+    cfg0 = {
+        "base_x": float(step1_cfg_dual["base_x_0"]),
+        "base_y": float(step1_cfg_dual["base_y_0"]),
+        "base_z": float(step1_cfg_dual["base_z_0"]),
+        "base_euler_deg": step1_cfg_dual["base_euler_deg_0"],
+        "max_gripper": float(step1_cfg_dual["max_gripper_0"]),
+    }
+    cfg1 = {
+        "base_x": float(step1_cfg_dual["base_x_1"]),
+        "base_y": float(step1_cfg_dual["base_y_1"]),
+        "base_z": float(step1_cfg_dual["base_z_1"]),
+        "base_euler_deg": step1_cfg_dual["base_euler_deg_1"],
+        "max_gripper": float(step1_cfg_dual["max_gripper_1"]),
+    }
+    return cfg0, cfg1
 
 
 def find_all_sessions(raw_root: Path) -> List[Path]:
     found: List[Path] = []
+    if raw_root.name.startswith("session") and detect_layout(raw_root)[0] != "invalid":
+        found.append(raw_root)
     for r, dirs, _files in os.walk(raw_root):
         for d in dirs:
             if d.startswith("session"):
                 found.append(Path(r) / d)
     return sorted(found)
+
+
+def find_all_sessions_in_roots(raw_roots: List[Path]) -> List[Path]:
+    found_by_path: Dict[Path, Path] = {}
+    for raw_root in raw_roots:
+        if not raw_root.exists():
+            raise FileNotFoundError(f"--raw-dir does not exist: {raw_root}")
+        for session_path in find_all_sessions(raw_root):
+            try:
+                key = session_path.resolve()
+            except OSError:
+                key = session_path
+            found_by_path.setdefault(key, session_path)
+    return sorted(found_by_path.values())
 
 
 def detect_layout(session_path: Path) -> Tuple[str, Dict[str, Path]]:
@@ -476,6 +566,194 @@ def resize_rgb_no_crop(frame_bgr: np.ndarray, out_hw: int = 224) -> np.ndarray:
     return rgb.astype(np.uint8)
 
 
+def resize_mask_no_crop(mask: np.ndarray, out_hw: int = 224) -> np.ndarray:
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        mask = mask[..., 0]
+    mask = cv2.resize(mask, (out_hw, out_hw), interpolation=cv2.INTER_NEAREST)
+    return ((mask > 0).astype(np.uint8) * 255)[..., None]
+
+
+def mask_to_rgb(mask: np.ndarray) -> np.ndarray:
+    mask = np.asarray(mask)
+    if mask.ndim == 3:
+        if mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        elif mask.shape[0] == 1:
+            mask = mask[0]
+        elif mask.shape[-1] in (3, 4):
+            mask = np.max(mask[..., :3], axis=-1)
+        elif mask.shape[0] in (3, 4):
+            mask = np.max(mask[:3], axis=0)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected mask rank 2 or single-channel/rgb rank 3, got shape={mask.shape}")
+    mask_u8 = ((mask > 0).astype(np.uint8) * 255)
+    return np.repeat(mask_u8[..., None], 3, axis=-1)
+
+
+def _mask_contour(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask.astype(bool), 1, mode="constant", constant_values=False)
+    eroded = mask.astype(bool).copy()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            eroded &= padded[1 + dy : 1 + dy + mask.shape[0], 1 + dx : 1 + dx + mask.shape[1]]
+    return mask & ~eroded
+
+
+def overlay_rgb_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    alpha: float = 0.35,
+    color: Tuple[int, int, int] = (0, 255, 0),
+    draw_contour: bool = True,
+    contour_alpha: float = 0.85,
+    contour_color: Tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    mask_arr = np.asarray(mask)
+    if mask_arr.ndim == 3:
+        mask_arr = mask_arr[..., 0]
+    mask_bool = mask_arr > 0
+    if not np.any(mask_bool):
+        return np.array(image, copy=True)
+
+    work = np.asarray(image).astype(np.float32, copy=True)
+    rgb_color = np.asarray(color, dtype=np.float32)
+    rgb_contour_color = np.asarray(contour_color, dtype=np.float32)
+    work[mask_bool, :3] = (1.0 - alpha) * work[mask_bool, :3] + alpha * rgb_color
+
+    if draw_contour:
+        contour = _mask_contour(mask_bool)
+        if np.any(contour):
+            work[contour, :3] = (1.0 - contour_alpha) * work[contour, :3] + contour_alpha * rgb_contour_color
+
+    return np.rint(np.clip(work, 0, 255)).astype(np.uint8)
+
+
+def overlay_rgb_masks(images: np.ndarray, masks: np.ndarray, *, alpha: float = 0.35) -> np.ndarray:
+    overlays = np.empty_like(images, dtype=np.uint8)
+    for index in range(images.shape[0]):
+        overlays[index] = overlay_rgb_mask(images[index], masks[index], alpha=alpha)
+    return overlays
+
+
+def _parse_frame_range(frame_range: str) -> Tuple[int, int]:
+    start, end = frame_range.strip().strip("[]").split(",", maxsplit=1)
+    return int(start), int(end) + 1
+
+
+def _segments_from_subtask_json(path: Path, *, fallback_end_frame: int) -> List[Tuple[int, int, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+
+    segments: List[Tuple[int, int, str]] = []
+    for item in payload.get("segments", []):
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("subtask", "")).strip()
+        if not text:
+            continue
+        start = int(item.get("start_frame", item.get("start", 0)))
+        end = int(item.get("end_frame", item.get("end", fallback_end_frame)))
+        if start < end:
+            segments.append((start, end, text))
+    if segments:
+        return segments
+
+    for item in payload.get("subtask_instruction", []):
+        if not isinstance(item, dict):
+            continue
+        for frame_range, subtask in item.items():
+            start, end = _parse_frame_range(str(frame_range))
+            text = str(subtask).strip()
+            if text and start < end:
+                segments.append((start, end, text))
+    if segments:
+        return segments
+
+    subtasks = [str(item).strip() for item in payload.get("subtask", [])]
+    boundaries = [int(item) for item in payload.get("boundaries_frame_indices", [])]
+    if not subtasks:
+        return []
+    starts = [0, *boundaries]
+    ends = [*boundaries, int(fallback_end_frame)]
+    return [
+        (start, end, subtask)
+        for start, end, subtask in zip(starts, ends, subtasks)
+        if subtask and start < end
+    ]
+
+
+def _subtasks_for_frame_indices(session_path: Path, frame_indices: np.ndarray) -> np.ndarray:
+    if frame_indices.size == 0:
+        return np.asarray([], dtype="<U1")
+    candidates = [
+        session_path / "subtask.json",
+        session_path / "segments.json",
+        session_path.parent / "subtask.json",
+        session_path.parent / "segments.json",
+    ]
+    fallback_end_frame = int(np.max(frame_indices)) + 1
+    segments: List[Tuple[int, int, str]] = []
+    for candidate in candidates:
+        segments = _segments_from_subtask_json(candidate, fallback_end_frame=fallback_end_frame)
+        if segments:
+            break
+
+    values: List[str] = []
+    for frame_index in frame_indices.tolist():
+        value = ""
+        for start, end, subtask in segments:
+            if start <= int(frame_index) < end:
+                value = subtask
+                break
+        values.append(value)
+    max_len = max([1, *(len(value) for value in values)])
+    return np.asarray(values, dtype=f"<U{max_len}")
+
+
+def _masks_for_frame_indices(session_path: Path, frame_indices: np.ndarray) -> np.ndarray:
+    mask_dir = session_path / "annotation" / "masks"
+    masks = np.zeros((len(frame_indices), 224, 224, 1), dtype=np.uint8)
+    if not mask_dir.exists():
+        return masks
+    for out_index, frame_index in enumerate(frame_indices.tolist()):
+        mask_path = mask_dir / f"{int(frame_index):06d}.png"
+        if not mask_path.exists():
+            continue
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            continue
+        masks[out_index] = resize_mask_no_crop(mask, out_hw=224)
+    return masks
+
+
+def _segments_from_subtask_array(subtasks: np.ndarray) -> List[Dict[str, object]]:
+    values = [str(value).strip() for value in subtasks.tolist()]
+    segments: List[Dict[str, object]] = []
+    start = 0
+    current = values[0] if values else ""
+    for index, value in enumerate(values[1:], start=1):
+        if value == current:
+            continue
+        if current:
+            segments.append({"start_frame": start, "end_frame": index, "subtask": current})
+        start = index
+        current = value
+    if current:
+        segments.append({"start_frame": start, "end_frame": len(values), "subtask": current})
+    return segments
+
+
+def _subtask_segments_from_npz(npz_path: Path) -> List[Dict[str, object]]:
+    z = np.load(npz_path, allow_pickle=False)
+    if "subtask" not in z.files:
+        return []
+    return _segments_from_subtask_array(z["subtask"])
+
+
 def nearest_indices(sorted_ts: np.ndarray, query_ts: np.ndarray) -> np.ndarray:
     """
     sorted_ts must be ascending.
@@ -545,8 +823,11 @@ def create_empty_dataset(
     *,
     repo_id: str,
     fps: int,
+    robot_type: str,
     mode: Literal["video", "image"],
     bimanual: bool,
+    include_guidance: bool = False,
+    include_overlay_images: bool = False,
     dataset_config: DatasetConfig = DEFAULT_DATASET_CONFIG,
 ) -> LeRobotDataset:
     features: Dict[str, Dict[str, object]] = {}
@@ -560,6 +841,23 @@ def create_empty_dataset(
             "shape": (224, 224, 3),
             "names": ["height", "width", "channels"],
         }
+        if include_guidance:
+            features["subtask"] = {
+                "dtype": "string",
+                "shape": (1,),
+                "names": ["text"],
+            }
+            features["observation.masks.front_mask"] = {
+                "dtype": mode,
+                "shape": (224, 224, 3),
+                "names": ["height", "width", "channels"],
+            }
+            if include_overlay_images:
+                features["observation.images.front_overlay"] = {
+                    "dtype": mode,
+                    "shape": (224, 224, 3),
+                    "names": ["height", "width", "channels"],
+                }
     else:
         state_names_16 = [f"robot_0_{n}" for n in STATE_NAMES_8] + [f"robot_1_{n}" for n in STATE_NAMES_8]
         features["observation.state"] = {"dtype": "float32", "shape": (16,), "names": state_names_16}
@@ -576,6 +874,33 @@ def create_empty_dataset(
             "shape": (224, 224, 3),
             "names": ["height", "width", "channels"],
         }
+        if include_guidance:
+            features["subtask"] = {
+                "dtype": "string",
+                "shape": (1,),
+                "names": ["text"],
+            }
+            features["observation.masks.robot_0_mask"] = {
+                "dtype": mode,
+                "shape": (224, 224, 3),
+                "names": ["height", "width", "channels"],
+            }
+            features["observation.masks.robot_1_mask"] = {
+                "dtype": mode,
+                "shape": (224, 224, 3),
+                "names": ["height", "width", "channels"],
+            }
+            if include_overlay_images:
+                features["observation.images.robot_0_overlay"] = {
+                    "dtype": mode,
+                    "shape": (224, 224, 3),
+                    "names": ["height", "width", "channels"],
+                }
+                features["observation.images.robot_1_overlay"] = {
+                    "dtype": mode,
+                    "shape": (224, 224, 3),
+                    "names": ["height", "width", "channels"],
+                }
 
     if (HF_LEROBOT_HOME / repo_id).exists():
         shutil.rmtree(HF_LEROBOT_HOME / repo_id)
@@ -583,7 +908,7 @@ def create_empty_dataset(
     return LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
-        robot_type="fastumi",
+        robot_type=robot_type,
         features=features,
         use_videos=(mode == "video"),
         tolerance_s=dataset_config.tolerance_s,
@@ -602,6 +927,9 @@ def _extract_single_to_npz(
     traj_source: str,
     use_next: bool,
     step1_cfg: Dict[str, float],
+    include_guidance: bool,
+    include_overlay_images: bool,
+    overlay_alpha: float,
 ) -> Tuple[bool, str]:
     data_path = str(data_path)
     out_npz = str(out_npz)
@@ -648,7 +976,21 @@ def _extract_single_to_npz(
 
         actions = build_actions_from_states(states, use_next)
 
-        np.savez_compressed(out_npz, kind=np.array("single"), states=states, actions=actions, images=imgs)
+        payload = {
+            "kind": np.array("single"),
+            "states": states,
+            "actions": actions,
+            "images": imgs,
+        }
+        if include_guidance:
+            path_obj = Path(data_path)
+            masks = _masks_for_frame_indices(path_obj, fidx_arr)
+            payload["front_mask"] = masks
+            if include_overlay_images:
+                payload["front_overlay"] = overlay_rgb_masks(imgs, masks, alpha=overlay_alpha)
+            payload["subtask"] = _subtasks_for_frame_indices(path_obj, fidx_arr)
+
+        np.savez_compressed(out_npz, **payload)
         return True, "ok"
     except Exception as e:
         return False, f"exception: {e}\n{traceback.format_exc()}"
@@ -664,6 +1006,9 @@ def _extract_dual_to_npz(
     use_next: bool,
     step1_cfg_robot0: Dict[str, float],
     step1_cfg_robot1: Dict[str, float],
+    include_guidance: bool,
+    include_overlay_images: bool,
+    overlay_alpha: float,
 ) -> Tuple[bool, str]:
     left_path = str(left_path)
     right_path = str(right_path)
@@ -739,33 +1084,84 @@ def _extract_dual_to_npz(
         states = np.concatenate([s0, s1], axis=1).astype(np.float32)  # (T,16)
         actions = build_actions_from_states(states, use_next)
 
-        np.savez_compressed(out_npz, kind=np.array("dual"), s0=s0, s1=s1, states=states, actions=actions, img_l=imgs_l, img_r=imgs_r)
+        payload = {
+            "kind": np.array("dual"),
+            "s0": s0,
+            "s1": s1,
+            "states": states,
+            "actions": actions,
+            "img_l": imgs_l,
+            "img_r": imgs_r,
+        }
+        if include_guidance:
+            left_path_obj = Path(left_path)
+            right_path_obj = Path(right_path)
+            mask_l = _masks_for_frame_indices(left_path_obj, fidx_l[:T])
+            mask_r = _masks_for_frame_indices(right_path_obj, fidx_r[:T])
+            payload["robot_0_mask"] = mask_l
+            payload["robot_1_mask"] = mask_r
+            if include_overlay_images:
+                payload["robot_0_overlay"] = overlay_rgb_masks(imgs_l, mask_l, alpha=overlay_alpha)
+                payload["robot_1_overlay"] = overlay_rgb_masks(imgs_r, mask_r, alpha=overlay_alpha)
+            payload["subtask"] = _subtasks_for_frame_indices(left_path_obj, fidx_l[:T])
+
+        np.savez_compressed(out_npz, **payload)
         return True, "ok"
     except Exception as e:
         return False, f"exception: {e}\n{traceback.format_exc()}"
 
 
-def write_single_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -> bool:
+def write_single_from_npz(
+    dataset: LeRobotDataset,
+    npz_path: Path,
+    *,
+    task: str,
+    include_guidance: bool,
+    include_overlay_images: bool,
+    overlay_target: Literal["replace", "extra"],
+) -> bool:
     z = np.load(npz_path, allow_pickle=False)
     states = z["states"].astype(np.float32)
     actions = z["actions"].astype(np.float32)
     images = z["images"].astype(np.uint8)
+    masks = z["front_mask"].astype(np.uint8) if include_guidance and "front_mask" in z.files else None
+    overlays = z["front_overlay"].astype(np.uint8) if include_overlay_images and "front_overlay" in z.files else None
+    subtasks = z["subtask"] if include_guidance and "subtask" in z.files else None
 
     T = states.shape[0]
     for i in range(T):
+        subtask = str(subtasks[i]).strip() if subtasks is not None else ""
+        image = overlays[i] if overlays is not None and overlay_target == "replace" else images[i]
         frame = {
             "task": task,
             "observation.state": torch.from_numpy(states[i]).to(torch.float32),
             "action": torch.from_numpy(actions[i]).to(torch.float32),
             "robot_0_state": torch.from_numpy(states[i]).to(torch.float32),
-            "observation.images.front": images[i],
+            "observation.images.front": image,
         }
+        if include_guidance:
+            frame["subtask"] = subtask
+            frame["observation.masks.front_mask"] = (
+                mask_to_rgb(masks[i]) if masks is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+            )
+            if include_overlay_images and overlay_target == "extra":
+                frame["observation.images.front_overlay"] = (
+                    overlays[i] if overlays is not None else images[i]
+                )
         dataset.add_frame(frame)
     dataset.save_episode()
     return True
 
 
-def write_dual_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -> bool:
+def write_dual_from_npz(
+    dataset: LeRobotDataset,
+    npz_path: Path,
+    *,
+    task: str,
+    include_guidance: bool,
+    include_overlay_images: bool,
+    overlay_target: Literal["replace", "extra"],
+) -> bool:
     z = np.load(npz_path, allow_pickle=False)
     s0 = z["s0"].astype(np.float32)
     s1 = z["s1"].astype(np.float32)
@@ -773,28 +1169,61 @@ def write_dual_from_npz(dataset: LeRobotDataset, npz_path: Path, *, task: str) -
     actions = z["actions"].astype(np.float32)
     img_l = z["img_l"].astype(np.uint8)
     img_r = z["img_r"].astype(np.uint8)
+    mask_l = z["robot_0_mask"].astype(np.uint8) if include_guidance and "robot_0_mask" in z.files else None
+    mask_r = z["robot_1_mask"].astype(np.uint8) if include_guidance and "robot_1_mask" in z.files else None
+    overlay_l = z["robot_0_overlay"].astype(np.uint8) if include_overlay_images and "robot_0_overlay" in z.files else None
+    overlay_r = z["robot_1_overlay"].astype(np.uint8) if include_overlay_images and "robot_1_overlay" in z.files else None
+    subtasks = z["subtask"] if include_guidance and "subtask" in z.files else None
 
     T = states.shape[0]
     for i in range(T):
+        subtask = str(subtasks[i]).strip() if subtasks is not None else ""
+        image_l = overlay_l[i] if overlay_l is not None and overlay_target == "replace" else img_l[i]
+        image_r = overlay_r[i] if overlay_r is not None and overlay_target == "replace" else img_r[i]
         frame = {
             "task": task,
             "observation.state": torch.from_numpy(states[i]).to(torch.float32),
             "action": torch.from_numpy(actions[i]).to(torch.float32),
             "robot_0_state": torch.from_numpy(s0[i]).to(torch.float32),
             "robot_1_state": torch.from_numpy(s1[i]).to(torch.float32),
-            "observation.images.robot_0_image": img_l[i],
-            "observation.images.robot_1_image": img_r[i],
+            "observation.images.robot_0_image": image_l,
+            "observation.images.robot_1_image": image_r,
         }
+        if include_guidance:
+            frame["subtask"] = subtask
+            frame["observation.masks.robot_0_mask"] = (
+                mask_to_rgb(mask_l[i]) if mask_l is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+            )
+            frame["observation.masks.robot_1_mask"] = (
+                mask_to_rgb(mask_r[i]) if mask_r is not None else np.zeros((224, 224, 3), dtype=np.uint8)
+            )
+            if include_overlay_images and overlay_target == "extra":
+                frame["observation.images.robot_0_overlay"] = overlay_l[i] if overlay_l is not None else img_l[i]
+                frame["observation.images.robot_1_overlay"] = overlay_r[i] if overlay_r is not None else img_r[i]
         dataset.add_frame(frame)
     dataset.save_episode()
     return True
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FastUMI rawdata -> LeRobot v2.0 (safe parallel) with Step1 processing.")
-    parser.add_argument("--raw-dir", type=Path, required=True, help="Raw data root (search recursively for session*)")
+    parser = argparse.ArgumentParser(description="FastUMI rawdata -> LeRobot v2.1 (safe parallel) with Step1 processing.")
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        required=True,
+        nargs="+",
+        action="append",
+        help="Raw data root(s) or session dir(s). Searches recursively for session*. Can be repeated.",
+    )
     parser.add_argument("--repo-id", type=str, required=True, help="LeRobot repo id, e.g. fastumi/task_xxx")
     parser.add_argument("--task", type=str, required=True, help="Task string stored in each frame")
+    parser.add_argument(
+        "--robot-type",
+        type=str,
+        required=True,
+        choices=sorted(STEP1_CONFIGS),
+        help="Robot type used to select Step1 coordinate/gripper configs.",
+    )
     parser.add_argument("--fps", type=int, default=20, choices=[20, 30, 60], help="Target fps (downsample from 60Hz)")
     parser.add_argument("--output-dir", type=Path, default=None, help="Optional copy-out directory")
     parser.add_argument("--mode", type=str, default="image", choices=["image", "video"], help="Store images as image or video")
@@ -809,6 +1238,25 @@ def main():
     parser.add_argument("--tmp-dir", type=Path, default=None,
                         help="Temp dir for episode .npz (recommend /dev/shm if enough RAM)")
     parser.add_argument("--keep-tmp", action="store_true", help="Keep tmp npz files (debug)")
+    parser.add_argument(
+        "--include-guidance",
+        action="store_true",
+        help="Store optional annotation/masks/*.png and subtask.json fields in the LeRobot 2.1 dataset.",
+    )
+    parser.add_argument(
+        "--include-overlay-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Precompute masked overlay RGB images during conversion.",
+    )
+    parser.add_argument(
+        "--overlay-target",
+        type=str,
+        default="extra",
+        choices=["replace", "extra"],
+        help="Use 'replace' to write overlay into the main image fields, or 'extra' to store separate overlay image fields.",
+    )
+    parser.add_argument("--overlay-alpha", type=float, default=0.35, help="Mask overlay alpha for offline overlay images.")
 
     # writer config (avoid oversubscribe)
     parser.add_argument("--image-writer-processes", type=int, default=DEFAULT_DATASET_CONFIG.image_writer_processes)
@@ -816,21 +1264,27 @@ def main():
 
     args = parser.parse_args()
 
-    raw_dir: Path = args.raw_dir
+    raw_dirs: List[Path] = [path for group in args.raw_dir for path in group]
     repo_id: str = args.repo_id
     task: str = args.task
+    robot_type: str = args.robot_type
     fps: int = args.fps
     traj_source: str = args.traj_source
     use_next: bool = args.next
     mode: Literal["image", "video"] = args.mode  # type: ignore
     output_dir: Optional[Path] = args.output_dir
+    include_guidance: bool = bool(args.include_guidance)
+    include_overlay_images: bool = bool(args.include_overlay_images)
+    overlay_target: Literal["replace", "extra"] = args.overlay_target  # type: ignore[assignment]
+    overlay_alpha: float = float(args.overlay_alpha)
+    if include_overlay_images:
+        include_guidance = True
+    store_extra_overlay_images = include_overlay_images and overlay_target == "extra"
 
-    if not raw_dir.exists():
-        raise FileNotFoundError(f"--raw-dir does not exist: {raw_dir}")
-
-    sessions = find_all_sessions(raw_dir)
+    sessions = find_all_sessions_in_roots(raw_dirs)
     if not sessions:
-        raise RuntimeError(f"No session* directories found under: {raw_dir}")
+        raise RuntimeError(f"No session* directories found under: {', '.join(str(path) for path in raw_dirs)}")
+    print(f"[Info] Found {len(sessions)} session(s) under {len(raw_dirs)} raw root(s).")
 
     layout = None
     valid: List[Tuple[Path, str, Dict[str, Path]]] = []
@@ -843,16 +1297,15 @@ def main():
             layout = m
         elif layout != m:
             raise RuntimeError(
-                f"Mixed layouts under {raw_dir}: already '{layout}', but session {s} is '{m}'. "
+                f"Mixed layouts under raw roots: already '{layout}', but session {s} is '{m}'. "
                 f"Please convert single/dual tasks separately."
             )
 
     if not valid or layout is None:
-        raise RuntimeError(f"No valid sessions found under: {raw_dir}")
+        raise RuntimeError(f"No valid sessions found under: {', '.join(str(path) for path in raw_dirs)}")
 
     bimanual = (layout == "dual")
-    step1_cfg = STEP1_CFG
-    step1_cfg_dual = STEP1_CFG_DUAL
+    step1_cfg, step1_cfg_dual = resolve_step1_configs(robot_type)
     step1_cfg_robot0, step1_cfg_robot1 = make_dual_step1_cfgs(step1_cfg_dual)
 
     # tmp dir
@@ -877,14 +1330,18 @@ def main():
     dataset = create_empty_dataset(
         repo_id=repo_id,
         fps=fps,
+        robot_type=robot_type,
         mode=mode,
         bimanual=bimanual,
+        include_guidance=include_guidance,
+        include_overlay_images=store_extra_overlay_images,
         dataset_config=dataset_cfg,
     )
 
     total = len(valid)
     ok_count = 0
     fail_count = 0
+    subtask_sidecar: Dict[str, Dict[str, List[Dict[str, object]]]] = {"episodes": {}}
 
     ready: Dict[int, Tuple[bool, str, Path]] = {} 
     next_to_write = 0
@@ -901,6 +1358,9 @@ def main():
                 traj_source=traj_source,
                 use_next=use_next,
                 step1_cfg=step1_cfg,
+                include_guidance=include_guidance,
+                include_overlay_images=include_overlay_images,
+                overlay_alpha=overlay_alpha,
             )
         else:
             fut = ex.submit(
@@ -913,6 +1373,9 @@ def main():
                 use_next=use_next,
                 step1_cfg_robot0=step1_cfg_robot0,
                 step1_cfg_robot1=step1_cfg_robot1,
+                include_guidance=include_guidance,
+                include_overlay_images=include_overlay_images,
+                overlay_alpha=overlay_alpha,
             )
         return fut, npz_path
 
@@ -963,10 +1426,28 @@ def main():
 
                     # write episode
                     try:
+                        episode_index = ok_count
+                        segments = _subtask_segments_from_npz(npz2) if include_guidance else []
                         if not bimanual:
-                            write_single_from_npz(dataset, npz2, task=task)
+                            write_single_from_npz(
+                                dataset,
+                                npz2,
+                                task=task,
+                                include_guidance=include_guidance,
+                                include_overlay_images=include_overlay_images,
+                                overlay_target=overlay_target,
+                            )
                         else:
-                            write_dual_from_npz(dataset, npz2, task=task)
+                            write_dual_from_npz(
+                                dataset,
+                                npz2,
+                                task=task,
+                                include_guidance=include_guidance,
+                                include_overlay_images=include_overlay_images,
+                                overlay_target=overlay_target,
+                            )
+                        if segments:
+                            subtask_sidecar["episodes"][str(episode_index)] = {"segments": segments}
                         ok_count += 1
                     except Exception as e:
                         fail_count += 1
@@ -989,6 +1470,13 @@ def main():
     elif hasattr(dataset, "close"):
         dataset.close()
 
+    if include_guidance and subtask_sidecar["episodes"]:
+        sidecar_path = HF_LEROBOT_HOME / repo_id / "subtask_segments.json"
+        with sidecar_path.open("w", encoding="utf-8") as stream:
+            json.dump(subtask_sidecar, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        print(f"[Info] Wrote subtask sidecar: {sidecar_path}")
+
     # copy out
     if output_dir is not None:
         target = output_dir / repo_id
@@ -1007,6 +1495,8 @@ def main():
 
     print(
         f"[Done] repo_id={repo_id} bimanual={bimanual} "
+        f"include_guidance={include_guidance} include_overlay_images={include_overlay_images} "
+        f"overlay_target={overlay_target} "
         f"episodes_ok={ok_count} episodes_fail={fail_count} "
         f"HF_LEROBOT_HOME={HF_LEROBOT_HOME}"
     )

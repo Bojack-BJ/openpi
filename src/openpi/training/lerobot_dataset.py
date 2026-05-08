@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from collections.abc import Sequence
 from pathlib import Path
 
 import datasets
@@ -33,12 +34,15 @@ class LeRobotDataset(_lerobot_dataset.LeRobotDataset):
     """LeRobot dataset wrapper that delays image transforms until after timestamp validation."""
 
     def _load_hf_dataset(self, *, apply_transform: bool) -> datasets.Dataset:
+        load_kwargs = {}
+        if self.selected_columns is not None:
+            load_kwargs["columns"] = list(self.selected_columns)
         if self.episodes is None:
             path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+            hf_dataset = load_dataset("parquet", data_dir=path, split="train", **load_kwargs)
         else:
             files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            hf_dataset = load_dataset("parquet", data_files=files, split="train", **load_kwargs)
 
         if apply_transform:
             hf_dataset.set_transform(hf_transform_to_torch)
@@ -59,6 +63,7 @@ class LeRobotDataset(_lerobot_dataset.LeRobotDataset):
         force_cache_sync: bool = False,
         download_videos: bool = True,
         video_backend: str | None = None,
+        selected_columns: Sequence[str] | None = None,
     ):
         torch.utils.data.Dataset.__init__(self)
         self.repo_id = repo_id
@@ -69,6 +74,7 @@ class LeRobotDataset(_lerobot_dataset.LeRobotDataset):
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
+        self.selected_columns = tuple(dict.fromkeys(selected_columns)) if selected_columns is not None else None
         self.delta_indices = None
 
         # Unused attributes retained for compatibility with upstream LeRobotDataset.

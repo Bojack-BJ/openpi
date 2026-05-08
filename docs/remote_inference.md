@@ -3,6 +3,8 @@
 
 We provide utilities for running openpi models remotely. This is useful for running inference on more powerful GPUs off-robot, and also helps keep the robot and policy environments separate (and e.g. avoid dependency hell with robot software).
 
+For policies trained with mask-overlaid images, see [SAM3 mask overlay inference](sam3_mask_overlay_inference.md).
+
 ## Starting a remote policy server
 
 To start a remote policy server, you can simply run the following command:

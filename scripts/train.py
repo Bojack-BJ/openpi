@@ -3,10 +3,12 @@ import functools
 import logging
 import os
 import platform
+import queue
 import sys
 import threading
 import time
 from collections import Counter
+from collections.abc import Iterator
 from typing import Any
 
 # Reduce TensorFlow/XLA startup log noise (e.g., repeated cuDNN/cuBLAS registration warnings).
@@ -57,6 +59,41 @@ def init_logging():
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
     logger.handlers[0].setFormatter(formatter)
+
+
+def _prefetch_iterator(iterator: Iterator[Any], buffer_size: int) -> Iterator[Any]:
+    if buffer_size <= 0:
+        return iterator
+
+    items: queue.Queue[Any] = queue.Queue(maxsize=buffer_size)
+    done = object()
+
+    def producer():
+        try:
+            for item in iterator:
+                items.put(item)
+        except BaseException as exc:
+            items.put(exc)
+        finally:
+            items.put(done)
+
+    thread = threading.Thread(target=producer, name="train-batch-prefetch", daemon=True)
+    thread.start()
+
+    def consumer():
+        while True:
+            item = items.get()
+            if item is done:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+
+    return consumer()
+
+
+def _mean(values: list[float]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
 
 
 def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
@@ -380,7 +417,9 @@ def main(config: _config.TrainConfig):
     )
     logging.info("Fetching first batch from data loader...")
     first_batch_t0 = time.perf_counter()
-    data_iter = iter(data_loader)
+    data_iter = _prefetch_iterator(iter(data_loader), config.train_prefetch_batches)
+    if config.train_prefetch_batches > 0:
+        logging.info("Training batch prefetch enabled: %d batches.", config.train_prefetch_batches)
     batch = next(data_iter)
     logging.info("Fetched first batch in %.1f seconds.", time.perf_counter() - first_batch_t0)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -418,7 +457,15 @@ def main(config: _config.TrainConfig):
     )
 
     losses = []
+    timing_window: dict[str, list[float]] = {
+        "train_step_host_sec": [],
+        "data_wait_sec": [],
+        "iter_wall_sec": [],
+    }
+    timing_window_t0 = time.perf_counter()
+    timing_window_steps = 0
     for step in pbar:
+        iter_t0 = time.perf_counter()
         is_first_step = step == start_step
         should_log = step % config.log_interval == 0
         should_compute_norms = should_log and config.log_param_and_grad_norms
@@ -432,8 +479,10 @@ def main(config: _config.TrainConfig):
                 interval_sec=60.0,
             )
         try:
+            train_step_t0 = time.perf_counter()
             with sharding.set_mesh(mesh):
                 train_state, info = ptrain_step(train_rng, np.bool_(should_compute_norms), train_state, batch)
+            train_step_host_sec = time.perf_counter() - train_step_t0
             if is_first_step:
                 # Ensure compile + first execution time is fully materialized for accurate logging.
                 train_state = jax.block_until_ready(train_state)
@@ -450,18 +499,51 @@ def main(config: _config.TrainConfig):
                 compile_log_stop.set()
                 compile_log_thread.join(timeout=1.0)
         losses.append(info["loss"])
+        data_wait_t0 = time.perf_counter()
+        batch = next(data_iter)
+        data_wait_sec = time.perf_counter() - data_wait_t0
+        iter_wall_sec = time.perf_counter() - iter_t0
+        if config.log_efficiency_metrics and not is_first_step:
+            timing_window["train_step_host_sec"].append(train_step_host_sec)
+            timing_window["data_wait_sec"].append(data_wait_sec)
+            timing_window["iter_wall_sec"].append(iter_wall_sec)
+            timing_window_steps += 1
         if should_log:
+            log_sync_t0 = time.perf_counter()
             reduced_info = {
                 "loss": float(jax.device_get(jnp.mean(jnp.stack(losses)))),
             }
             if config.log_param_and_grad_norms:
                 reduced_info["grad_norm"] = float(jax.device_get(info["grad_norm"]))
                 reduced_info["param_norm"] = float(jax.device_get(info["param_norm"]))
+            log_sync_sec = time.perf_counter() - log_sync_t0
+            if config.log_efficiency_metrics and timing_window["iter_wall_sec"]:
+                iter_wall_total = sum(timing_window["iter_wall_sec"])
+                data_wait_total = sum(timing_window["data_wait_sec"])
+                host_steps_per_sec = len(timing_window["iter_wall_sec"]) / max(iter_wall_total, 1e-9)
+                window_wall_sec = time.perf_counter() - timing_window_t0
+                window_steps_per_sec = timing_window_steps / max(window_wall_sec, 1e-9)
+                reduced_info.update(
+                    {
+                        "perf/train_step_host_sec": _mean(timing_window["train_step_host_sec"]),
+                        "perf/data_wait_sec": _mean(timing_window["data_wait_sec"]),
+                        "perf/iter_wall_sec": _mean(timing_window["iter_wall_sec"]),
+                        "perf/data_wait_ratio": data_wait_total / max(iter_wall_total, 1e-9),
+                        "perf/log_sync_sec": log_sync_sec,
+                        "perf/window_wall_sec": window_wall_sec,
+                        "perf/host_steps_per_sec": host_steps_per_sec,
+                        "perf/window_steps_per_sec": window_steps_per_sec,
+                        "perf/window_samples_per_sec": window_steps_per_sec * config.batch_size,
+                    }
+                )
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             losses = []
-        batch = next(data_iter)
+            for values in timing_window.values():
+                values.clear()
+            timing_window_t0 = time.perf_counter()
+            timing_window_steps = 0
 
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
