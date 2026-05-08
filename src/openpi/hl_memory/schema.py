@@ -21,6 +21,8 @@ class HLMemoryPrediction:
     phase: str
     target_query: str
     goal_query: str
+    sam_text_prompt: str = ""
+    sam_point_xy: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if not self.updated_language_memory.strip():
@@ -34,7 +36,7 @@ class HLMemoryPrediction:
                 raise ValueError("keyframe_candidate_positions must be positive and 1-indexed.")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "updated_language_memory": self.updated_language_memory,
             "current_subtask": self.current_subtask,
             "keyframe_candidate_positions": list(self.keyframe_candidate_positions),
@@ -42,6 +44,11 @@ class HLMemoryPrediction:
             "target_query": self.target_query,
             "goal_query": self.goal_query,
         }
+        if self.sam_text_prompt:
+            result["sam_text_prompt"] = self.sam_text_prompt
+        if self.sam_point_xy is not None:
+            result["sam_point_xy"] = [int(self.sam_point_xy[0]), int(self.sam_point_xy[1])]
+        return result
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=True, separators=(",", ":"))
@@ -81,6 +88,13 @@ class HLMemoryPrediction:
             phase=str(data["phase"]).strip(),
             target_query=str(data["target_query"]).strip(),
             goal_query=str(data["goal_query"]).strip(),
+            sam_text_prompt=str(data.get("sam_text_prompt", data.get("sam_prompt", ""))).strip(),
+            sam_point_xy=_parse_optional_point(
+                data.get("sam_point_xy")
+                or data.get("point_xy")
+                or data.get("target_point")
+                or data.get("point_prompt")
+            ),
         )
 
     @classmethod
@@ -135,6 +149,16 @@ def _iter_json_objects(text: str) -> Iterator[dict[str, object]]:
 
 def _looks_like_prediction(data: dict[str, object]) -> bool:
     return _PREDICTION_REQUIRED_KEYS.issubset(data)
+
+
+def _parse_optional_point(value: object) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict) and {"x", "y"}.issubset(value):
+        return int(round(float(value["x"]))), int(round(float(value["y"])))
+    if isinstance(value, list | tuple) and len(value) >= 2:
+        return int(round(float(value[0]))), int(round(float(value[1])))
+    return None
 
 
 def _extract_fenced_blocks(text: str) -> list[str]:

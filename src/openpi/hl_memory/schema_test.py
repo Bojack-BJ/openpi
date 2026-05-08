@@ -71,3 +71,14 @@ Final answer:
     assert parsed.updated_language_memory == "new"
     assert parsed.current_subtask == "new"
     assert parsed.keyframe_candidate_positions == (2,)
+
+
+def test_prediction_parses_optional_sam_grounding_fields():
+    parsed = HLMemoryPrediction.from_json(
+        '{"updated_language_memory":"m","current_subtask":"s","phase":"p","target_query":"cube","goal_query":"bin",'
+        '"sam_text_prompt":"red cube","sam_point_xy":{"x":12.4,"y":29.6}}'
+    )
+
+    assert parsed.sam_text_prompt == "red cube"
+    assert parsed.sam_point_xy == (12, 30)
+    assert HLMemoryPrediction.from_json(parsed.to_json()) == parsed

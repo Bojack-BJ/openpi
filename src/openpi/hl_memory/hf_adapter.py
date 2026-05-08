@@ -189,6 +189,7 @@ class BaseHLVLMAdapter:
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
+        current_width, current_height = _current_recent_frame_size(clips)
         thinking_instruction = (
             "Thinking is enabled. If you produce private reasoning, keep it brief: at most "
             f"{self.config.thinking_budget_tokens} tokens, then finish with exactly one final JSON object. "
@@ -217,7 +218,8 @@ class BaseHLVLMAdapter:
             "the active hand, which is the hand currently moving, manipulating, or positioned at a target, and name the"
             "active hand in the subtask, e.g., `approach with left hand` or `place with right hand`. If both hands are active, "
             "describe the subtasks of both hands in the same `current_subtask` field, e.g., `left hand place, right hand hold`.\n"
-            "Use visual evidence first. Treat language memory as a compact progress hint, and correct it when it "
+            "Use visual evidence first. The HL input frames are raw RGB observations; no segmentation mask, mask "
+            "overlay, or target highlight is provided. Treat language memory as a compact progress hint, and correct it when it "
             "conflicts with the current visual evidence.\n"
             "Manipulation segmentation rules:\n"
             "- Choose the current subtask from the visible robot behavior, not from the first object mentioned in "
@@ -242,11 +244,21 @@ class BaseHLVLMAdapter:
             "recent video contradicts that plan, correct to the observed manipulation step.\n"
             "- `target_query` should name the manipulated object or object part; `goal_query` should name the target "
             "slot/bin/plate/placement area. Do not put the full task instruction in either field.\n"
+            "SAM grounding output:\n"
+            f"- The current frame size is width={current_width}, height={current_height}. Pixel coordinates use x "
+            f"from 0 to {max(current_width - 1, 0)} left-to-right and y from 0 to {max(current_height - 1, 0)} "
+            "top-to-bottom.\n"
+            "- If the current target instance is visible in the last valid recent frame, include `sam_text_prompt` "
+            "as a short SAM/Grounding prompt and `sam_point_xy` as one pixel point near the center of that exact "
+            "instance or object part.\n"
+            "- Ground only the task-relevant target instance for the current subtask, not every object of the same "
+            "class. If no target instance is visible, set `sam_text_prompt` to an empty string and omit "
+            "`sam_point_xy`.\n"
             "Predict the current low-level subtask and nominate recent frames worth remembering after they leave "
             "the recent window.\n"
             "Return exactly one JSON object with keys "
             "`updated_language_memory`, `current_subtask`, `keyframe_candidate_positions`, `phase`, "
-            "`target_query`, `goal_query`.\n"
+            "`target_query`, `goal_query`, and optionally `sam_text_prompt`, `sam_point_xy`.\n"
             f"{thinking_instruction}"
             "`updated_language_memory` will be read by a downstream low-level VLM policy. It must be compact, stable, "
             "and action-useful, not a verbose log.\n"
@@ -293,7 +305,10 @@ class BaseHLVLMAdapter:
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
-        return sample.target_prediction().to_json()
+        prediction = sample.target_prediction()
+        if not prediction.sam_text_prompt and sample.target_query:
+            prediction = dataclasses.replace(prediction, sam_text_prompt=sample.target_query)
+        return prediction.to_json()
 
     def _fallback_prediction(self, sample: ExportedHLMemorySample) -> HLMemoryPrediction:
         previous_fields = _parse_ll_memory_fields(sample.language_memory)
@@ -648,3 +663,13 @@ def _is_usable_fallback_objective(objective: str, instruction: str) -> bool:
     if normalized_objective in {"continue the task", "task started"}:
         return False
     return normalized_objective not in {normalized_instruction, normalized_primary_instruction}
+
+
+def _current_recent_frame_size(clips: LoadedVideoClips) -> tuple[int, int]:
+    if clips.recent_valid_length <= 0 or not clips.recent_frames:
+        return 0, 0
+    index = min(clips.recent_valid_length, len(clips.recent_frames)) - 1
+    size = getattr(clips.recent_frames[index], "size", None)
+    if isinstance(size, tuple) and len(size) >= 2:
+        return int(size[0]), int(size[1])
+    return 0, 0

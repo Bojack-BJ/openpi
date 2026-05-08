@@ -110,6 +110,7 @@ python scripts/export_hl_memory_dataset.py \
   --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
   --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --output-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
+  --visual-mode raw \
   --recent-frames-length 8 \
   --frame-subsample 5 \
   --memory-length 8 \
@@ -127,6 +128,8 @@ exported/
 ```
 
 `samples.jsonl` 是 HL VLM 训练和评估的数据集。
+
+`--visual-mode raw` 是默认值，也是推荐值：即使 source config 是 mask overlay / mask image 训练配置，HL export 也会强制读取 raw RGB，不给 HL VLM 看任何 mask、overlay 或高亮目标。只有复现实验时才用 `--visual-mode config`，它可能把 mask overlay 或 mask image 暴露给 HL。
 
 ### 4. Train
 
@@ -255,6 +258,17 @@ Input rules：
 ```
 
 `event_type` 支持 `none`、`subtask_boundary`、`success`、`failure`、`progress`、`discovery`。它会影响导出的 target `updated_language_memory`。
+
+HL prediction 还支持可选 SAM grounding 字段：
+
+```json
+{
+  "sam_text_prompt": "motor",
+  "sam_point_xy": [120, 85]
+}
+```
+
+`sam_point_xy` 是 last valid recent frame 上的像素点，用于给 SAM point prompt；`sam_text_prompt` 是给 SAM/Grounding-SAM 的短文本 prompt。没有人工 point label 时，训练 target 通常只监督 `sam_text_prompt`，point prompt 主要靠 VLM zero-shot/推理能力生成。
 
 ### Language Memory
 
