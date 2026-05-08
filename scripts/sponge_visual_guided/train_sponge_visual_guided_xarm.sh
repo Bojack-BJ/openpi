@@ -24,6 +24,7 @@ export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export HF_LEROBOT_HOME=${HF_LEROBOT_HOME:-/root/Users/dataset/lerobot_home}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-/root/Users/.cache/}
 export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_API_KEY="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"
 export PYTHONPATH="$repo/src:$repo/packages/openpi-client/src:$PYTHONPATH"
 
 source /root/Users/miniconda3/etc/profile.d/conda.sh
