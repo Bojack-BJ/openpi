@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping
 import dataclasses
+import io
 import json
 import logging
 import pathlib
@@ -357,6 +358,12 @@ class _HLVisualOnlyTransform:
         out: dict[str, Any] = {"image": {}}
         if isinstance(images, Mapping):
             out["image"] = _select_hl_image_views(images)
+        for key, value in sample.items():
+            key_text = str(key)
+            if not key_text.startswith("observation.images.") or _is_guidance_visual_column(key_text):
+                continue
+            view_name = key_text.removeprefix("observation.images.")
+            out["image"].setdefault(view_name, value)
         for key in ("prompt", "subtask", "current_subtask", "episode_index", "frame_index", "task_index"):
             if key in sample:
                 out[key] = sample[key]
@@ -385,7 +392,8 @@ def _ensure_frame_saved(
         return cache[global_index]
     image_views = _collect_image_views(sample)
     if not image_views:
-        raise ValueError(f"Sample {global_index} did not expose any image views after transforms.")
+        sample_keys = ", ".join(str(key) for key in sample.keys())
+        raise ValueError(f"Sample {global_index} did not expose any image views after transforms. keys=[{sample_keys}]")
     composed = compose_observation_frame(
         image_views,
         frame_height=hl_config.frame_height,
@@ -416,12 +424,23 @@ def _collect_image_views(tree: Mapping[str, Any], *, prefix: str = "") -> dict[s
     images: dict[str, Image.Image | np.ndarray | torch.Tensor] = {}
     for key, value in tree.items():
         path = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, Image.Image) or _is_image_array(value):
-            images[path] = value
+        image = _coerce_image_value(value)
+        if image is not None:
+            images[path] = image
             continue
         if isinstance(value, Mapping):
             images.update(_collect_image_views(value, prefix=path))
     return images
+
+
+def _coerce_image_value(value: Any) -> Image.Image | np.ndarray | torch.Tensor | None:
+    if isinstance(value, Image.Image) or isinstance(value, torch.Tensor) or _is_image_array(value):
+        return value
+    if isinstance(value, Mapping):
+        image_bytes = value.get("bytes")
+        if image_bytes:
+            return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return None
 
 
 def _is_image_array(value: Any) -> bool:
