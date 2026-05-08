@@ -6,7 +6,9 @@ import dataclasses
 import json
 import logging
 import pathlib
+import time
 from typing import Any
+from typing import Literal
 
 import numpy as np
 import torch
@@ -33,6 +35,7 @@ class ExportArgs:
     source_config_name: str
     annotations_jsonl: pathlib.Path
     output_dir: pathlib.Path
+    visual_mode: Literal["raw", "config"] = "raw"
     recent_frames_length: int = 8
     frame_subsample: int = 5
     memory_length: int = 8
@@ -49,17 +52,34 @@ def main(args: ExportArgs) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "frames").mkdir(exist_ok=True)
 
+    start_time = time.perf_counter()
+    logging.info("Resolving training config: %s", args.source_config_name)
     config = training_config.get_config(args.source_config_name)
+    config = _resolve_hl_visual_config(config, visual_mode=args.visual_mode)
     data_config = config.data.create(config.assets_dirs, config.model)
-    raw_dataset = data_loader.create_torch_dataset(data_config, config.model.action_horizon, config.model)
+    logging.info(
+        "Creating LeRobot dataset for HL export: repo_id=%s visual_mode=%s",
+        data_config.repo_id,
+        args.visual_mode,
+    )
+    raw_dataset = data_loader.create_torch_dataset(data_config, _hl_action_horizon(config, args.visual_mode), config.model)
+    logging.info("LeRobot dataset ready in %.1fs; len=%d", time.perf_counter() - start_time, len(raw_dataset))
     export_dataset = data_loader.TransformedDataset(
         raw_dataset,
-        [*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs],
+        [*data_config.repack_transforms.inputs, *_hl_export_input_transforms(data_config, args.visual_mode)],
     )
 
+    logging.info("Loading HL annotations: %s", args.annotations_jsonl)
     annotations = load_annotations_jsonl(args.annotations_jsonl)
     episode_to_annotations = _group_annotations_by_episode(annotations)
+    logging.info(
+        "Loaded %d annotations across %d episodes.",
+        len(annotations),
+        len(episode_to_annotations),
+    )
+    logging.info("Building episode index map from LeRobot dataset.")
     episode_to_indices = _build_episode_index_map(raw_dataset)
+    logging.info("Episode index map ready for %d episodes.", len(episode_to_indices))
     frame_cache: dict[int, str] = {}
     samples: list[ExportedHLMemorySample] = []
     hl_config = HLMemoryConfig(
@@ -71,9 +91,19 @@ def main(args: ExportArgs) -> None:
         frame_width=args.frame_width,
     )
 
-    for episode_index, episode_annotations in sorted(episode_to_annotations.items()):
+    sorted_episode_items = sorted(episode_to_annotations.items())
+    for episode_offset, (episode_index, episode_annotations) in enumerate(sorted_episode_items, start=1):
         if episode_index not in episode_to_indices:
             raise ValueError(f"Episode {episode_index} was not found in dataset {args.source_config_name}.")
+        logging.info(
+            "Exporting episode %d/%d: episode_index=%d annotations=%d frames=%d cached_frames=%d",
+            episode_offset,
+            len(sorted_episode_items),
+            episode_index,
+            len(episode_annotations),
+            len(episode_to_indices[episode_index]),
+            len(frame_cache),
+        )
         samples.extend(
             _export_episode(
                 episode_index=episode_index,
@@ -91,11 +121,44 @@ def main(args: ExportArgs) -> None:
         "schema_version": "hl_memory_v1",
         "source_config_name": args.source_config_name,
         "annotations_jsonl": str(args.annotations_jsonl),
+        "visual_mode": args.visual_mode,
         "num_samples": len(samples),
         "hl_memory_config": dataclasses.asdict(hl_config),
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
-    logging.info("Exported %d HL memory samples to %s", len(samples), args.output_dir)
+    logging.info(
+        "Exported %d HL memory samples and %d unique frames to %s in %.1fs",
+        len(samples),
+        len(frame_cache),
+        args.output_dir,
+        time.perf_counter() - start_time,
+    )
+
+
+def _resolve_hl_visual_config(config: Any, *, visual_mode: str) -> Any:
+    if visual_mode == "config":
+        logging.warning("HL export visual_mode=config may expose mask overlays or mask images to the HL VLM.")
+        return config
+    if visual_mode != "raw":
+        raise ValueError(f"Unsupported visual_mode: {visual_mode}")
+
+    data_factory = config.data
+    if hasattr(data_factory, "guidance_image_mode"):
+        logging.info("HL export forcing raw visual mode for %s.", type(data_factory).__name__)
+        return dataclasses.replace(config, data=dataclasses.replace(data_factory, guidance_image_mode="raw"))
+    return config
+
+
+def _hl_export_input_transforms(data_config: Any, visual_mode: str) -> list[Any]:
+    if visual_mode == "config":
+        return list(data_config.data_transforms.inputs)
+    return [_StripGuidanceMasksForHLExport()]
+
+
+def _hl_action_horizon(config: Any, visual_mode: str) -> int:
+    if visual_mode == "config":
+        return int(config.model.action_horizon)
+    return 1
 
 
 def _export_episode(
@@ -108,6 +171,7 @@ def _export_episode(
     frame_cache: dict[int, str],
     hl_config: HLMemoryConfig,
 ) -> list[ExportedHLMemorySample]:
+    episode_start_time = time.perf_counter()
     progress_state = TaskProgressState()
     keyframe_memory = EpisodicKeyframeMemory(
         memory_length=hl_config.memory_length,
@@ -116,6 +180,15 @@ def _export_episode(
     samples: list[ExportedHLMemorySample] = []
 
     for step_index, annotation in enumerate(episode_annotations):
+        if step_index > 0 and step_index % 50 == 0:
+            logging.info(
+                "Episode %d progress: %d/%d annotations, cached_frames=%d, elapsed=%.1fs",
+                episode_index,
+                step_index,
+                len(episode_annotations),
+                len(frame_cache),
+                time.perf_counter() - episode_start_time,
+            )
         if annotation.frame_index >= len(global_indices):
             raise ValueError(
                 f"Annotation frame_index={annotation.frame_index} exceeds episode {episode_index} length {len(global_indices)}."
@@ -196,6 +269,23 @@ def _group_annotations_by_episode(annotations: list[Any]) -> dict[int, list[Any]
     for annotation in annotations:
         grouped[annotation.episode_index].append(annotation)
     return dict(grouped)
+
+
+@dataclasses.dataclass(frozen=True)
+class _StripGuidanceMasksForHLExport:
+    """Keep HL visual inputs clean: no masks, overlays, or LL model-specific padding images."""
+
+    def __call__(self, sample: Mapping[str, Any]) -> dict[str, Any]:
+        out = dict(sample)
+        out.pop("mask", None)
+        images = out.get("image")
+        if isinstance(images, Mapping):
+            out["image"] = {
+                key: value
+                for key, value in images.items()
+                if "mask" not in str(key).lower() and "overlay" not in str(key).lower()
+            }
+        return out
 
 
 def _ensure_frame_saved(
