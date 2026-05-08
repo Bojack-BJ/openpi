@@ -2430,6 +2430,50 @@ _CONFIGS = [
         num_workers=8,
     ),
     TrainConfig(
+        name="sponge_visual_mask_keys_pi0_touch_hil",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_touch_hil",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_touch_hil",
+                asset_id="fastumi/sponge_visual_guided_touch_hil",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi0_xarm_hil",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_xarm_hil",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_xarm_hil",
+                asset_id="fastumi/sponge_visual_guided_xarm_hil",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
         name="sponge_visual_guided_pi05_touch",
         model=pi0_config.Pi0Config(pi05=True),
         data=FastUMIData7DRPYGuidedConfig(

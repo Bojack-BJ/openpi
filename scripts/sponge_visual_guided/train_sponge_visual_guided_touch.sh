@@ -11,6 +11,7 @@ variant=${1:-qwen3_5}
 
 case "$variant" in
   pi0)    cfg=sponge_visual_mask_keys_pi0_touch ;;
+  hil | pi0_hil) cfg=sponge_visual_mask_keys_pi0_touch_hil ;;
   pi05)   cfg=sponge_visual_mask_keys_pi05_touch ;;
   qwen2_5 | qwen25) cfg=sponge_visual_guided_qwen2_5_3b_400m_touch ;;
   qwen3_5 | qwen35) cfg=sponge_visual_guided_qwen3_5_2b_400m_touch ;;

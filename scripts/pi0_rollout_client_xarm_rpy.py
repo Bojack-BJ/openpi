@@ -32,6 +32,11 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from hil.lerobot_hil_recorder import SingleArmHilRecorder
+from hil.lerobot_hil_recorder import action7_rpy_deg_to_action8_quat
+from hil.relative_pose import RelativePoseMapper
+from hil.relative_pose import parse_signed_axes
+from hil.umi_slam_reader import UmiSlamReader
 from openpi_client import image_tools, websocket_client_policy
 
 # ====== 根据你的实际路径修改 ======
@@ -662,6 +667,21 @@ def main():
     parser.add_argument("--mask_debug_dir", default=None, help="显式提供目录时，保存 SAM3 preview 输入/输出调试图并请求 server 回传原图")
     parser.add_argument("--mask_track_between_actions", action="store_true", help="每执行若干 action 后额外发送一帧给 SAM3 追踪，只更新 mask 不跑 policy")
     parser.add_argument("--mask_track_every_n_actions", type=int, default=1, help="开启 --mask_track_between_actions 后，每 N 个 action 发送一次 tracking-only 图像")
+    parser.add_argument("--hil_correction", action="store_true", help="开启 UMI SLAM HIL correction 接管与数据记录")
+    parser.add_argument("--umi_xv_serial", default=None, help="UMI XV 设备序列号，用于订阅 /xv_sdk/<serial>/slam/pose")
+    parser.add_argument("--umi_max_gripper", type=float, default=84.0, help="UMI clamp 原始值对应 open=1 的量程")
+    parser.add_argument("--umi_pose_max_age_s", type=float, default=0.25, help="UMI SLAM pose 最大允许延迟")
+    parser.add_argument("--umi_gripper_max_age_s", type=float, default=0.5, help="UMI clamp 最大允许延迟")
+    parser.add_argument("--hil_ready_timeout_s", type=float, default=10.0, help="启动时等待 UMI SLAM+clamp 首帧的超时时间")
+    parser.add_argument("--hil_output_repo_id", default="fastumi/sponge_visual_guided_xarm_hil", help="HIL 成功 episode 写入的 LeRobot repo id")
+    parser.add_argument("--hil_fps", type=int, default=20, help="HIL LeRobot 数据集 fps")
+    parser.add_argument("--hil_pre_takeover_drop", type=int, default=3, help="接管开始时丢弃最近 N 个 policy frames")
+    parser.add_argument("--hil_max_delta_xyz", type=float, default=0.04, help="每次接管允许 UMI 映射的最大平移范数（米）")
+    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="每次接管允许 UMI 映射的最大旋转角（度）")
+    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI 平移轴映射，例如 x,y,z 或 -y,x,z")
+    parser.add_argument("--hil_slam_delta_frame", choices=("local", "world"), default="local", help="UMI 平移 delta 在 local 或 world 坐标中计算")
+    parser.add_argument("--hil_slam_translation_scale", type=float, default=1.0, help="UMI 平移映射到机器人 TCP 的比例")
+    parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
 
     is_dual = args.arm_mode == "dual"
@@ -673,6 +693,10 @@ def main():
         parser.error("--mask_track_between_actions 需要同时开启 --mask_overlay")
     if args.mask_track_every_n_actions < 1:
         parser.error("--mask_track_every_n_actions 必须 >= 1")
+    if args.hil_correction and is_dual:
+        parser.error("--hil_correction 第一版只支持 --arm_mode single")
+    if args.hil_correction and not args.umi_xv_serial:
+        parser.error("--hil_correction 需要提供 --umi_xv_serial")
 
     single_arm = args.single_arm
     single_arm_index = _arm_index(single_arm) if single_arm is not None else 0
@@ -731,10 +755,56 @@ def main():
         assert single_arm is not None
         caps[single_arm] = init_yu12_camera(camera_devs[single_arm])
 
+    def read_single_observation():
+        assert single_arm is not None
+        pos, rpy_deg, quat = _read_xarm_pose(arms[single_arm])
+        gripper_open = _read_xarm_gripper_open(arms[single_arm])
+        state = np.array([*pos, *quat, gripper_open], dtype=np.float32)
+        images = {
+            args.single_image_key: image_tools.convert_to_uint8(_capture_resized(caps[single_arm])),
+        }
+        return state, images, np.asarray(pos, dtype=np.float64), list(rpy_deg)
+
     for _ in range(50):
         for cap in caps.values():
             _ = cap.read()
     print("[INFO] 摄像头预热完成，开始循环")
+
+    umi_reader = None
+    hil_recorder = None
+    hil_mapper = None
+    if args.hil_correction:
+        assert args.umi_xv_serial is not None
+        axes = parse_signed_axes(args.hil_slam_axes)
+        umi_reader = UmiSlamReader(
+            xv_serial=args.umi_xv_serial,
+            max_gripper=args.umi_max_gripper,
+            pose_max_age_s=args.umi_pose_max_age_s,
+            gripper_max_age_s=args.umi_gripper_max_age_s,
+        )
+        print(
+            f"[HIL] 订阅 UMI SLAM: {umi_reader.slam_topic}；夹爪: {umi_reader.clamp_topic}；"
+            f"等待首帧 {args.hil_ready_timeout_s:.1f}s"
+        )
+        if not umi_reader.wait_until_ready(timeout_s=args.hil_ready_timeout_s):
+            raise RuntimeError("HIL UMI SLAM reader 未在超时时间内收到 pose+clamp 数据")
+        hil_mapper = RelativePoseMapper(
+            axes=axes,
+            translation_scale=args.hil_slam_translation_scale,
+            delta_frame=args.hil_slam_delta_frame,
+            max_delta_xyz=args.hil_max_delta_xyz,
+            max_delta_rpy_deg=args.hil_max_delta_rpy_deg,
+        )
+        hil_recorder = SingleArmHilRecorder(
+            repo_id=args.hil_output_repo_id,
+            fps=args.hil_fps,
+            robot_type="xarm6",
+            overwrite=args.hil_overwrite_dataset,
+        )
+        print(
+            "[HIL] 已启用：t=开始/结束接管，e=保存成功 episode，x=丢弃当前 episode；"
+            "接管期间使用 UMI SLAM 相对位姿映射到当前 xArm TCP"
+        )
 
     input("按 Enter 开始")
     mask_debug_dir = pathlib.Path(args.mask_debug_dir) if args.mask_debug_dir else None
@@ -767,20 +837,68 @@ def main():
         if sys.stdin.isatty():
             old_term = termios.tcgetattr(stdin_fd)
             tty.setcbreak(stdin_fd)
-        print("[INFO] 按 s：复位到初始位姿并暂停推理；按 c：继续推理")
+        if args.hil_correction:
+            print("[INFO] 按 s：复位并丢弃当前 HIL episode；按 c：继续；按 t：接管/释放；按 e：保存成功 episode；按 x：丢弃 episode")
+        else:
+            print("[INFO] 按 s：复位到初始位姿并暂停推理；按 c：继续推理")
 
         paused = False
         infer_index = 0
+        hil_takeover_active = False
+        hil_takeover_id = 0
+        pending_takeover_start = False
+        last_policy_action_7d = None
         while True:
             ch = _stdin_read_char_nonblocking()
             if ch in ("s", "S"):
                 reset_active_arms()
+                if hil_recorder is not None:
+                    discarded = hil_recorder.discard_episode()
+                    if discarded:
+                        print(f"[HIL] 已丢弃当前 episode 的 {discarded} 帧")
+                if hil_mapper is not None:
+                    hil_mapper.reset()
+                hil_takeover_active = False
+                pending_takeover_start = False
                 paused = True
                 print("[INFO] 已复位到初始位姿，推理已暂停；按 c 继续")
                 continue
             if ch in ("c", "C"):
                 paused = False
                 print("[INFO] 继续推理")
+            if args.hil_correction and ch in ("e", "E"):
+                if hil_recorder is not None and hil_recorder.has_frames():
+                    saved = hil_recorder.save_episode()
+                    print(f"[HIL] 已保存成功 episode：{saved} 帧 -> {args.hil_output_repo_id}")
+                else:
+                    print("[HIL] 当前没有可保存的 episode 帧")
+                if hil_mapper is not None:
+                    hil_mapper.reset()
+                hil_takeover_active = False
+                pending_takeover_start = False
+                paused = True
+                print("[INFO] 推理已暂停；按 c 继续下一条 episode")
+                continue
+            if args.hil_correction and ch in ("x", "X"):
+                if hil_recorder is not None:
+                    discarded = hil_recorder.discard_episode()
+                    print(f"[HIL] 已丢弃当前 episode：{discarded} 帧")
+                if hil_mapper is not None:
+                    hil_mapper.reset()
+                hil_takeover_active = False
+                pending_takeover_start = False
+                paused = True
+                print("[INFO] 推理已暂停；按 c 继续")
+                continue
+            if args.hil_correction and ch in ("t", "T"):
+                if hil_takeover_active:
+                    hil_takeover_active = False
+                    if hil_mapper is not None:
+                        hil_mapper.reset()
+                    print("[HIL] 结束人工接管；下一轮重新 policy infer")
+                else:
+                    pending_takeover_start = True
+                    print("[HIL] 请求开始人工接管；将在下一帧锁定 UMI 与 xArm TCP 基准")
 
             if paused:
                 time.sleep(0.02)
@@ -810,14 +928,86 @@ def main():
                     "robot_1": image_tools.convert_to_uint8(_capture_resized(caps["robot_1"])),
                 }
             else:
-                assert single_arm is not None
-                pos_single, rpy_single, quat_single = _read_xarm_pose(arms[single_arm])
-                gripper_open_single = _read_xarm_gripper_open(arms[single_arm])
-                state_vec = np.array([*pos_single, *quat_single, gripper_open_single], dtype=np.float32)
-                cur_pos_single, cur_rpy_single = list(pos_single), list(rpy_single)
-                image_obs = {
-                    args.single_image_key: image_tools.convert_to_uint8(_capture_resized(caps[single_arm])),
-                }
+                state_vec, image_obs, cur_pos_arr, cur_rpy_single = read_single_observation()
+                cur_pos_single = cur_pos_arr.tolist()
+
+                if args.hil_correction and pending_takeover_start:
+                    assert umi_reader is not None and hil_mapper is not None
+                    umi_sample = umi_reader.latest()
+                    if umi_sample is None:
+                        print("[HIL][WARN] UMI SLAM/clamp 数据过期或未就绪，无法开始接管")
+                        pending_takeover_start = False
+                    else:
+                        hil_takeover_id += 1
+                        hil_mapper.begin(
+                            robot_tcp_position_xyz_m=cur_pos_arr,
+                            robot_tcp_euler_xyz_rad=np.deg2rad(np.asarray(cur_rpy_single, dtype=np.float64)),
+                            umi_position_xyz_m=umi_sample.position_xyz_m,
+                            umi_quat_xyzw=umi_sample.quat_xyzw,
+                        )
+                        hil_takeover_active = True
+                        pending_takeover_start = False
+                        dropped = hil_recorder.drop_recent_policy_frames(args.hil_pre_takeover_drop) if hil_recorder else 0
+                        print(f"[HIL] 开始接管 takeover_id={hil_takeover_id}；已丢弃最近 policy 帧 {dropped} 条")
+
+                if args.hil_correction and hil_takeover_active:
+                    assert single_arm is not None
+                    assert umi_reader is not None and hil_mapper is not None
+                    umi_sample = umi_reader.latest()
+                    if umi_sample is None:
+                        print("[HIL][WARN] UMI SLAM/clamp 数据过期，暂停 HIL command")
+                        time.sleep(args.dt)
+                        continue
+
+                    hil_target = hil_mapper.target(
+                        umi_position_xyz_m=umi_sample.position_xyz_m,
+                        umi_quat_xyzw=umi_sample.quat_xyzw,
+                    )
+                    gripper_open = float(np.clip(umi_sample.gripper_open, 0.0, 1.0))
+                    target_rpy_deg = np.rad2deg(hil_target.euler_xyz_rad)
+                    action = np.asarray(
+                        [
+                            *hil_target.position_xyz_m.tolist(),
+                            *target_rpy_deg.tolist(),
+                            gripper_open,
+                        ],
+                        dtype=np.float64,
+                    )
+                    if hil_recorder is not None:
+                        hil_recorder.record(
+                            state_8d=state_vec,
+                            action_8d=action7_rpy_deg_to_action8_quat(action),
+                            image_front=image_obs[args.single_image_key],
+                            task=args.description,
+                            subtask="hil_correction",
+                            timestamp=time.time(),
+                            control_mode="human",
+                            base_action_7d=last_policy_action_7d,
+                            human_action_7d=action,
+                            takeover_id=hil_takeover_id,
+                        )
+                    if hil_target.translation_clamped or hil_target.rotation_clamped:
+                        print(
+                            "[HIL][WARN] command 已限幅 "
+                            f"translation={hil_target.translation_clamped} rotation={hil_target.rotation_clamped}"
+                        )
+                    print(f"[HIL] takeover={hil_takeover_id} action:", action)
+                    if args.enable_interp:
+                        interp_and_move_one(
+                            arms[single_arm],
+                            cur_pos_single,
+                            cur_rpy_single,
+                            hil_target.position_xyz_m.tolist(),
+                            target_rpy_deg.tolist(),
+                            gripper_open,
+                            arm_index=single_arm_index,
+                            step_size=args.interp_step_size,
+                            dt=args.dt,
+                        )
+                    else:
+                        _set_xarm_pose(arms[single_arm], hil_target.position_xyz_m.tolist(), target_rpy_deg.tolist(), wait=False)
+                        _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
+                    continue
 
             print("[INFO] 机器人状态：", state_vec)
             obs = {
@@ -874,10 +1064,47 @@ def main():
             lo, action_slice = action_slice_result
 
             for step_idx, action in enumerate(action_slice, start=lo):
-                if _stdin_wants_reset_pause():
+                step_ch = _stdin_read_char_nonblocking()
+                if step_ch in ("s", "S"):
                     reset_active_arms()
+                    if hil_recorder is not None:
+                        discarded = hil_recorder.discard_episode()
+                        if discarded:
+                            print(f"[HIL] 已丢弃当前 episode 的 {discarded} 帧")
+                    if hil_mapper is not None:
+                        hil_mapper.reset()
+                    hil_takeover_active = False
+                    pending_takeover_start = False
                     paused = True
                     print("[INFO] 已复位到初始位姿，推理已暂停；按 c 继续")
+                    break
+                if args.hil_correction and step_ch in ("t", "T"):
+                    pending_takeover_start = True
+                    print("[HIL] 请求开始人工接管；中断当前 policy chunk")
+                    break
+                if args.hil_correction and step_ch in ("e", "E"):
+                    if hil_recorder is not None and hil_recorder.has_frames():
+                        saved = hil_recorder.save_episode()
+                        print(f"[HIL] 已保存成功 episode：{saved} 帧 -> {args.hil_output_repo_id}")
+                    else:
+                        print("[HIL] 当前没有可保存的 episode 帧")
+                    if hil_mapper is not None:
+                        hil_mapper.reset()
+                    hil_takeover_active = False
+                    pending_takeover_start = False
+                    paused = True
+                    print("[INFO] 推理已暂停；按 c 继续下一条 episode")
+                    break
+                if args.hil_correction and step_ch in ("x", "X"):
+                    if hil_recorder is not None:
+                        discarded = hil_recorder.discard_episode()
+                        print(f"[HIL] 已丢弃当前 episode：{discarded} 帧")
+                    if hil_mapper is not None:
+                        hil_mapper.reset()
+                    hil_takeover_active = False
+                    pending_takeover_start = False
+                    paused = True
+                    print("[INFO] 推理已暂停；按 c 继续")
                     break
 
                 print(f"第 {step_idx} 步, action:", action)
@@ -918,9 +1145,29 @@ def main():
                 else:
                     assert single_arm is not None
                     x_a, y_a, z_a, roll, pitch, yaw, g_open = action[:7]
+                    if hil_recorder is not None:
+                        state_vec_step, image_obs_step, cur_pos_arr_step, cur_rpy_single = read_single_observation()
+                        cur_pos_single = cur_pos_arr_step.tolist()
+                    else:
+                        state_vec_step, image_obs_step = state_vec, image_obs
                     target_pos = [x_a, y_a, z_a]
                     target_rpy = [roll, pitch, yaw]
                     gripper_open = float(np.clip(g_open, 0.0, 1.0))
+                    policy_action_7d = np.asarray(action[:7], dtype=np.float64)
+                    last_policy_action_7d = policy_action_7d.copy()
+                    if hil_recorder is not None:
+                        hil_recorder.record(
+                            state_8d=state_vec_step,
+                            action_8d=action7_rpy_deg_to_action8_quat(policy_action_7d),
+                            image_front=image_obs_step[args.single_image_key],
+                            task=args.description,
+                            subtask="policy_success_candidate",
+                            timestamp=time.time(),
+                            control_mode="policy",
+                            base_action_7d=policy_action_7d,
+                            human_action_7d=None,
+                            takeover_id=None,
+                        )
                     if args.enable_interp:
                         interp_and_move_one(
                             arms[single_arm],
@@ -975,6 +1222,13 @@ def main():
     finally:
         if old_term is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+        if hil_recorder is not None:
+            if hil_recorder.has_frames():
+                discarded = hil_recorder.discard_episode()
+                print(f"[HIL] 退出时未确认保存，已丢弃缓冲帧：{discarded}")
+            hil_recorder.close()
+        if umi_reader is not None:
+            umi_reader.close()
         for cap in caps.values():
             cap.release()
         cv2.destroyAllWindows()

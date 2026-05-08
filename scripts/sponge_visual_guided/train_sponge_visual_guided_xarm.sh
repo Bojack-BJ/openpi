@@ -5,12 +5,14 @@ set -e
 #   bash scripts/sponge_visual_guided/train_sponge_visual_guided.sh qwen3_5
 #   bash scripts/sponge_visual_guided/train_sponge_visual_guided.sh qwen2_5
 #   bash scripts/sponge_visual_guided/train_sponge_visual_guided.sh pi0
+#   bash scripts/sponge_visual_guided/train_sponge_visual_guided.sh hil
 #   bash scripts/sponge_visual_guided/train_sponge_visual_guided.sh pi05
 
 variant=${1:-qwen3_5}
 
 case "$variant" in
   pi0)    cfg=sponge_visual_mask_keys_pi0_xarm ;;
+  hil | pi0_hil) cfg=sponge_visual_mask_keys_pi0_xarm_hil ;;
   pi05)   cfg=sponge_visual_mask_keys_pi05_xarm ;;
   qwen2_5 | qwen25) cfg=sponge_visual_guided_qwen2_5_3b_400m_xarm ;;
   qwen3_5 | qwen35) cfg=sponge_visual_guided_qwen3_5_2b_400m_xarm ;;
