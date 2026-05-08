@@ -129,7 +129,7 @@ exported/
 
 `samples.jsonl` 是 HL VLM 训练和评估的数据集。
 
-`--visual-mode raw` 是默认值，也是推荐值：即使 source config 是 mask overlay / mask image 训练配置，HL export 也会强制读取 raw RGB，不给 HL VLM 看任何 mask、overlay 或高亮目标。只有复现实验时才用 `--visual-mode config`，它可能把 mask overlay 或 mask image 暴露给 HL。
+`--visual-mode raw` 是默认值，也是推荐值。HL export 只读取必要的 parquet columns：episode/frame/task/subtask/prompt 和 RGB image columns；不会读取 state/action，也不会读取或传给 HL 任何 mask / overlay / 高亮目标。`--visual-mode config` 只影响优先选择哪些已配置的 RGB camera column，仍然会排除 mask/overlay。
 
 ### 4. Train
 

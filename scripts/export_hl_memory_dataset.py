@@ -10,7 +10,10 @@ import time
 from typing import Any
 from typing import Literal
 
+import datasets
+from datasets import load_dataset
 import numpy as np
+from PIL import Image
 import torch
 import tyro
 
@@ -28,6 +31,8 @@ from openpi.hl_memory.memory import map_relative_positions_to_absolute
 from openpi.hl_memory.frame_composer import compose_observation_frame
 import openpi.training.config as training_config
 import openpi.training.data_loader as data_loader
+import openpi.training.lerobot_dataset as openpi_lerobot_dataset
+import openpi.transforms as _transforms
 
 
 @dataclasses.dataclass
@@ -62,11 +67,11 @@ def main(args: ExportArgs) -> None:
         data_config.repo_id,
         args.visual_mode,
     )
-    raw_dataset = data_loader.create_torch_dataset(data_config, _hl_action_horizon(config, args.visual_mode), config.model)
-    logging.info("LeRobot dataset ready in %.1fs; len=%d", time.perf_counter() - start_time, len(raw_dataset))
+    raw_dataset = _create_hl_export_dataset(data_config, visual_mode=args.visual_mode)
+    logging.info("HL export dataset ready in %.1fs; len=%d", time.perf_counter() - start_time, len(raw_dataset))
     export_dataset = data_loader.TransformedDataset(
         raw_dataset,
-        [*data_config.repack_transforms.inputs, *_hl_export_input_transforms(data_config, args.visual_mode)],
+        [_HLVisualOnlyTransform()],
     )
 
     logging.info("Loading HL annotations: %s", args.annotations_jsonl)
@@ -137,7 +142,7 @@ def main(args: ExportArgs) -> None:
 
 def _resolve_hl_visual_config(config: Any, *, visual_mode: str) -> Any:
     if visual_mode == "config":
-        logging.warning("HL export visual_mode=config may expose mask overlays or mask images to the HL VLM.")
+        logging.info("HL export visual_mode=config still loads only RGB image columns; masks and overlays are excluded.")
         return config
     if visual_mode != "raw":
         raise ValueError(f"Unsupported visual_mode: {visual_mode}")
@@ -149,16 +154,87 @@ def _resolve_hl_visual_config(config: Any, *, visual_mode: str) -> Any:
     return config
 
 
-def _hl_export_input_transforms(data_config: Any, visual_mode: str) -> list[Any]:
-    if visual_mode == "config":
-        return list(data_config.data_transforms.inputs)
-    return [_StripGuidanceMasksForHLExport()]
+def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loader.Dataset:
+    repo_id = data_config.repo_id
+    if repo_id is None:
+        raise ValueError("Repo ID is not set. Cannot create HL export dataset.")
+    if repo_id == "fake":
+        raise ValueError("HL export does not support fake datasets.")
+
+    dataset_meta = openpi_lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_root = openpi_lerobot_dataset.HF_LEROBOT_HOME / repo_id
+    selected_columns = _resolve_hl_export_columns(data_config, dataset_meta)
+    logging.info(
+        "Loading HL parquet dataset directly without LeRobot timestamp/delta checks; columns=%s",
+        ", ".join(selected_columns),
+    )
+    hf_dataset = load_dataset("parquet", data_dir=str(dataset_root / "data"), split="train", columns=list(selected_columns))
+    dataset: data_loader.Dataset = _HLExportParquetDataset(repo_id=repo_id, root=dataset_root, hf_dataset=hf_dataset)
+
+    if data_config.prompt_from_task:
+        dataset = data_loader.TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+    if data_config.subtask_segments_path is not None:
+        dataset = data_loader.TransformedDataset(
+            dataset,
+            [
+                _transforms.SubtaskFromSegments(
+                    data_loader._load_subtask_segments(data_config.subtask_segments_path, dataset_root)  # pylint: disable=protected-access
+                )
+            ],
+        )
+    return dataset
 
 
-def _hl_action_horizon(config: Any, visual_mode: str) -> int:
-    if visual_mode == "config":
-        return int(config.model.action_horizon)
-    return 1
+def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any) -> tuple[str, ...]:
+    features = dict(getattr(dataset_meta, "features", {}) or {})
+    existing_columns = set(features)
+    selected: list[str] = []
+
+    for column in ("timestamp", "frame_index", "episode_index", "index", "task_index", "subtask", "prompt"):
+        _append_existing_column(selected, column, existing_columns)
+
+    configured_columns = tuple(data_config.dataset_columns or ())
+    for column in configured_columns:
+        if column.startswith("observation.images.") and not _is_guidance_visual_column(column):
+            _append_existing_column(selected, column, existing_columns)
+
+    if not any(column.startswith("observation.images.") for column in selected):
+        for column in sorted(existing_columns):
+            if column.startswith("observation.images."):
+                if _is_guidance_visual_column(column):
+                    continue
+                _append_existing_column(selected, column, existing_columns)
+
+    if not any(column.startswith("observation.images.") for column in selected):
+        raise ValueError("Could not resolve any image columns for HL export.")
+    return tuple(selected)
+
+
+def _append_existing_column(selected: list[str], column: str, existing_columns: set[str]) -> None:
+    if column in existing_columns and column not in selected:
+        selected.append(column)
+        return
+    fallback = data_loader._DATASET_COLUMN_FALLBACKS.get(column)  # pylint: disable=protected-access
+    if fallback in existing_columns and fallback not in selected:
+        selected.append(fallback)
+
+
+def _is_guidance_visual_column(column: str) -> bool:
+    lowered = column.lower()
+    return "mask" in lowered or "overlay" in lowered
+
+
+@dataclasses.dataclass
+class _HLExportParquetDataset:
+    repo_id: str
+    root: pathlib.Path
+    hf_dataset: datasets.Dataset
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        return self.hf_dataset[int(index)]
+
+    def __len__(self) -> int:
+        return len(self.hf_dataset)
 
 
 def _export_episode(
@@ -272,20 +348,29 @@ def _group_annotations_by_episode(annotations: list[Any]) -> dict[int, list[Any]
 
 
 @dataclasses.dataclass(frozen=True)
-class _StripGuidanceMasksForHLExport:
-    """Keep HL visual inputs clean: no masks, overlays, or LL model-specific padding images."""
+class _HLVisualOnlyTransform:
+    """Return only fields needed by HL export: RGB views, prompt text, and optional subtask."""
 
     def __call__(self, sample: Mapping[str, Any]) -> dict[str, Any]:
-        out = dict(sample)
-        out.pop("mask", None)
-        images = out.get("image")
+        observation = sample.get("observation", {})
+        images = observation.get("images", {}) if isinstance(observation, Mapping) else {}
+        out: dict[str, Any] = {"image": {}}
         if isinstance(images, Mapping):
-            out["image"] = {
-                key: value
-                for key, value in images.items()
-                if "mask" not in str(key).lower() and "overlay" not in str(key).lower()
-            }
+            out["image"] = _select_hl_image_views(images)
+        for key in ("prompt", "subtask", "current_subtask", "episode_index", "frame_index", "task_index"):
+            if key in sample:
+                out[key] = sample[key]
         return out
+
+
+def _select_hl_image_views(images: Mapping[str, Any]) -> dict[str, Any]:
+    selected: dict[str, Any] = {}
+    for key, value in images.items():
+        key_text = str(key)
+        if _is_guidance_visual_column(key_text):
+            continue
+        selected[key_text] = value
+    return selected
 
 
 def _ensure_frame_saved(
@@ -327,11 +412,11 @@ def _extract_instruction(sample: Mapping[str, Any]) -> str:
     return ""
 
 
-def _collect_image_views(tree: Mapping[str, Any], *, prefix: str = "") -> dict[str, np.ndarray | torch.Tensor]:
-    images: dict[str, np.ndarray | torch.Tensor] = {}
+def _collect_image_views(tree: Mapping[str, Any], *, prefix: str = "") -> dict[str, Image.Image | np.ndarray | torch.Tensor]:
+    images: dict[str, Image.Image | np.ndarray | torch.Tensor] = {}
     for key, value in tree.items():
         path = f"{prefix}.{key}" if prefix else str(key)
-        if _is_image_array(value):
+        if isinstance(value, Image.Image) or _is_image_array(value):
             images[path] = value
             continue
         if isinstance(value, Mapping):
