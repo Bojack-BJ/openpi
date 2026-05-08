@@ -2392,8 +2392,8 @@ _CONFIGS = [
             repo_id="fastumi/sponge_visual_guided_xarm",
             guidance_image_mode="mask_images",
             assets=AssetsConfig(
-                assets_dir="./assets/sponge_visual_guided",
-                asset_id="fastumi/sponge_visual_guided",
+                assets_dir="./assets/sponge_visual_guided_xarm",
+                asset_id="fastumi/sponge_visual_guided_xarm",
             ),
             base_config=DataConfig(
                 prompt_from_task=True,
