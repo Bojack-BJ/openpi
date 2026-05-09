@@ -103,6 +103,19 @@ python scripts/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
+默认每个 segment 导出两条 annotation：`start_frame` 的 `subtask_boundary` 和 segment 中点的 `progress`。这样 HL 同时学习 subtask 切换点和 subtask 进行中的稳定状态。`--emit-success-events` 会额外在 `end_frame - 1` 导出 `success`，当前默认不启用。
+
+长 segment 可以按长度补充 progress 样本，但建议加上 cap，避免长时间段主导训练：
+
+```bash
+python scripts/export_hl_annotations_from_subtasks.py \
+  --repo-id fastumi/sponge_visual_guided_xarm \
+  --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --progress-sample-stride 50 \
+  --max-progress-samples-per-segment 4 \
+  --overwrite
+```
+
 ### 3. HL Annotation JSONL To HL Dataset
 
 ```bash
@@ -254,8 +267,8 @@ Input rules：
   "phase": "place the motor into the box",
   "target_query": "motor",
   "goal_query": "box",
-  "event_type": "subtask_boundary",
-  "event_text": "Started placing the motor into the box."
+  "event_type": "progress",
+  "event_text": "Continuing placing the motor into the box."
 }
 ```
 

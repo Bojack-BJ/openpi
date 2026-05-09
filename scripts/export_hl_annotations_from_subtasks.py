@@ -74,6 +74,21 @@ def _parse_args() -> argparse.Namespace:
         help="Also emit a success annotation at end_frame - 1 for each segment.",
     )
     parser.add_argument(
+        "--progress-sample-stride",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, emit additional progress annotations every N frames inside each segment, capped by "
+            "--max-progress-samples-per-segment. The segment midpoint is always included when possible."
+        ),
+    )
+    parser.add_argument(
+        "--max-progress-samples-per-segment",
+        type=int,
+        default=1,
+        help="Maximum number of progress annotations per segment, including the midpoint.",
+    )
+    parser.add_argument(
         "--empty-last-end-policy",
         choices=("skip", "use-start", "error"),
         default="skip",
@@ -311,6 +326,22 @@ def _segments_to_rows(
                 args=args,
             )
         )
+        for progress_frame in _progress_sample_frames(
+            start,
+            end,
+            stride=args.progress_sample_stride,
+            max_samples=args.max_progress_samples_per_segment,
+        ):
+            rows.append(
+                _make_row(
+                    episode_index=episode_index,
+                    frame_index=progress_frame,
+                    subtask=subtask,
+                    event_type="progress",
+                    event_text=f"Continuing {subtask}.",
+                    args=args,
+                )
+            )
         if args.emit_success_events:
             rows.append(
                 _make_row(
@@ -323,6 +354,36 @@ def _segments_to_rows(
                 )
             )
     return rows
+
+
+def _progress_sample_frames(start: int, end: int, *, stride: int, max_samples: int) -> list[int]:
+    if end - start <= 1 or max_samples <= 0:
+        return []
+
+    middle = start + (end - start) // 2
+    candidates: list[int] = [middle]
+    if stride > 0:
+        candidates.extend(range(start + stride, end, stride))
+
+    unique = sorted({int(frame) for frame in candidates if start < int(frame) < end})
+    if len(unique) <= max_samples:
+        return unique
+    if middle in unique:
+        remaining = [frame for frame in unique if frame != middle]
+        budget = max_samples - 1
+        return sorted([middle, *_evenly_spaced_subset(remaining, budget)])
+    return _evenly_spaced_subset(unique, max_samples)
+
+
+def _evenly_spaced_subset(values: list[int], count: int) -> list[int]:
+    if count <= 0:
+        return []
+    if len(values) <= count:
+        return list(values)
+    if count == 1:
+        return [values[len(values) // 2]]
+    positions = [round(index * (len(values) - 1) / (count - 1)) for index in range(count)]
+    return [values[position] for position in positions]
 
 
 def _make_row(
@@ -353,7 +414,7 @@ def _make_row(
 
 
 def _sort_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    event_order = {"success": 0, "subtask_boundary": 1}
+    event_order = {"success": 0, "subtask_boundary": 1, "progress": 2}
     return sorted(
         rows,
         key=lambda row: (
