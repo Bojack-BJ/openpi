@@ -166,8 +166,10 @@ python scripts/train_hl_memory.py \
 多卡数据并行训练用 `torchrun`。每个 rank 独立采样 HL sample，同步梯度；只有 rank0 打印 tqdm/loss 和保存 checkpoint：
 
 ```bash
-PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src 
+export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src
 export WANDB_API_KEY="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"
+export WANDB_MODE=online
+
 torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
@@ -175,15 +177,14 @@ torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
   --vlm-variant qwen3_5_2b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
   --precision bfloat16 \
-  --batch-size 2 \
-  --grad-accum-steps 4 \
+  --batch-size 4 \
+  --grad-accum-steps 1 \
   --frame-cache-size 4096 \
+  --num-train-steps 2000 \
+  --save-interval 200 \
   --wandb-enabled \
   --wandb-project openpi-hl-memory \
-  --num-train-steps 1000 \
-  --save-interval 200 \
-  --num-train-steps 10000 \
-  --save-interval 2500
+  --wandb-run-name sponge-qwen35-2b-hl
 ```
 
 这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。开启 wandb 后 rank0 会记录 `train/loss`、`time/data_s_per_it`、`time/step_s_per_it`、`time/data_fraction`、`train/lr` 和 `train/global_batch_size`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
@@ -213,7 +214,7 @@ python scripts/train_hl_memory.py --config-yaml src/openpi/hl_memory/train_hl_me
 ```bash
 python scripts/eval_hl_memory_rollout.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
-  --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-001000 \
+  --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-000800 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --device cuda \
