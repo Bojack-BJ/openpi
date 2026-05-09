@@ -166,18 +166,20 @@ python scripts/train_hl_memory.py \
 多卡数据并行训练用 `torchrun`。每个 rank 独立采样 HL sample，同步梯度；只有 rank0 打印 tqdm/loss 和保存 checkpoint：
 
 ```bash
+PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src 
+export WANDB_API_KEY="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"
 torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
-  --precision float16 \
+  --precision bfloat16 \
   --batch-size 2 \
   --grad-accum-steps 4 \
   --frame-cache-size 4096 \
   --num-train-steps 1000 \
-  --save-interval 200
+  --save-interval 200 \
   --num-train-steps 10000 \
   --save-interval 2500
 ```
