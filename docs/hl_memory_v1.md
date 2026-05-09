@@ -175,14 +175,11 @@ torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
   --precision float16 \
   --batch-size 2 \
   --grad-accum-steps 4 \
-<<<<<<< HEAD
   --frame-cache-size 4096 \
   --num-train-steps 1000 \
   --save-interval 200
-=======
   --num-train-steps 10000 \
   --save-interval 2500
->>>>>>> 37d965d (local adjustment)
 ```
 
 这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
