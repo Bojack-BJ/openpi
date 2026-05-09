@@ -28,29 +28,42 @@ from openpi.hl_memory.zero_shot import write_debug_video
 
 @dataclasses.dataclass
 class ZeroShotArgs:
+    """Run one-shot or interval rollout HL-memory inference on single-view or dual-view videos."""
+
+    # Task and input videos.
     instruction: str
     video_path: pathlib.Path | None = None
     left_video_path: pathlib.Path | None = None
     right_video_path: pathlib.Path | None = None
     task_config_path: pathlib.Path | None = None
+
+    # Optional YAML config and model checkpoint/source.
     config_yaml: pathlib.Path | None = None
     model_path: str | None = None
     local_vlm_ckpt_path: pathlib.Path | None = None
+
+    # Output artifacts.
     output_json: pathlib.Path | None = None
     rollout_jsonl: pathlib.Path | None = None
     rollout_pretty_json: pathlib.Path | None = None
     debug_dir: pathlib.Path | None = None
     debug_video_fps: float = 1.0
+
+    # Runtime memory and clip selection.
     language_memory: str = ""
     memory_seconds: str | None = None
     recent_seconds: str | None = None
     recent_end_sec: float | None = None
     recent_step_sec: float = 1.0
+
+    # If rollout_interval_sec is set, run recurrent HL memory rollout over the whole video range.
     rollout_interval_sec: float | None = None
     rollout_start_sec: float = 0.0
     rollout_end_sec: float | None = None
     keyframe_merge_distance_sec: float = 2.0
     auto_memory: bool = True
+
+    # VLM backend and generation settings.
     vlm_backend: str = "qwen2_5_vl"
     vlm_variant: str | None = None
     vlm_hf_model_id: str | None = None
@@ -64,6 +77,8 @@ class ZeroShotArgs:
     enable_thinking: bool = False
     thinking_budget_tokens: int = 128
     thinking_max_new_tokens: int = 1024
+
+    # Large-model loading options.
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"

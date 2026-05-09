@@ -144,13 +144,29 @@ exported/
 
 `--visual-mode raw` 是默认值，也是推荐值。HL export 只读取必要的 parquet columns：episode/frame/task/subtask/prompt 和 RGB image columns；不会读取 state/action，也不会读取或传给 HL 任何 mask / overlay / 高亮目标。`--visual-mode config` 只影响优先选择哪些已配置的 RGB camera column，仍然会排除 mask/overlay。
 
+推荐按 episode 做 held-out split，而不是直接用同一个 `exported/` 同时训练和评估。下面这条命令会在一次运行里计算一次 split，并同时生成互斥的 train / val episode，避免两次运行时误填不同 ratio/seed：
+
+```bash
+python scripts/export_hl_memory_dataset.py \
+  --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
+  --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --output-train-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
+  --output-val-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
+  --val-ratio 0.1 \
+  --split-seed 42 \
+  --visual-mode raw \
+  --overwrite
+```
+
+也可以显式指定 episode：`--episode-indices 0,3,7-12` 或排除 episode：`--exclude-episode-indices 100-120`。`metadata.json` 会记录 selected episode 列表，方便确认 train/val 没有重叠。旧的单目录模式仍然可用：`--output-dir ... --episode-split train|val|all`。
+
 如果报 `Episode ... was not found in dataset`，说明 `annotations.jsonl` 的 episode index 和当前 LeRobot dataset 不匹配；优先用上一步的 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 重新生成 annotations。只有确认要导出交集时才加 `--missing-episode-policy skip`。
 
 ### 4. Train
 
 ```bash
 python scripts/train_hl_memory.py \
-  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
+  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
@@ -171,7 +187,7 @@ export WANDB_API_KEY="wandb_v1_OKCbHLRPsB6FUyvWXvYPGYEAXDx_iIeP64fAp1VgAgrkTY4l0
 export WANDB_MODE=online
 
 torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
-  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
+  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
@@ -213,8 +229,8 @@ python scripts/train_hl_memory.py --config-yaml src/openpi/hl_memory/train_hl_me
 
 ```bash
 python scripts/eval_hl_memory_rollout.py \
-  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
-  --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-000800 \
+  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
+  --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-001000 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --device cuda \
@@ -223,6 +239,22 @@ python scripts/eval_hl_memory_rollout.py \
 ```
 
 评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标是 subtask match、phase/target/goal accuracy、keyframe precision/recall、memory similarity/drift、event accuracy。
+
+快速 smoke eval 可以先只跑少量未见 episode 或单个 ablation：
+
+```bash
+python scripts/eval_hl_memory_rollout.py \
+  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
+  --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-001000 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_2b \
+  --device cuda \
+  --max-episodes 10 \
+  --eval-modes full \
+  --output-json /root/Users/dataset/hl_memory/sponge_visual_guided/eval_metrics_smoke.json
+```
+
+`--max-samples` 也可用于快速调试，但它可能截断 episode 中间序列；正式 rollout metrics 更推荐用 `--max-episodes`。
 
 Eval 会打印阶段日志并显示每种 ablation 的 tqdm 进度条：
 
@@ -278,6 +310,53 @@ Input rules：
 - memory clip 和 recent clip 都按时间从旧到新排列。
 - recent clip 最后一张有效帧定义当前状态，`current_subtask` 必须描述最后有效帧。
 - rollout 会把上一轮 `updated_language_memory` 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
+
+常用参数说明：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--instruction` | 任务指令，会进入 HL VLM prompt；如果配合 `--task-config-path`，还会拼接 nominal primitive plan。 |
+| `--video-path` | 单视角输入视频，内部视角名为 `front`。 |
+| `--left-video-path` / `--right-video-path` | 双视角输入视频，内部视角名为 `robot_0` / `robot_1`，同一时间抽帧后横向拼接成一张 HL frame。 |
+| `--task-config-path` | JSON task plan，可提供 `task_description` 和 `steps`，作为分段先验；视觉证据优先级仍高于 plan。 |
+| `--model-path` | 已训练 HL checkpoint 或 Hugging Face/local model 路径。 |
+| `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
+| `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |
+| `--vlm-variant` | Qwen3.5 变体，例如 `qwen3_5_2b`，也可用短名 `2b` / `4b` / `27b`。 |
+| `--precision` | 推理精度，常用 `float16` 或 `bfloat16`；遇到 vision/cuDNN 问题先试 `float16`。 |
+| `--device` | 推理设备，通常是 `cuda`；CPU 只适合小模型/调试。 |
+
+clip 和 memory 参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--recent-end-sec` | 单次预测时 recent clip 的结束时间；不填时默认取视频末尾。 |
+| `--recent-step-sec` | recent clip 抽帧间隔，默认每 1 秒取一帧。 |
+| `--recent-seconds` | 手动指定 recent clip 秒数列表，例如 `10,12,14`；不能和 rollout interval 模式一起用。 |
+| `--memory-seconds` | 手动指定历史 memory keyframe 秒数列表，例如 `2,8,15`。 |
+| `--auto-memory` | 单次预测时自动从 recent 前面的时间段取 memory frames；rollout 模式会关闭它并使用上一步 keyframes。 |
+| `--recent-frames-length` | recent clip 最大帧数，默认 `8`。 |
+| `--memory-length` | memory clip 最大帧数，默认 `8`。 |
+| `--frame-height` / `--frame-width` | 输入 VLM 前的 frame resize 尺寸，默认 `224x224`。 |
+| `--allow-single-frame-fallback` | 视频太短或时间点不足时允许复用单帧补齐，方便调试短视频。 |
+
+rollout 和调试参数：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--rollout-interval-sec` | 开启 recurrent rollout；每隔 N 秒推理一次，并把上一轮 language memory/keyframes 传到下一轮。 |
+| `--rollout-start-sec` / `--rollout-end-sec` | rollout 起止时间；不填 end 时默认到视频末尾。 |
+| `--keyframe-merge-distance-sec` | 合并距离过近的 keyframe candidates，默认 `2.0` 秒。 |
+| `--language-memory` | 初始语言记忆；空字符串表示从默认初始状态开始。 |
+| `--output-json` | 保存最终 summary JSON。 |
+| `--rollout-jsonl` | rollout 模式下逐步保存 compact JSONL。 |
+| `--rollout-pretty-json` | rollout 模式下逐步保存可读 JSON。 |
+| `--debug-dir` | 保存输入帧、keyframe candidates、debug panel；排查模型预测时建议开启。 |
+| `--debug-video-fps` | 用 debug panels 合成 rollout debug 视频的 FPS。 |
+| `--max-new-tokens` | 非 thinking 模式的最大生成 token 数。 |
+| `--enable-thinking` | 打开 Qwen thinking；默认关闭，建议先关闭以保证 JSON 输出稳定。 |
+| `--parallel-mode` | 大模型加载方式；单卡默认 `none`，27B OOM 时可试 `device_map`。 |
+| `--device-map` / `--tensor-parallel-plan` | 配合 `--parallel-mode device_map|tensor_parallel` 使用。 |
 
 ## Data Formats
 
