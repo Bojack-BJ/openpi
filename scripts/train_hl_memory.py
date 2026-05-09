@@ -9,6 +9,7 @@ import os
 import pathlib
 import random
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.distributed as dist
@@ -52,11 +53,23 @@ class TrainArgs:
     ddp_backend: str = "nccl"
     frame_cache_size: int = 4096
     use_grad_scaler: bool = True
+    wandb_enabled: bool = False
+    wandb_project: str = "openpi-hl-memory"
+    wandb_run_name: str | None = None
+    wandb_entity: str | None = None
 
 
 def main(args: TrainArgs) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     distributed = _init_distributed(args)
+    try:
+        _train(args, distributed=distributed)
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _train(args: TrainArgs, *, distributed: bool) -> None:
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
     is_main = rank == 0
@@ -78,6 +91,7 @@ def main(args: TrainArgs) -> None:
             args.batch_size,
             args.grad_accum_steps,
         )
+    wandb_run = _init_wandb(args, sample_count=len(samples), world_size=world_size) if is_main else None
     hl_config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -110,7 +124,10 @@ def main(args: TrainArgs) -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    grad_scaler = torch.cuda.amp.GradScaler(enabled=args.use_grad_scaler and device.type == "cuda" and args.precision == "float16")
+    scaler_enabled = args.use_grad_scaler and device.type == "cuda" and not _has_fp16_trainable_parameters(loaded.model)
+    if is_main and args.use_grad_scaler and not scaler_enabled:
+        logging.info("Disabling GradScaler because trainable parameters are already fp16/bf16.")
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     frame_cache = FrameCache(args.frame_cache_size)
     rng = random.Random(args.seed + rank)
     running_loss = 0.0
@@ -124,83 +141,104 @@ def main(args: TrainArgs) -> None:
         dynamic_ncols=True,
         unit="it",
     )
-    for step in progress:
-        step_start_time = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
-        step_loss = 0.0
-        step_data_time = 0.0
-        for _ in range(args.grad_accum_steps):
-            batch = _sample_batch(samples, args.batch_size, rng)
-            micro_loss = 0.0
-            for sample in batch:
-                data_start_time = time.perf_counter()
-                clips = load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
-                inputs = adapter.prepare_training_inputs(loaded, sample, clips, device=device)
-                supervised_tokens = int((inputs["labels"] != -100).sum().detach().cpu().item())
-                if supervised_tokens <= 0:
-                    raise ValueError(
-                        f"HL sample {sample.sample_id} produced zero supervised target tokens after label masking. "
-                        "This would make the language-model loss NaN."
-                    )
-                step_data_time += time.perf_counter() - data_start_time
-                outputs = loaded.model(**inputs)
-                loss = outputs.loss / max(len(batch), 1)
-                loss_value = float(loss.detach().cpu())
-                if not math.isfinite(loss_value):
-                    raise FloatingPointError(
-                        f"Non-finite HL loss for sample_id={sample.sample_id}: loss={loss_value} "
-                        f"supervised_tokens={supervised_tokens} input_shape={tuple(inputs['input_ids'].shape)}. "
-                        "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
-                    )
-                micro_loss += loss_value
-                grad_scaler.scale(loss / args.grad_accum_steps).backward()
-            step_loss += micro_loss
+    try:
+        for step in progress:
+            step_start_time = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            step_loss = 0.0
+            step_data_time = 0.0
+            for accum_index in range(args.grad_accum_steps):
+                batch = _sample_batch(samples, args.batch_size, rng)
+                micro_loss = 0.0
+                sync_gradients = accum_index == args.grad_accum_steps - 1
+                sync_context = (
+                    loaded.model.no_sync()
+                    if distributed and isinstance(loaded.model, torch.nn.parallel.DistributedDataParallel) and not sync_gradients
+                    else nullcontext()
+                )
+                with sync_context:
+                    for sample in batch:
+                        data_start_time = time.perf_counter()
+                        clips = load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
+                        inputs = adapter.prepare_training_inputs(loaded, sample, clips, device=device)
+                        supervised_tokens = int((inputs["labels"] != -100).sum().detach().cpu().item())
+                        if supervised_tokens <= 0:
+                            raise ValueError(
+                                f"HL sample {sample.sample_id} produced zero supervised target tokens after label masking. "
+                                "This would make the language-model loss NaN."
+                            )
+                        step_data_time += time.perf_counter() - data_start_time
+                        outputs = loaded.model(**inputs)
+                        loss = outputs.loss / max(len(batch), 1)
+                        loss_value = float(loss.detach().cpu())
+                        if not math.isfinite(loss_value):
+                            raise FloatingPointError(
+                                f"Non-finite HL loss for sample_id={sample.sample_id}: loss={loss_value} "
+                                f"supervised_tokens={supervised_tokens} input_shape={tuple(inputs['input_ids'].shape)}. "
+                                "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
+                            )
+                        micro_loss += loss_value
+                        grad_scaler.scale(loss / args.grad_accum_steps).backward()
+                step_loss += micro_loss
 
-        grad_scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(loaded.model.parameters(), args.max_grad_norm)
-        grad_scaler.step(optimizer)
-        grad_scaler.update()
-        step_elapsed = time.perf_counter() - step_start_time
-        logged_step_loss = _mean_across_ranks(step_loss, device=device) if distributed else step_loss
-        running_loss += logged_step_loss
-        logged_data_time = _mean_across_ranks(step_data_time, device=device) if distributed else step_data_time
-        logged_step_time = _mean_across_ranks(step_elapsed, device=device) if distributed else step_elapsed
-        running_data_time += logged_data_time
-        running_step_time += logged_step_time
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(loaded.model.parameters(), args.max_grad_norm)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+            step_elapsed = time.perf_counter() - step_start_time
+            logged_step_loss = _mean_across_ranks(step_loss, device=device) if distributed else step_loss
+            running_loss += logged_step_loss
+            logged_data_time = _mean_across_ranks(step_data_time, device=device) if distributed else step_data_time
+            logged_step_time = _mean_across_ranks(step_elapsed, device=device) if distributed else step_elapsed
+            running_data_time += logged_data_time
+            running_step_time += logged_step_time
 
-        if is_main and step % args.log_interval == 0:
-            avg_loss = running_loss / args.log_interval
-            avg_data_time = running_data_time / args.log_interval
-            avg_step_time = running_step_time / args.log_interval
-            progress.set_postfix(
-                loss=f"{avg_loss:.6f}",
-                data_s=f"{avg_data_time:.2f}",
-                step_s=f"{avg_step_time:.2f}",
-            )
-            logging.info(
-                "step=%d/%d loss=%.6f data_s/it=%.2f step_s/it=%.2f",
-                step,
-                args.num_train_steps,
-                avg_loss,
-                avg_data_time,
-                avg_step_time,
-            )
-            running_loss = 0.0
-            running_data_time = 0.0
-            running_step_time = 0.0
-        save_due = step % args.save_interval == 0 or step == args.num_train_steps
-        if is_main and save_due:
-            _save_checkpoint(
-                output_dir=args.output_dir / f"checkpoint-step-{step:06d}",
-                loaded=loaded,
-                hl_config=hl_config,
-                train_args=args,
-            )
-        if distributed and save_due:
-            dist.barrier()
-
-    if distributed:
-        dist.destroy_process_group()
+            if is_main and step % args.log_interval == 0:
+                avg_loss = running_loss / args.log_interval
+                avg_data_time = running_data_time / args.log_interval
+                avg_step_time = running_step_time / args.log_interval
+                data_fraction = avg_data_time / max(avg_step_time, 1e-6)
+                progress.set_postfix(
+                    loss=f"{avg_loss:.6f}",
+                    data_s=f"{avg_data_time:.2f}",
+                    step_s=f"{avg_step_time:.2f}",
+                )
+                logging.info(
+                    "step=%d/%d loss=%.6f data_s/it=%.2f step_s/it=%.2f",
+                    step,
+                    args.num_train_steps,
+                    avg_loss,
+                    avg_data_time,
+                    avg_step_time,
+                )
+                _wandb_log(
+                    wandb_run,
+                    {
+                        "train/loss": avg_loss,
+                        "time/data_s_per_it": avg_data_time,
+                        "time/step_s_per_it": avg_step_time,
+                        "time/data_fraction": data_fraction,
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
+                    },
+                    step=step,
+                )
+                running_loss = 0.0
+                running_data_time = 0.0
+                running_step_time = 0.0
+            save_due = step % args.save_interval == 0 or step == args.num_train_steps
+            if is_main and save_due:
+                _save_checkpoint(
+                    output_dir=args.output_dir / f"checkpoint-step-{step:06d}",
+                    loaded=loaded,
+                    hl_config=hl_config,
+                    train_args=args,
+                )
+            if distributed and save_due:
+                dist.barrier()
+    finally:
+        if wandb_run is not None:
+            wandb_run.finish()
 
 
 def _init_distributed(args: TrainArgs) -> bool:
@@ -227,6 +265,36 @@ def _mean_across_ranks(value: float, *, device: torch.device) -> float:
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     tensor /= dist.get_world_size()
     return float(tensor.detach().cpu())
+
+
+def _init_wandb(args: TrainArgs, *, sample_count: int, world_size: int):
+    if not args.wandb_enabled:
+        return None
+    import wandb
+
+    return wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_run_name,
+        config={
+            **{
+                key: str(value) if isinstance(value, pathlib.Path) else value
+                for key, value in dataclasses.asdict(args).items()
+            },
+            "sample_count": sample_count,
+            "world_size": world_size,
+            "effective_global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
+        },
+    )
+
+
+def _wandb_log(wandb_run, payload: dict[str, float | int], *, step: int) -> None:
+    if wandb_run is not None:
+        wandb_run.log(payload, step=step)
+
+
+def _has_fp16_trainable_parameters(model: torch.nn.Module) -> bool:
+    return any(parameter.requires_grad and parameter.dtype in {torch.float16, torch.bfloat16} for parameter in model.parameters())
 
 
 def _sample_batch(samples, batch_size: int, rng: random.Random):

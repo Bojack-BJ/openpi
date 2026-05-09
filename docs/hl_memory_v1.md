@@ -178,13 +178,15 @@ torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
   --batch-size 2 \
   --grad-accum-steps 4 \
   --frame-cache-size 4096 \
+  --wandb-enabled \
+  --wandb-project openpi-hl-memory \
   --num-train-steps 1000 \
   --save-interval 200 \
   --num-train-steps 10000 \
   --save-interval 2500
 ```
 
-这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
+这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。开启 wandb 后 rank0 会记录 `train/loss`、`time/data_s_per_it`、`time/step_s_per_it`、`time/data_fraction`、`train/lr` 和 `train/global_batch_size`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
 
 可用 backend / variant：
 
@@ -196,7 +198,7 @@ Qwen3.5 建议：
 
 - 默认可用 `bfloat16`，GPU 不支持时 runtime 会降到 fp16。
 - vision `conv3d` / cuDNN 报错时先显式 `--precision float16`。
-- 如果 `loss=nan`，优先在 A100/H100 等支持 bf16 的 GPU 上改用 `--precision bfloat16`；fp16 训练默认启用 GradScaler，但仍可能比 bf16 更容易数值溢出。
+- 如果 `loss=nan`，优先在 A100/H100 等支持 bf16 的 GPU 上改用 `--precision bfloat16`；full fine-tune 时模型参数本身是 fp16/bf16，GradScaler 会自动禁用，不要依赖它解决纯 fp16 溢出。
 - 训练多卡 DDP 不要同时设置 `--parallel-mode device_map|tensor_parallel`。
 - 27B 单卡推理 OOM 时可用 `--parallel-mode device_map --device-map auto`；这是模型切分，不是数据并行训练。
 
