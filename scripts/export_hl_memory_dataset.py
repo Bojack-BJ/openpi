@@ -42,9 +42,17 @@ import openpi.transforms as _transforms
 class ExportArgs:
     source_config_name: str
     annotations_jsonl: pathlib.Path
-    output_dir: pathlib.Path
+    output_dir: pathlib.Path | None = None
+    output_train_dir: pathlib.Path | None = None
+    output_val_dir: pathlib.Path | None = None
     visual_mode: Literal["raw", "config"] = "raw"
     missing_episode_policy: Literal["error", "skip"] = "error"
+    episode_split: Literal["all", "train", "val"] = "all"
+    val_ratio: float = 0.1
+    split_seed: int = 42
+    episode_indices: str | None = None
+    exclude_episode_indices: str | None = None
+    max_episodes: int | None = None
     recent_frames_length: int = 8
     frame_subsample: int = 5
     memory_length: int = 8
@@ -56,10 +64,9 @@ class ExportArgs:
 
 def main(args: ExportArgs) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
-    if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.overwrite:
-        raise FileExistsError(f"{args.output_dir} already exists and is not empty. Use --overwrite to replace it.")
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    (args.output_dir / "frames").mkdir(exist_ok=True)
+    export_targets = _resolve_export_targets(args)
+    for _split_name, output_dir in export_targets:
+        _validate_output_dir(output_dir, overwrite=args.overwrite)
 
     start_time = time.perf_counter()
     logging.info("Resolving training config: %s", args.source_config_name)
@@ -89,8 +96,6 @@ def main(args: ExportArgs) -> None:
     logging.info("Building episode index map from LeRobot dataset.")
     episode_to_indices = _build_episode_index_map(raw_dataset)
     logging.info("Episode index map ready for %d episodes.", len(episode_to_indices))
-    frame_cache: dict[int, str] = {}
-    samples: list[ExportedHLMemorySample] = []
     hl_config = HLMemoryConfig(
         recent_frames_length=args.recent_frames_length,
         frame_subsample=args.frame_subsample,
@@ -100,9 +105,60 @@ def main(args: ExportArgs) -> None:
         frame_width=args.frame_width,
     )
 
-    sorted_episode_items = sorted(episode_to_annotations.items())
+    all_episode_items = sorted(episode_to_annotations.items())
+    for split_name, output_dir in export_targets:
+        split_start_time = time.perf_counter()
+        sorted_episode_items = _filter_episode_items(
+            all_episode_items,
+            episode_split=split_name,
+            val_ratio=args.val_ratio,
+            split_seed=args.split_seed,
+            episode_indices=args.episode_indices,
+            exclude_episode_indices=args.exclude_episode_indices,
+            max_episodes=args.max_episodes,
+        )
+        logging.info(
+            "Selected %d/%d annotation episodes for split=%s val_ratio=%.3f split_seed=%d -> %s.",
+            len(sorted_episode_items),
+            len(episode_to_annotations),
+            split_name,
+            args.val_ratio,
+            args.split_seed,
+            output_dir,
+        )
+        _export_split(
+            split_name=split_name,
+            output_dir=output_dir,
+            sorted_episode_items=sorted_episode_items,
+            args=args,
+            raw_dataset=raw_dataset,
+            export_dataset=export_dataset,
+            episode_to_indices=episode_to_indices,
+            hl_config=hl_config,
+            elapsed_start_time=split_start_time,
+        )
+
+    logging.info("HL export complete for %d output target(s) in %.1fs", len(export_targets), time.perf_counter() - start_time)
+
+
+def _export_split(
+    *,
+    split_name: str,
+    output_dir: pathlib.Path,
+    sorted_episode_items: list[tuple[int, list[Any]]],
+    args: ExportArgs,
+    raw_dataset: Any,
+    export_dataset: data_loader.Dataset,
+    episode_to_indices: dict[int, list[int]],
+    hl_config: HLMemoryConfig,
+    elapsed_start_time: float,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "frames").mkdir(exist_ok=True)
+    frame_cache: dict[int, str] = {}
+    samples: list[ExportedHLMemorySample] = []
     skipped_episodes: list[int] = []
-    episode_progress = tqdm(sorted_episode_items, desc="HL export episodes", dynamic_ncols=True, unit="episode")
+    episode_progress = tqdm(sorted_episode_items, desc=f"HL export {split_name}", dynamic_ncols=True, unit="episode")
     for episode_offset, (episode_index, episode_annotations) in enumerate(episode_progress, start=1):
         if episode_index not in episode_to_indices:
             message = _format_missing_episode_error(
@@ -136,7 +192,7 @@ def main(args: ExportArgs) -> None:
                 episode_annotations=episode_annotations,
                 global_indices=episode_to_indices[episode_index],
                 dataset=export_dataset,
-                output_dir=args.output_dir,
+                output_dir=output_dir,
                 frame_cache=frame_cache,
                 hl_config=hl_config,
             )
@@ -145,23 +201,30 @@ def main(args: ExportArgs) -> None:
     if skipped_episodes:
         logging.warning("Skipped %d annotation episodes missing from dataset: %s", len(skipped_episodes), skipped_episodes[:20])
 
-    _write_jsonl(args.output_dir / "samples.jsonl", [sample.to_dict() for sample in samples])
+    _write_jsonl(output_dir / "samples.jsonl", [sample.to_dict() for sample in samples])
     metadata = {
         "schema_version": "hl_memory_v1",
         "source_config_name": args.source_config_name,
         "annotations_jsonl": str(args.annotations_jsonl),
         "visual_mode": args.visual_mode,
+        "episode_split": split_name,
+        "val_ratio": args.val_ratio,
+        "split_seed": args.split_seed,
+        "episode_indices": args.episode_indices,
+        "exclude_episode_indices": args.exclude_episode_indices,
+        "max_episodes": args.max_episodes,
+        "selected_episode_indices": [episode_index for episode_index, _ in sorted_episode_items],
         "num_samples": len(samples),
         "skipped_missing_episode_indices": skipped_episodes,
         "hl_memory_config": dataclasses.asdict(hl_config),
     }
-    (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
     logging.info(
         "Exported %d HL memory samples and %d unique frames to %s in %.1fs",
         len(samples),
         len(frame_cache),
-        args.output_dir,
-        time.perf_counter() - start_time,
+        output_dir,
+        time.perf_counter() - elapsed_start_time,
     )
 
 
@@ -177,6 +240,30 @@ def _resolve_hl_visual_config(config: Any, *, visual_mode: str) -> Any:
         logging.info("HL export forcing raw visual mode for %s.", type(data_factory).__name__)
         return dataclasses.replace(config, data=dataclasses.replace(data_factory, guidance_image_mode="raw"))
     return config
+
+
+def _resolve_export_targets(args: ExportArgs) -> list[tuple[str, pathlib.Path]]:
+    paired_mode = args.output_train_dir is not None or args.output_val_dir is not None
+    if paired_mode:
+        if args.output_dir is not None:
+            raise ValueError("Use either --output-dir or --output-train-dir/--output-val-dir, not both.")
+        if args.output_train_dir is None or args.output_val_dir is None:
+            raise ValueError("Paired export requires both --output-train-dir and --output-val-dir.")
+        if args.episode_split != "all":
+            raise ValueError("Paired export writes both train and val; leave --episode-split as all.")
+        return [
+            ("train", args.output_train_dir),
+            ("val", args.output_val_dir),
+        ]
+
+    if args.output_dir is None:
+        raise ValueError("Set --output-dir, or set both --output-train-dir and --output-val-dir.")
+    return [(args.episode_split, args.output_dir)]
+
+
+def _validate_output_dir(output_dir: pathlib.Path, *, overwrite: bool) -> None:
+    if output_dir.exists() and any(output_dir.iterdir()) and not overwrite:
+        raise FileExistsError(f"{output_dir} already exists and is not empty. Use --overwrite to replace it.")
 
 
 def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loader.Dataset:
@@ -417,6 +504,76 @@ def _group_annotations_by_episode(annotations: list[Any]) -> dict[int, list[Any]
     for annotation in annotations:
         grouped[annotation.episode_index].append(annotation)
     return dict(grouped)
+
+
+def _filter_episode_items(
+    episode_items: list[tuple[int, list[Any]]],
+    *,
+    episode_split: str,
+    val_ratio: float,
+    split_seed: int,
+    episode_indices: str | None,
+    exclude_episode_indices: str | None,
+    max_episodes: int | None,
+) -> list[tuple[int, list[Any]]]:
+    if not 0.0 <= val_ratio < 1.0:
+        raise ValueError(f"--val-ratio must be in [0, 1), got {val_ratio}")
+    if max_episodes is not None and max_episodes < 1:
+        raise ValueError(f"--max-episodes must be >= 1, got {max_episodes}")
+
+    include = _parse_episode_index_spec(episode_indices)
+    exclude = _parse_episode_index_spec(exclude_episode_indices) or set()
+    filtered = [(episode_index, annotations) for episode_index, annotations in episode_items if episode_index not in exclude]
+    if include is not None:
+        filtered = [(episode_index, annotations) for episode_index, annotations in filtered if episode_index in include]
+
+    if episode_split != "all":
+        val_indices = _deterministic_val_episode_indices(
+            [episode_index for episode_index, _ in filtered],
+            val_ratio=val_ratio,
+            split_seed=split_seed,
+        )
+        if episode_split == "val":
+            filtered = [(episode_index, annotations) for episode_index, annotations in filtered if episode_index in val_indices]
+        elif episode_split == "train":
+            filtered = [(episode_index, annotations) for episode_index, annotations in filtered if episode_index not in val_indices]
+        else:
+            raise ValueError(f"Unsupported --episode-split: {episode_split}")
+
+    if max_episodes is not None:
+        filtered = filtered[:max_episodes]
+    return filtered
+
+
+def _deterministic_val_episode_indices(episode_indices: list[int], *, val_ratio: float, split_seed: int) -> set[int]:
+    if not episode_indices or val_ratio <= 0.0:
+        return set()
+    rng = np.random.default_rng(split_seed)
+    shuffled = np.asarray(sorted(episode_indices), dtype=np.int64)
+    rng.shuffle(shuffled)
+    val_count = max(1, int(round(len(shuffled) * val_ratio)))
+    val_count = min(val_count, len(shuffled))
+    return set(int(value) for value in shuffled[:val_count].tolist())
+
+
+def _parse_episode_index_spec(value: str | None) -> set[int] | None:
+    if value is None or not value.strip():
+        return None
+    result: set[int] = set()
+    for chunk in value.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            start_text, end_text = chunk.split("-", maxsplit=1)
+            start = int(start_text)
+            end = int(end_text)
+            if end < start:
+                raise ValueError(f"Invalid episode range {chunk!r}: end < start")
+            result.update(range(start, end + 1))
+        else:
+            result.add(int(chunk))
+    return result
 
 
 @dataclasses.dataclass(frozen=True)
