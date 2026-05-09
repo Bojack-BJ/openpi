@@ -45,7 +45,7 @@ class TrainArgs:
 
 
 def main(args: TrainArgs) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     samples = load_exported_samples(args.dataset_dir)
     if not samples:
         raise ValueError(f"No exported HL memory samples found in {args.dataset_dir}.")

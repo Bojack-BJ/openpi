@@ -54,7 +54,7 @@ class ExportArgs:
 
 
 def main(args: ExportArgs) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
     if args.output_dir.exists() and any(args.output_dir.iterdir()) and not args.overwrite:
         raise FileExistsError(f"{args.output_dir} already exists and is not empty. Use --overwrite to replace it.")
     args.output_dir.mkdir(parents=True, exist_ok=True)

@@ -18,11 +18,12 @@ def compose_observation_frame(
 ) -> Image.Image:
     ordered_images = [images[key] for key in sorted(images)[:max_images]]
     pil_images = [_to_pil_image(image) for image in ordered_images]
+    columns = min(2, max(len(pil_images), 1))
     return _compose_grid(
         pil_images,
         cell_height=frame_height,
         cell_width=frame_width,
-        columns=2,
+        columns=columns,
         gap=8,
     )
 
