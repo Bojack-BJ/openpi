@@ -15,6 +15,7 @@ import datasets
 from datasets import load_dataset
 import numpy as np
 from PIL import Image
+import pyarrow.parquet as pq
 import torch
 import tyro
 
@@ -42,6 +43,7 @@ class ExportArgs:
     annotations_jsonl: pathlib.Path
     output_dir: pathlib.Path
     visual_mode: Literal["raw", "config"] = "raw"
+    missing_episode_policy: Literal["error", "skip"] = "error"
     recent_frames_length: int = 8
     frame_subsample: int = 5
     memory_length: int = 8
@@ -98,9 +100,20 @@ def main(args: ExportArgs) -> None:
     )
 
     sorted_episode_items = sorted(episode_to_annotations.items())
+    skipped_episodes: list[int] = []
     for episode_offset, (episode_index, episode_annotations) in enumerate(sorted_episode_items, start=1):
         if episode_index not in episode_to_indices:
-            raise ValueError(f"Episode {episode_index} was not found in dataset {args.source_config_name}.")
+            message = _format_missing_episode_error(
+                episode_index,
+                source_config_name=args.source_config_name,
+                available_episode_indices=episode_to_indices.keys(),
+                dataset=_unwrap_base_dataset(raw_dataset),
+            )
+            if args.missing_episode_policy == "skip":
+                skipped_episodes.append(episode_index)
+                logging.warning("%s Skipping because missing_episode_policy=skip.", message)
+                continue
+            raise ValueError(message)
         logging.info(
             "Exporting episode %d/%d: episode_index=%d annotations=%d frames=%d cached_frames=%d",
             episode_offset,
@@ -122,6 +135,9 @@ def main(args: ExportArgs) -> None:
             )
         )
 
+    if skipped_episodes:
+        logging.warning("Skipped %d annotation episodes missing from dataset: %s", len(skipped_episodes), skipped_episodes[:20])
+
     _write_jsonl(args.output_dir / "samples.jsonl", [sample.to_dict() for sample in samples])
     metadata = {
         "schema_version": "hl_memory_v1",
@@ -129,6 +145,7 @@ def main(args: ExportArgs) -> None:
         "annotations_jsonl": str(args.annotations_jsonl),
         "visual_mode": args.visual_mode,
         "num_samples": len(samples),
+        "skipped_missing_episode_indices": skipped_episodes,
         "hl_memory_config": dataclasses.asdict(hl_config),
     }
     (args.output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
@@ -165,11 +182,16 @@ def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loa
     dataset_meta = openpi_lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset_root = openpi_lerobot_dataset.HF_LEROBOT_HOME / repo_id
     selected_columns = _resolve_hl_export_columns(data_config, dataset_meta)
+    parquet_files = sorted((dataset_root / "data").glob("**/*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found under {dataset_root / 'data'}")
     logging.info(
-        "Loading HL parquet dataset directly without LeRobot timestamp/delta checks; columns=%s",
+        "Loading HL parquet dataset directly without LeRobot timestamp/delta checks; root=%s parquet_files=%d columns=%s",
+        dataset_root,
+        len(parquet_files),
         ", ".join(selected_columns),
     )
-    hf_dataset = load_dataset("parquet", data_dir=str(dataset_root / "data"), split="train", columns=list(selected_columns))
+    hf_dataset = load_dataset("parquet", data_files=[str(path) for path in parquet_files], split="train", columns=list(selected_columns))
     dataset: data_loader.Dataset = _HLExportParquetDataset(repo_id=repo_id, root=dataset_root, hf_dataset=hf_dataset)
 
     if data_config.prompt_from_task:
@@ -330,6 +352,48 @@ def _build_episode_index_map(dataset: Any) -> dict[int, list[int]]:
     for global_index, episode_index in enumerate(episode_column.tolist()):
         grouped[int(episode_index)].append(global_index)
     return dict(grouped)
+
+
+def _format_missing_episode_error(
+    episode_index: int,
+    *,
+    source_config_name: str,
+    available_episode_indices: Any,
+    dataset: Any | None = None,
+) -> str:
+    available = sorted(int(index) for index in available_episode_indices)
+    if available:
+        available_summary = f"available_count={len(available)} range=[{available[0]}, {available[-1]}]"
+    else:
+        available_summary = "available_count=0"
+    file_summary = _inspect_episode_file(dataset, episode_index)
+    return (
+        f"Episode {episode_index} was not found in dataset {source_config_name} ({available_summary}). "
+        f"{file_summary} "
+        "This usually means annotations.jsonl was generated from raw session ordering or from a different LeRobot repo. "
+        "Regenerate annotations from the LeRobot sidecar with `scripts/export_hl_annotations_from_subtasks.py --repo-id ...`, "
+        "or pass `--missing-episode-policy skip` only if a partial export is intended."
+    )
+
+
+def _inspect_episode_file(dataset: Any | None, episode_index: int) -> str:
+    root = getattr(dataset, "root", None)
+    if root is None:
+        return "Could not inspect episode parquet files."
+    matches = sorted(pathlib.Path(root).glob(f"data/**/episode_{episode_index:06d}.parquet"))
+    if not matches:
+        return f"No parquet file named episode_{episode_index:06d}.parquet exists under {root / 'data'}."
+
+    summaries: list[str] = []
+    for path in matches[:3]:
+        try:
+            table = pq.read_table(path, columns=["episode_index"])
+            values = np.asarray(table.column("episode_index")).astype(int)
+            unique_values = sorted(set(values.tolist()))
+            summaries.append(f"{path}: episode_index_values={unique_values[:5]} rows={len(values)}")
+        except Exception as exc:  # pragma: no cover - diagnostic path.
+            summaries.append(f"{path}: could not read episode_index ({exc})")
+    return "Matching parquet file(s) exist, but their contents may not match: " + "; ".join(summaries)
 
 
 def _unwrap_base_dataset(dataset: Any) -> Any:
