@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -44,6 +45,7 @@ class BaseHLVLMAdapter:
         self.config = config
 
     def load(self, *, model_path: str | None = None, device: str | torch.device = "cpu") -> LoadedHLVLM:
+        started_at = time.perf_counter()
         transformers = _import_transformers()
         resolved_device = torch.device(device)
         torch_dtype = self._resolve_torch_dtype()
@@ -56,8 +58,13 @@ class BaseHLVLMAdapter:
             )
             torch_dtype = torch.float16
         pretrained_path = model_path or self.config.resolved_model_id
+        logging.info("[stage] loading processor from %s", pretrained_path)
         processor = transformers.AutoProcessor.from_pretrained(pretrained_path, trust_remote_code=True)
+        logging.info("[stage] processor loaded in %.1fs", time.perf_counter() - started_at)
+        model_started_at = time.perf_counter()
+        logging.info("[stage] loading model weights from %s dtype=%s", pretrained_path, torch_dtype)
         model = self._load_model(transformers, pretrained_path, torch_dtype=torch_dtype)
+        logging.info("[stage] model weights loaded in %.1fs", time.perf_counter() - model_started_at)
         if self._uses_parallel_model_loading():
             logging.info(
                 "Loaded HL VLM with parallel_mode=%s; skipping explicit model.to(%s).",
@@ -65,8 +72,13 @@ class BaseHLVLMAdapter:
                 device,
             )
         else:
+            move_started_at = time.perf_counter()
+            logging.info("[stage] moving model to %s", device)
             model.to(device)
+            logging.info("[stage] moved model to %s in %.1fs", device, time.perf_counter() - move_started_at)
+        logging.info("[stage] switching model to eval mode")
         model.eval()
+        logging.info("[stage] HL VLM load complete in %.1fs", time.perf_counter() - started_at)
         return LoadedHLVLM(processor=processor, model=model)
 
     def prepare_training_inputs(

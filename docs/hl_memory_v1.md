@@ -217,10 +217,18 @@ python scripts/eval_hl_memory_rollout.py \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --device cuda \
+  --frame-cache-size 512 \
   --output-json /root/Users/dataset/hl_memory/sponge_visual_guided/eval_metrics.json
 ```
 
 评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标是 subtask match、phase/target/goal accuracy、keyframe precision/recall、memory similarity/drift、event accuracy。
+
+Eval 会打印阶段日志并显示每种 ablation 的 tqdm 进度条：
+
+- `[stage] loading processor` / `[stage] loading model weights`：正在读取 processor 和 checkpoint。
+- `[stage] moving model to cuda`：正在把模型搬到 GPU；如果长时间停在这里，优先检查 GPU 显存、CUDA 初始化和 `--parallel-mode device_map`。
+- `HL eval <mode>`：已经进入逐 sample rollout；如果停在某个 sample，通常是该 sample 的视频 processor encode 或 `generate()` 慢。
+- `--frame-cache-size` 控制 resized frame LRU cache，默认 `512`；如果 eval 反复读取同一批帧且 CPU 内存足够，可以适当增大。
 
 ### 6. Video Inference
 
