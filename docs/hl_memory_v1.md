@@ -113,6 +113,7 @@ python scripts/export_hl_annotations_from_subtasks.py \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --progress-sample-stride 50 \
   --max-progress-samples-per-segment 4 \
+  --progress-min-gap 10 \
   --overwrite
 ```
 

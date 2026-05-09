@@ -89,6 +89,12 @@ def _parse_args() -> argparse.Namespace:
         help="Maximum number of progress annotations per segment, including the midpoint.",
     )
     parser.add_argument(
+        "--progress-min-gap",
+        type=int,
+        default=0,
+        help="Minimum frame distance between progress annotations inside the same segment. Use 0 to disable.",
+    )
+    parser.add_argument(
         "--empty-last-end-policy",
         choices=("skip", "use-start", "error"),
         default="skip",
@@ -331,6 +337,7 @@ def _segments_to_rows(
             end,
             stride=args.progress_sample_stride,
             max_samples=args.max_progress_samples_per_segment,
+            min_gap=args.progress_min_gap,
         ):
             rows.append(
                 _make_row(
@@ -356,7 +363,7 @@ def _segments_to_rows(
     return rows
 
 
-def _progress_sample_frames(start: int, end: int, *, stride: int, max_samples: int) -> list[int]:
+def _progress_sample_frames(start: int, end: int, *, stride: int, max_samples: int, min_gap: int = 0) -> list[int]:
     if end - start <= 1 or max_samples <= 0:
         return []
 
@@ -366,6 +373,7 @@ def _progress_sample_frames(start: int, end: int, *, stride: int, max_samples: i
         candidates.extend(range(start + stride, end, stride))
 
     unique = sorted({int(frame) for frame in candidates if start < int(frame) < end})
+    unique = _apply_progress_min_gap(unique, anchor=middle, min_gap=min_gap)
     if len(unique) <= max_samples:
         return unique
     if middle in unique:
@@ -373,6 +381,25 @@ def _progress_sample_frames(start: int, end: int, *, stride: int, max_samples: i
         budget = max_samples - 1
         return sorted([middle, *_evenly_spaced_subset(remaining, budget)])
     return _evenly_spaced_subset(unique, max_samples)
+
+
+def _apply_progress_min_gap(values: list[int], *, anchor: int, min_gap: int) -> list[int]:
+    if min_gap <= 0 or len(values) <= 1:
+        return values
+
+    selected: list[int] = []
+    if anchor in values:
+        selected.append(anchor)
+    for value in _prioritize_coverage(values, anchor=anchor):
+        if value == anchor:
+            continue
+        if all(abs(value - existing) >= min_gap for existing in selected):
+            selected.append(value)
+    return sorted(selected)
+
+
+def _prioritize_coverage(values: list[int], *, anchor: int) -> list[int]:
+    return sorted(values, key=lambda value: (-abs(value - anchor), value))
 
 
 def _evenly_spaced_subset(values: list[int], count: int) -> list[int]:
