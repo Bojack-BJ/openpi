@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image
 import pyarrow.parquet as pq
 import torch
+from tqdm.auto import tqdm
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
@@ -101,7 +102,8 @@ def main(args: ExportArgs) -> None:
 
     sorted_episode_items = sorted(episode_to_annotations.items())
     skipped_episodes: list[int] = []
-    for episode_offset, (episode_index, episode_annotations) in enumerate(sorted_episode_items, start=1):
+    episode_progress = tqdm(sorted_episode_items, desc="HL export episodes", dynamic_ncols=True, unit="episode")
+    for episode_offset, (episode_index, episode_annotations) in enumerate(episode_progress, start=1):
         if episode_index not in episode_to_indices:
             message = _format_missing_episode_error(
                 episode_index,
@@ -114,6 +116,11 @@ def main(args: ExportArgs) -> None:
                 logging.warning("%s Skipping because missing_episode_policy=skip.", message)
                 continue
             raise ValueError(message)
+        episode_progress.set_postfix(
+            episode=episode_index,
+            annotations=len(episode_annotations),
+            cached_frames=len(frame_cache),
+        )
         logging.info(
             "Exporting episode %d/%d: episode_index=%d annotations=%d frames=%d cached_frames=%d",
             episode_offset,

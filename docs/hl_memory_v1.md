@@ -163,6 +163,24 @@ python scripts/train_hl_memory.py \
   --save-interval 200
 ```
 
+多卡数据并行训练用 `torchrun`。每个 rank 独立采样 HL sample，同步梯度；只有 rank0 打印 tqdm/loss 和保存 checkpoint：
+
+```bash
+torchrun --standalone --nproc_per_node 4 scripts/train_hl_memory.py \
+  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
+  --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_2b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
+  --precision float16 \
+  --batch-size 1 \
+  --grad-accum-steps 4 \
+  --num-train-steps 1000 \
+  --save-interval 200
+```
+
+这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA 和 `s/it` / `it/s`。
+
 可用 backend / variant：
 
 - `--vlm-backend qwen2_5_vl`
@@ -173,8 +191,8 @@ Qwen3.5 建议：
 
 - 默认可用 `bfloat16`，GPU 不支持时 runtime 会降到 fp16。
 - vision `conv3d` / cuDNN 报错时先显式 `--precision float16`。
-- 27B 单卡 OOM 时用 `--parallel-mode device_map --device-map auto`。
-- 真 tensor parallel 用 `torchrun --nproc-per-node <n>` 加 `--parallel-mode tensor_parallel --tensor-parallel-plan auto`，不要和 `device_map` 混用。
+- 训练多卡 DDP 不要同时设置 `--parallel-mode device_map|tensor_parallel`。
+- 27B 单卡推理 OOM 时可用 `--parallel-mode device_map --device-map auto`；这是模型切分，不是数据并行训练。
 
 也可用 YAML：
 
