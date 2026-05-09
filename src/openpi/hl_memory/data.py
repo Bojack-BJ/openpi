@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections import OrderedDict
 from collections.abc import Iterable
 from collections.abc import Iterator
 import dataclasses
@@ -21,6 +22,28 @@ class LoadedVideoClips:
     recent_frames: tuple[Image.Image, ...]
     memory_valid_length: int
     recent_valid_length: int
+
+
+class FrameCache:
+    def __init__(self, max_items: int):
+        self._max_items = max(0, int(max_items))
+        self._items: OrderedDict[tuple[str, int, int], Image.Image] = OrderedDict()
+
+    def get_resized(self, path: pathlib.Path, *, frame_width: int, frame_height: int) -> Image.Image:
+        if self._max_items <= 0:
+            return _load_and_resize_rgb_image(path, frame_width=frame_width, frame_height=frame_height)
+        key = (str(path), int(frame_width), int(frame_height))
+        cached = self._items.get(key)
+        if cached is not None:
+            self._items.move_to_end(key)
+            return cached.copy()
+
+        image = _load_and_resize_rgb_image(path, frame_width=frame_width, frame_height=frame_height)
+        self._items[key] = image
+        self._items.move_to_end(key)
+        while len(self._items) > self._max_items:
+            self._items.popitem(last=False)
+        return image.copy()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -206,16 +229,28 @@ def load_video_clips_for_sample(
     sample: ExportedHLMemorySample,
     dataset_dir: pathlib.Path | str,
     config: HLMemoryConfig,
+    frame_cache: FrameCache | None = None,
 ) -> LoadedVideoClips:
     dataset_dir = pathlib.Path(dataset_dir)
-    memory_frames = [_load_rgb_image(path) for path in sample.resolve_memory_frame_paths(dataset_dir)]
-    recent_frames = [_load_rgb_image(path) for path in sample.resolve_recent_frame_paths(dataset_dir)]
+    if frame_cache is None:
+        memory_frames = [_load_rgb_image(path) for path in sample.resolve_memory_frame_paths(dataset_dir)]
+        recent_frames = [_load_rgb_image(path) for path in sample.resolve_recent_frame_paths(dataset_dir)]
+    else:
+        memory_frames = [
+            frame_cache.get_resized(path, frame_width=config.frame_width, frame_height=config.frame_height)
+            for path in sample.resolve_memory_frame_paths(dataset_dir)
+        ]
+        recent_frames = [
+            frame_cache.get_resized(path, frame_width=config.frame_width, frame_height=config.frame_height)
+            for path in sample.resolve_recent_frame_paths(dataset_dir)
+        ]
     return build_loaded_video_clips_from_frames(
         memory_frames,
         recent_frames,
         config=config,
         memory_valid_length=sample.memory_valid_length,
         recent_valid_length=sample.recent_valid_length,
+        already_resized=frame_cache is not None,
     )
 
 
@@ -227,6 +262,7 @@ def build_loaded_video_clips_from_frames(
     memory_valid_length: int | None = None,
     recent_valid_length: int | None = None,
     preserve_input_size: bool = False,
+    already_resized: bool = False,
 ) -> LoadedVideoClips:
     memory_frames = list(memory_frames)
     recent_frames = list(recent_frames)
@@ -255,6 +291,7 @@ def build_loaded_video_clips_from_frames(
         frame_width=frame_width,
         frame_height=frame_height,
         allow_single_frame_fallback=config.allow_single_frame_fallback,
+        already_resized=already_resized,
     )
     padded_recent_frames = _pad_clip_frames(
         recent_frames[:resolved_recent_valid_length],
@@ -262,6 +299,7 @@ def build_loaded_video_clips_from_frames(
         frame_width=frame_width,
         frame_height=frame_height,
         allow_single_frame_fallback=config.allow_single_frame_fallback,
+        already_resized=already_resized,
     )
     return LoadedVideoClips(
         memory_frames=tuple(padded_memory_frames),
@@ -276,6 +314,11 @@ def _load_rgb_image(path: pathlib.Path) -> Image.Image:
         return image.convert("RGB").copy()
 
 
+def _load_and_resize_rgb_image(path: pathlib.Path, *, frame_width: int, frame_height: int) -> Image.Image:
+    with Image.open(path) as image:
+        return _resize_with_pad(image.convert("RGB"), frame_width=frame_width, frame_height=frame_height)
+
+
 def _pad_clip_frames(
     frames: list[Image.Image],
     *,
@@ -283,13 +326,17 @@ def _pad_clip_frames(
     frame_width: int,
     frame_height: int,
     allow_single_frame_fallback: bool,
+    already_resized: bool = False,
 ) -> list[Image.Image]:
     if target_length <= 0:
         raise ValueError("target_length must be positive.")
-    normalized_frames = [
-        _resize_with_pad(frame, frame_width=frame_width, frame_height=frame_height)
-        for frame in frames[-target_length:]
-    ]
+    if already_resized:
+        normalized_frames = [frame.copy() for frame in frames[-target_length:]]
+    else:
+        normalized_frames = [
+            _resize_with_pad(frame, frame_width=frame_width, frame_height=frame_height)
+            for frame in frames[-target_length:]
+        ]
     if not allow_single_frame_fallback and len(normalized_frames) < target_length:
         raise ValueError(
             f"Expected at least {target_length} frames, but received {len(normalized_frames)} and "

@@ -175,11 +175,12 @@ torchrun --standalone --nproc_per_node 4 scripts/train_hl_memory.py \
   --precision float16 \
   --batch-size 1 \
   --grad-accum-steps 4 \
+  --frame-cache-size 4096 \
   --num-train-steps 1000 \
   --save-interval 200
 ```
 
-这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA 和 `s/it` / `it/s`。
+这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
 
 可用 backend / variant：
 
@@ -191,6 +192,7 @@ Qwen3.5 建议：
 
 - 默认可用 `bfloat16`，GPU 不支持时 runtime 会降到 fp16。
 - vision `conv3d` / cuDNN 报错时先显式 `--precision float16`。
+- 如果 `loss=nan`，优先在 A100/H100 等支持 bf16 的 GPU 上改用 `--precision bfloat16`；fp16 训练默认启用 GradScaler，但仍可能比 bf16 更容易数值溢出。
 - 训练多卡 DDP 不要同时设置 `--parallel-mode device_map|tensor_parallel`。
 - 27B 单卡推理 OOM 时可用 `--parallel-mode device_map --device-map auto`；这是模型切分，不是数据并行训练。
 
