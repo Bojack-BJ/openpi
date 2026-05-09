@@ -80,8 +80,6 @@ python scripts/export_hl_annotations_from_subtasks.py \
   --repo-id fastumi/sponge_visual_guided_xarm \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --instruction "Put the target object into the target slot" \
-  --target-query "target object" \
-  --goal-query "target slot" \
   --overwrite
 ```
 
@@ -111,6 +109,7 @@ python scripts/export_hl_annotations_from_subtasks.py \
 python scripts/export_hl_annotations_from_subtasks.py \
   --repo-id fastumi/sponge_visual_guided_xarm \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --instruction "Put the target object into the target slot" \
   --progress-sample-stride 50 \
   --max-progress-samples-per-segment 4 \
   --progress-min-gap 10 \
