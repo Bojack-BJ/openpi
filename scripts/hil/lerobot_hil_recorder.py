@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import pathlib
+import re
 import shutil
 from typing import Any
 
@@ -158,10 +159,9 @@ class SingleArmHilRecorder:
             if self.overwrite:
                 shutil.rmtree(self._dataset_root)
             else:
-                raise FileExistsError(
-                    f"HIL output dataset already exists: {self._dataset_root}. "
-                    "Use --hil_overwrite_dataset or choose a new --hil_output_repo_id."
-                )
+                self._dataset = self._open_existing_dataset(LeRobotDataset)
+                self._episode_index = self._infer_next_episode_index(self._dataset)
+                return self._dataset
 
         features: dict[str, dict[str, Any]] = {
             "observation.state": {"dtype": "float32", "shape": (8,), "names": STATE_NAMES_8},
@@ -185,6 +185,48 @@ class SingleArmHilRecorder:
             image_writer_threads=self.image_writer_threads,
         )
         return self._dataset
+
+    def _open_existing_dataset(self, dataset_cls: type[Any]):
+        """Open an existing local LeRobot dataset so each HIL save appends a new episode."""
+        kwargs: dict[str, Any] = {
+            "repo_id": self.repo_id,
+            "root": self._dataset_root,
+            "tolerance_s": 1e-4,
+        }
+        try:
+            return dataset_cls(**kwargs)
+        except TypeError:
+            kwargs.pop("tolerance_s", None)
+            try:
+                return dataset_cls(**kwargs)
+            except TypeError:
+                kwargs.pop("root", None)
+                return dataset_cls(**kwargs)
+
+    def _infer_next_episode_index(self, dataset: Any) -> int:
+        for attr in ("num_episodes", "n_episodes"):
+            value = getattr(dataset, attr, None)
+            if value is not None:
+                return int(value)
+
+        meta = getattr(dataset, "meta", None)
+        if meta is not None:
+            for attr in ("total_episodes", "num_episodes", "n_episodes"):
+                value = getattr(meta, attr, None)
+                if value is not None:
+                    return int(value)
+            episodes = getattr(meta, "episodes", None)
+            if episodes is not None:
+                return len(episodes)
+
+        if self._dataset_root is None:
+            return 0
+        max_episode = -1
+        for path in (self._dataset_root / "data").glob("chunk-*/episode_*.parquet"):
+            match = re.search(r"episode_(\d+)\.parquet$", path.name)
+            if match:
+                max_episode = max(max_episode, int(match.group(1)))
+        return max_episode + 1
 
     def _write_metadata_sidecar(self, episode_index: int, frames: list[HilFrame]) -> None:
         if self._dataset_root is None:

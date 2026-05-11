@@ -58,6 +58,7 @@ python scripts/pi0_rollout_client_xarm_rpy.py \
   --hil_slam_delta_frame world \
   --hil_require_umi_tcp_alignment \
   --hil_umi_tcp_alignment_threshold_deg 25 \
+  --hil_pose_debug \
   --hil_output_repo_id fastumi/sponge_visual_guided_xarm_hil \
   --hil_fps 20
 ```
@@ -70,7 +71,7 @@ python scripts/pi0_rollout_client_xarm_rpy.py \
 --camera_dev1 <camera_id>
 ```
 
-不要复用已有 `--hil_output_repo_id`，否则会报 dataset already exists。只有确认要覆盖时才加 `--hil_overwrite_dataset`。
+同一个任务可以复用同一个 `--hil_output_repo_id`。如果 dataset 已存在，`e` 每次保存都会 append 一个新 episode；只有确认要清空重建时才加 `--hil_overwrite_dataset`。
 
 ## 键盘控制
 
@@ -78,7 +79,7 @@ python scripts/pi0_rollout_client_xarm_rpy.py \
 - `s`：reset arm 到 init pose，丢弃当前 HIL buffer，暂停 inference。
 - `c`：继续 policy inference。
 - `t`：切换人工接管。第一次按会在下一帧锁定当前 UMI pose 和 xArm TCP 作为相对运动原点；再次按会结束接管并恢复 policy。开启 `--hil_require_umi_tcp_alignment` 后，如果 UMI orientation 和当前 TCP orientation 差距超过阈值，会持续打印误差并等待操作员调整，达标后自动开始接管。
-- `e`：把当前 buffer 保存为一个成功 LeRobot episode，然后清空 buffer 并暂停。
+- `e`：把当前 buffer append 为一个成功 LeRobot episode，然后清空 buffer 并暂停。
 - `x`：丢弃当前 buffer，不保存。
 
 ## 训练数据语义
@@ -91,6 +92,8 @@ HIL recorder 会把当前成功片段写成 LeRobot episode：
 - `observation.images.front`：224x224 RGB front image。
 - `subtask`：policy frame 为 `policy_success_candidate`，人工接管 frame 为 `hil_correction`。
 - `task`：来自 `--description`。
+
+如果 `$HF_LEROBOT_HOME/<hil_output_repo_id>` 已存在，recorder 会打开现有 dataset 并从下一个 episode index 继续写；不会要求每次换 repo。
 
 额外 sidecar 文件：
 
@@ -113,7 +116,7 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 
 - UMI 开机/初始化时先按固定姿态握持，让 raw SLAM world frame 和 robot base frame 只有确定的轴映射关系。
 - 用 `--hil_slam_axes` 把 raw SLAM xyz 映射到 robot/base xyz。常见 xArm base 约定是 `x` 向前、`y` 向左、`z` 向上，对应 UMI camera frame 可先试 `--hil_slam_axes z,-x,-y`。
-- 如果采用上面的开机标准姿态，建议先用 `--hil_slam_delta_frame world`，直接把 UMI 在 base 对齐坐标系里的位移加到 TCP；`local` 更适合希望 UMI 局部坐标跟随 TCP 起始姿态的相对控制。
+- 默认 `--hil_slam_delta_frame world`，会直接把 UMI 在 base 对齐坐标系里的位移加到 TCP，`--hil_slam_axes` 会明显改变运动方向。`local` 更适合希望 UMI 局部坐标跟随 TCP 起始姿态的相对控制；在 `local` 下，全局轴映射会被起始姿态的相对化抵消，改 `--hil_slam_axes` 可能看起来没有变化。
 - `--hil_slam_axes` 现在会同时作用于 UMI position 和 orientation；它必须是右手系映射，否则 orientation 变换没有物理意义，程序会拒绝启动。
 - 如果要让操作更直观，开启 `--hil_require_umi_tcp_alignment`。接管前先把 UMI 转到接近当前 TCP 的 orientation，再按 `t`；未达标时会持续打印 TCP pose、映射后的 UMI pose 和 orientation error，操作员继续调整，直到误差进入阈值后自动开始接管。
 - 轴方向一定要用小位移验证。若 TCP 运动方向反了，优先改 `--hil_slam_axes` 的符号或排列。
@@ -121,6 +124,7 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 ## UMI 数据处理
 
 - `UmiSlamReader` 订阅 UMI pose 和 clamp topic，callback 只保留最新一帧 pose/clamp；控制循环调用 `latest()` 时读取当前最新值。
+- UMI SLAM position 按米处理；robot state/action 也按米处理。xArm SDK 需要 mm 的转换只发生在最终下发 `_set_xarm_pose()` 时。
 - ROS subscriber 默认 `queue_size=1`，旧 SLAM 消息会被丢弃，避免高频 SLAM 在 ROS 层堆积造成控制延迟。
 - `latest()` 会检查 `--umi_pose_max_age_s` 和 `--umi_gripper_max_age_s`，超过阈值则不发 HIL command。
 - HIL action 日志默认按 `--hil_log_interval_s 0.5` 秒节流；如果设成 `0` 会每步打印，可能显著拖慢控制环。
@@ -136,14 +140,15 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 - `--hil_output_repo_id`：输出 LeRobot repo id。
 - `--hil_fps`：写入 LeRobot 的 fps。
 - `--hil_pre_takeover_drop`：开始接管时丢弃最近多少个 policy frames。
-- `--hil_max_delta_xyz`：单步 TCP 平移最大变化，安全限幅。
+- `--hil_max_delta_xyz`：从接管起点算的累计 TCP 平移范数上限，单位米；默认 `0.04` 表示总 correction 最多 4cm，`0` 表示不限制。
 - `--hil_max_delta_rpy_deg`：单步 RPY 最大变化，安全限幅。
 - `--hil_slam_axes`：UMI raw SLAM xyz 到 robot/base xyz 的右手系轴映射，例如 `z,-x,-y`。
-- `--hil_slam_delta_frame`：`local` 表示在 UMI 起始姿态局部系里解释位移，`world` 表示直接用世界系 delta。
+- `--hil_slam_delta_frame`：默认 `world`，直接用 base 对齐后的世界系 delta；`local` 表示在 UMI 起始姿态局部系里解释位移。
 - `--hil_slam_translation_scale`：UMI 平移缩放系数。
 - `--hil_require_umi_tcp_alignment`：开始接管前检查 UMI orientation 是否接近当前 TCP orientation。
 - `--hil_umi_tcp_alignment_threshold_deg`：UMI-TCP orientation 对齐角度阈值，默认 `25` 度。
 - `--hil_log_interval_s`：HIL 状态日志打印间隔，默认 `0.5` 秒；设为 `0` 表示每步打印。
+- `--hil_pose_debug`：打印 UMI raw delta、坐标映射后的 mapped delta、最终 command delta，单位均为米，用于排查坐标轴和比例问题。
 
 ## 安全检查
 
@@ -160,4 +165,4 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 - 等待 UMI 数据超时：检查 ROS 是否启动、topic 名是否包含正确 serial、pose 和 clamp topic 是否都有数据。
 - 运行中提示 stale data：UMI pose 或 clamp 数据延迟超过阈值；检查 ROS 负载/网络，必要时谨慎增大 max age。
 - 运动方向反了：优先调整 `--hil_slam_axes`，例如给某个轴加 `-`；再检查 `--hil_slam_delta_frame`。
-- dataset 已存在：换一个新的 `--hil_output_repo_id`，或确认后加 `--hil_overwrite_dataset`。
+- 想重新采集同名 dataset：确认后加 `--hil_overwrite_dataset`；默认行为是 append 新 episode。
