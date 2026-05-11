@@ -704,9 +704,9 @@ def main():
     parser.add_argument("--hil_fps", type=int, default=20, help="HIL LeRobot 数据集 fps")
     parser.add_argument("--hil_pre_takeover_drop", type=int, default=3, help="接管开始时丢弃最近 N 个 policy frames")
     parser.add_argument("--hil_max_delta_xyz", type=float, default=0, help="从接管起点算的累计 TCP 平移范数上限（米）；0 表示不限制")
-    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="从接管起点算的累计 TCP 旋转角上限（度）；0 表示不限制")
+    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=0.0, help="从接管起点算的累计 TCP 旋转角上限（度）；0 表示不限制")
     parser.add_argument("--hil_slam_axes", default="z,-x,-y", help="UMI raw SLAM xyz/rpy -> robot base xyz/rpy 的右手系轴映射，例如 z,-x,-y")
-    parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移到 TCP 平移的比例；UMI 与 TCP 均按米处理")
+    parser.add_argument("--hil_slam_translation_scale", type=float, default=1.1, help="UMI 平移到 TCP 平移的比例；UMI 与 TCP 均按米处理")
     parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="开始接管前要求映射后的 UMI orientation 接近当前 TCP orientation")
     parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
     parser.add_argument(
