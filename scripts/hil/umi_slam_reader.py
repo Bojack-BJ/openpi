@@ -29,12 +29,14 @@ class UmiSlamReader:
         max_gripper: float,
         pose_max_age_s: float = 0.25,
         gripper_max_age_s: float = 0.5,
+        queue_size: int = 1,
         node_name: str = "openpi_hil_umi_slam_reader",
     ) -> None:
         self._xv_serial = xv_serial
         self._max_gripper = float(max_gripper)
         self._pose_max_age_s = float(pose_max_age_s)
         self._gripper_max_age_s = float(gripper_max_age_s)
+        self._queue_size = max(1, int(queue_size))
         self._lock = threading.Lock()
         self._pose: tuple[float, float, np.ndarray, np.ndarray, float | None] | None = None
         self._gripper: tuple[float, float, float] | None = None
@@ -62,7 +64,7 @@ class UmiSlamReader:
             self.slam_topic,
             self._pose_msg_cls,
             self._slam_callback,
-            queue_size=100,
+            queue_size=self._queue_size,
             buff_size=2**20,
             tcp_nodelay=True,
         )
@@ -70,7 +72,7 @@ class UmiSlamReader:
             self.clamp_topic,
             rospy.AnyMsg,
             self._clamp_callback,
-            queue_size=100,
+            queue_size=self._queue_size,
             buff_size=2**20,
             tcp_nodelay=True,
         )

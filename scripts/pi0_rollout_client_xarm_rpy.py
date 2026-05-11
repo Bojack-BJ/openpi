@@ -672,6 +672,7 @@ def main():
     parser.add_argument("--umi_max_gripper", type=float, default=84.0, help="UMI clamp 原始值对应 open=1 的量程")
     parser.add_argument("--umi_pose_max_age_s", type=float, default=0.25, help="UMI SLAM pose 最大允许延迟")
     parser.add_argument("--umi_gripper_max_age_s", type=float, default=0.5, help="UMI clamp 最大允许延迟")
+    parser.add_argument("--umi_ros_queue_size", type=int, default=1, help="UMI ROS subscriber queue size；默认只保留最新消息以降低延迟")
     parser.add_argument("--hil_ready_timeout_s", type=float, default=10.0, help="启动时等待 UMI SLAM+clamp 首帧的超时时间")
     parser.add_argument("--hil_output_repo_id", default="fastumi/sponge_visual_guided_xarm_hil", help="HIL 成功 episode 写入的 LeRobot repo id")
     parser.add_argument("--hil_fps", type=int, default=20, help="HIL LeRobot 数据集 fps")
@@ -683,6 +684,7 @@ def main():
     parser.add_argument("--hil_slam_translation_scale", type=float, default=1.0, help="UMI 平移映射到机器人 TCP 的比例")
     parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="开始接管前要求映射后的 UMI orientation 接近当前 TCP orientation")
     parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
+    parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="HIL 状态日志最小打印间隔；0 表示每步都打印")
     parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
 
@@ -783,6 +785,7 @@ def main():
             max_gripper=args.umi_max_gripper,
             pose_max_age_s=args.umi_pose_max_age_s,
             gripper_max_age_s=args.umi_gripper_max_age_s,
+            queue_size=args.umi_ros_queue_size,
         )
         print(
             f"[HIL] 订阅 UMI SLAM: {umi_reader.slam_topic}；夹爪: {umi_reader.clamp_topic}；"
@@ -853,6 +856,7 @@ def main():
         hil_takeover_id = 0
         pending_takeover_start = False
         last_policy_action_7d = None
+        last_hil_log_time = 0.0
         while True:
             ch = _stdin_read_char_nonblocking()
             if ch in ("s", "S"):
@@ -948,16 +952,32 @@ def main():
                                 robot_tcp_euler_xyz_rad=np.deg2rad(np.asarray(cur_rpy_single, dtype=np.float64)),
                                 umi_quat_xyzw=umi_sample.quat_xyzw,
                             )
+                            mapped_umi_pos, mapped_umi_rot = hil_mapper.map_umi_pose(
+                                position_xyz_m=umi_sample.position_xyz_m,
+                                quat_xyzw=umi_sample.quat_xyzw,
+                            )
                             if alignment_error_deg > args.hil_umi_tcp_alignment_threshold_deg:
-                                print(
-                                    "[HIL][WARN] UMI-TCP orientation 未对齐，拒绝开始接管："
-                                    f"error={alignment_error_deg:.1f}deg > "
-                                    f"{args.hil_umi_tcp_alignment_threshold_deg:.1f}deg；"
-                                    "请先旋转 UMI 接近当前 TCP 姿态后再按 t"
-                                )
-                                pending_takeover_start = False
+                                now = time.monotonic()
+                                if args.hil_log_interval_s <= 0.0 or now - last_hil_log_time >= args.hil_log_interval_s:
+                                    last_hil_log_time = now
+                                    print(
+                                        "[HIL][ALIGN] 等待 UMI-TCP orientation 对齐："
+                                        f"error={alignment_error_deg:.1f}deg > "
+                                        f"{args.hil_umi_tcp_alignment_threshold_deg:.1f}deg | "
+                                        f"tcp_pos={np.round(cur_pos_arr, 4).tolist()} "
+                                        f"tcp_rpy_deg={np.round(cur_rpy_single, 1).tolist()} | "
+                                        f"umi_pos_mapped={np.round(mapped_umi_pos, 4).tolist()} "
+                                        f"umi_rpy_mapped_deg={np.round(mapped_umi_rot.as_euler('xyz', degrees=True), 1).tolist()}"
+                                    )
+                                pending_takeover_start = True
                                 paused = True
+                                time.sleep(min(max(args.dt, 0.0), 0.02))
                                 continue
+                            print(
+                                "[HIL][ALIGN] UMI-TCP orientation 已对齐："
+                                f"error={alignment_error_deg:.1f}deg <= "
+                                f"{args.hil_umi_tcp_alignment_threshold_deg:.1f}deg"
+                            )
                         hil_takeover_id += 1
                         hil_mapper.begin(
                             robot_tcp_position_xyz_m=cur_pos_arr,
@@ -1012,7 +1032,10 @@ def main():
                             "[HIL][WARN] command 已限幅 "
                             f"translation={hil_target.translation_clamped} rotation={hil_target.rotation_clamped}"
                         )
-                    print(f"[HIL] takeover={hil_takeover_id} action:", action)
+                    now = time.monotonic()
+                    if args.hil_log_interval_s <= 0.0 or now - last_hil_log_time >= args.hil_log_interval_s:
+                        last_hil_log_time = now
+                        print(f"[HIL] takeover={hil_takeover_id} action:", action)
                     if args.enable_interp:
                         interp_and_move_one(
                             arms[single_arm],
