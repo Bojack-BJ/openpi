@@ -12,6 +12,9 @@ class RelativePoseTarget:
     euler_xyz_rad: np.ndarray
     translation_clamped: bool
     rotation_clamped: bool
+    raw_delta_xyz_m: np.ndarray
+    mapped_delta_xyz_m: np.ndarray
+    command_delta_xyz_m: np.ndarray
 
 
 def parse_signed_axes(spec: str) -> tuple[tuple[int, float], tuple[int, float], tuple[int, float]]:
@@ -81,6 +84,8 @@ class RelativePoseMapper:
         self._max_delta_rot_rad = np.deg2rad(float(max_delta_rpy_deg))
         self._robot_start_pos: np.ndarray | None = None
         self._robot_start_rot: R | None = None
+        self._umi_start_raw_pos: np.ndarray | None = None
+        self._umi_start_raw_rot: R | None = None
         self._umi_start_pos: np.ndarray | None = None
         self._umi_start_rot: R | None = None
 
@@ -94,6 +99,8 @@ class RelativePoseMapper:
     ) -> None:
         self._robot_start_pos = np.asarray(robot_tcp_position_xyz_m, dtype=np.float64)
         self._robot_start_rot = R.from_euler("xyz", np.asarray(robot_tcp_euler_xyz_rad, dtype=np.float64))
+        self._umi_start_raw_pos = np.asarray(umi_position_xyz_m, dtype=np.float64)
+        self._umi_start_raw_rot = R.from_quat(np.asarray(umi_quat_xyzw, dtype=np.float64))
         self._umi_start_pos, self._umi_start_rot = self.map_umi_pose(
             position_xyz_m=umi_position_xyz_m,
             quat_xyzw=umi_quat_xyzw,
@@ -102,12 +109,18 @@ class RelativePoseMapper:
     def reset(self) -> None:
         self._robot_start_pos = None
         self._robot_start_rot = None
+        self._umi_start_raw_pos = None
+        self._umi_start_raw_rot = None
         self._umi_start_pos = None
         self._umi_start_rot = None
 
     @property
     def active(self) -> bool:
         return self._robot_start_pos is not None
+
+    @property
+    def frame_matrix(self) -> np.ndarray:
+        return self._frame_matrix.copy()
 
     def map_umi_pose(self, *, position_xyz_m: np.ndarray, quat_xyzw: np.ndarray) -> tuple[np.ndarray, R]:
         """Map raw UMI SLAM pose into the configured robot/base-aligned frame."""
@@ -130,14 +143,20 @@ class RelativePoseMapper:
         if (
             self._robot_start_pos is None
             or self._robot_start_rot is None
+            or self._umi_start_raw_pos is None
+            or self._umi_start_raw_rot is None
             or self._umi_start_pos is None
             or self._umi_start_rot is None
         ):
             raise RuntimeError("RelativePoseMapper.begin() must be called before target().")
 
-        umi_pos, umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
+        raw_umi_pos = np.asarray(umi_position_xyz_m, dtype=np.float64)
+        raw_umi_rot = R.from_quat(np.asarray(umi_quat_xyzw, dtype=np.float64))
+        raw_delta_xyz = raw_umi_pos - self._umi_start_raw_pos
+        umi_pos, _umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
 
-        delta_xyz = umi_pos - self._umi_start_pos
+        mapped_delta_xyz = umi_pos - self._umi_start_pos
+        delta_xyz = mapped_delta_xyz.copy()
         if self._delta_frame == "local":
             delta_xyz = self._umi_start_rot.inv().apply(delta_xyz)
         delta_xyz = delta_xyz * self._translation_scale
@@ -153,7 +172,8 @@ class RelativePoseMapper:
         else:
             target_pos = self._robot_start_pos + delta_xyz
 
-        delta_rot = self._umi_start_rot.inv() * umi_rot
+        raw_delta_rot = self._umi_start_raw_rot.inv() * raw_umi_rot
+        delta_rot = self._frame_rot * raw_delta_rot * self._frame_rot.inv()
         delta_rotvec = delta_rot.as_rotvec()
         rotation_clamped = False
         rot_norm = float(np.linalg.norm(delta_rotvec))
@@ -168,4 +188,7 @@ class RelativePoseMapper:
             euler_xyz_rad=np.asarray(target_rot.as_euler("xyz"), dtype=np.float64),
             translation_clamped=translation_clamped,
             rotation_clamped=rotation_clamped,
+            raw_delta_xyz_m=np.asarray(raw_delta_xyz, dtype=np.float64),
+            mapped_delta_xyz_m=np.asarray(mapped_delta_xyz, dtype=np.float64),
+            command_delta_xyz_m=np.asarray(target_pos - self._robot_start_pos, dtype=np.float64),
         )
