@@ -53,6 +53,8 @@ DEV = 1
 W, H, FPS = 1280, 1280, 100
 
 MASK_OVERLAY_KEY = "__mask_overlay"
+HIL_GRIPPER_UPDATE_INTERVAL_S = 0.1
+HIL_GRIPPER_UPDATE_THRESHOLD = 0.02
 
 
 def init_yu12_camera(dev: int):
@@ -474,6 +476,30 @@ def _set_xarm_pose(
     )
 
 
+def _set_xarm_control_mode(bestman: Bestman_Real_Xarm6, mode: int) -> None:
+    """Switch xArm control mode. mode=0 is normal position mode, mode=1 is servo mode."""
+    robot = bestman.robot
+    if hasattr(robot, "motion_enable"):
+        try:
+            robot.motion_enable(enable=True)
+        except TypeError:
+            robot.motion_enable(True)
+    robot.set_mode(mode)
+    robot.set_state(0)
+    time.sleep(0.05)
+
+
+def _set_xarm_servo_pose(bestman: Bestman_Real_Xarm6, pos_m, rpy_deg) -> None:
+    """Send one non-blocking Cartesian servo target; position is meters, RPY is degrees."""
+    x_m, y_m, z_m = [float(v) for v in pos_m]
+    roll, pitch, yaw = [float(v) for v in rpy_deg]
+    pose = [x_m * 1000.0, y_m * 1000.0, z_m * 1000.0, roll, pitch, yaw]
+    try:
+        bestman.robot.set_servo_cartesian(pose, is_radian=False)
+    except TypeError:
+        bestman.robot.set_servo_cartesian(pose)
+
+
 def _set_xarm_gripper(
     bestman: Bestman_Real_Xarm6,
     g_open: float,
@@ -683,6 +709,12 @@ def main():
     parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移到 TCP 平移的比例；UMI 与 TCP 均按米处理")
     parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="开始接管前要求映射后的 UMI orientation 接近当前 TCP orientation")
     parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
+    parser.add_argument(
+        "--hil_xarm_control_mode",
+        choices=("servo", "position"),
+        default="servo",
+        help="HIL 接管期间的 xArm 下发模式：servo 使用 set_servo_cartesian；position 回退到 set_position(wait=True)",
+    )
     parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="HIL 状态日志最小打印间隔；0 表示每步都打印")
     parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
@@ -718,6 +750,8 @@ def main():
     if is_dual or single_arm == "robot_1":
         arms["robot_1"] = Bestman_Real_Xarm6(args.robot_ip_2, None, None)
 
+    hil_xarm_mode_state = {"servo": False}
+
     def reset_active_arms() -> None:
         if is_dual:
             reset_arms_to_init(arms["robot_0"], arms["robot_1"], init_pos0, init_rpy0, init_pos1, init_rpy1)
@@ -725,6 +759,31 @@ def main():
         assert single_arm is not None
         init_pos, init_rpy = init_by_arm[single_arm]
         reset_arm_to_init(arms[single_arm], init_pos, init_rpy, arm_index=single_arm_index)
+
+    def enter_hil_xarm_mode() -> None:
+        if not args.hil_correction or args.hil_xarm_control_mode != "servo":
+            return
+        if hil_xarm_mode_state["servo"]:
+            return
+        assert single_arm is not None
+        _set_xarm_control_mode(arms[single_arm], 1)
+        hil_xarm_mode_state["servo"] = True
+        print("[HIL] xArm servo cartesian mode 已启用")
+
+    def exit_hil_xarm_mode() -> None:
+        if not args.hil_correction or args.hil_xarm_control_mode != "servo":
+            return
+        if not hil_xarm_mode_state["servo"]:
+            return
+        assert single_arm is not None
+        try:
+            _set_xarm_control_mode(arms[single_arm], 0)
+        except Exception as exc:
+            print(f"[HIL][WARN] xArm 恢复 position mode 失败：{exc}")
+        else:
+            print("[HIL] xArm 已恢复 position mode")
+        finally:
+            hil_xarm_mode_state["servo"] = False
 
     if not args.skip_init_move:
         if is_dual:
@@ -809,7 +868,8 @@ def main():
             "接管期间使用 UMI SLAM 相对位姿映射到当前 xArm TCP；"
             f"slam_axes={args.hil_slam_axes}；"
             f"translation_scale={args.hil_slam_translation_scale}；"
-            f"umi_tcp_alignment={'on' if args.hil_require_umi_tcp_alignment else 'off'}"
+            f"umi_tcp_alignment={'on' if args.hil_require_umi_tcp_alignment else 'off'}；"
+            f"xarm_control_mode={args.hil_xarm_control_mode}"
         )
 
     input("按 Enter 开始")
@@ -855,9 +915,13 @@ def main():
         pending_takeover_start = False
         last_policy_action_7d = None
         last_hil_log_time = 0.0
+        last_hil_gripper_update_time = 0.0
+        last_hil_gripper_open = None
+        last_hil_command_time = 0.0
         while True:
             ch = _stdin_read_char_nonblocking()
             if ch in ("s", "S"):
+                exit_hil_xarm_mode()
                 reset_active_arms()
                 if hil_recorder is not None:
                     discarded = hil_recorder.discard_episode()
@@ -874,6 +938,7 @@ def main():
                 paused = False
                 print("[INFO] 继续推理")
             if args.hil_correction and ch in ("e", "E"):
+                exit_hil_xarm_mode()
                 if hil_recorder is not None and hil_recorder.has_frames():
                     saved = hil_recorder.save_episode()
                     print(f"[HIL] 已保存成功 episode：{saved} 帧 -> {args.hil_output_repo_id}")
@@ -887,6 +952,7 @@ def main():
                 print("[INFO] 推理已暂停；按 c 继续下一条 episode")
                 continue
             if args.hil_correction and ch in ("x", "X"):
+                exit_hil_xarm_mode()
                 if hil_recorder is not None:
                     discarded = hil_recorder.discard_episode()
                     print(f"[HIL] 已丢弃当前 episode：{discarded} 帧")
@@ -899,6 +965,7 @@ def main():
                 continue
             if args.hil_correction and ch in ("t", "T"):
                 if hil_takeover_active:
+                    exit_hil_xarm_mode()
                     hil_takeover_active = False
                     if hil_mapper is not None:
                         hil_mapper.reset()
@@ -986,6 +1053,10 @@ def main():
                         hil_takeover_active = True
                         pending_takeover_start = False
                         paused = False
+                        enter_hil_xarm_mode()
+                        last_hil_gripper_update_time = 0.0
+                        last_hil_gripper_open = None
+                        last_hil_command_time = 0.0
                         dropped = hil_recorder.drop_recent_policy_frames(args.hil_pre_takeover_drop) if hil_recorder else 0
                         print(f"[HIL] 开始接管 takeover_id={hil_takeover_id}；已丢弃最近 policy 帧 {dropped} 条")
 
@@ -1034,7 +1105,23 @@ def main():
                     if args.hil_log_interval_s <= 0.0 or now - last_hil_log_time >= args.hil_log_interval_s:
                         last_hil_log_time = now
                         print(f"[HIL] takeover={hil_takeover_id} action:", action)
-                    if args.enable_interp:
+                    if args.hil_xarm_control_mode == "servo":
+                        if last_hil_command_time > 0.0:
+                            sleep_s = max(args.dt, 0.0) - (time.monotonic() - last_hil_command_time)
+                            if sleep_s > 0.0:
+                                time.sleep(sleep_s)
+                        now = time.monotonic()
+                        _set_xarm_servo_pose(arms[single_arm], hil_target.position_xyz_m.tolist(), target_rpy_deg.tolist())
+                        if (
+                            last_hil_gripper_open is None
+                            or abs(gripper_open - last_hil_gripper_open) >= HIL_GRIPPER_UPDATE_THRESHOLD
+                            or now - last_hil_gripper_update_time >= HIL_GRIPPER_UPDATE_INTERVAL_S
+                        ):
+                            _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
+                            last_hil_gripper_open = gripper_open
+                            last_hil_gripper_update_time = now
+                        last_hil_command_time = now
+                    elif args.enable_interp:
                         interp_and_move_one(
                             arms[single_arm],
                             cur_pos_single,
@@ -1108,6 +1195,7 @@ def main():
             for step_idx, action in enumerate(action_slice, start=lo):
                 step_ch = _stdin_read_char_nonblocking()
                 if step_ch in ("s", "S"):
+                    exit_hil_xarm_mode()
                     reset_active_arms()
                     if hil_recorder is not None:
                         discarded = hil_recorder.discard_episode()
@@ -1125,6 +1213,7 @@ def main():
                     print("[HIL] 请求开始人工接管；中断当前 policy chunk")
                     break
                 if args.hil_correction and step_ch in ("e", "E"):
+                    exit_hil_xarm_mode()
                     if hil_recorder is not None and hil_recorder.has_frames():
                         saved = hil_recorder.save_episode()
                         print(f"[HIL] 已保存成功 episode：{saved} 帧 -> {args.hil_output_repo_id}")
@@ -1138,6 +1227,7 @@ def main():
                     print("[INFO] 推理已暂停；按 c 继续下一条 episode")
                     break
                 if args.hil_correction and step_ch in ("x", "X"):
+                    exit_hil_xarm_mode()
                     if hil_recorder is not None:
                         discarded = hil_recorder.discard_episode()
                         print(f"[HIL] 已丢弃当前 episode：{discarded} 帧")
@@ -1264,6 +1354,7 @@ def main():
     finally:
         if old_term is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+        exit_hil_xarm_mode()
         if hil_recorder is not None:
             if hil_recorder.has_frames():
                 discarded = hil_recorder.discard_episode()

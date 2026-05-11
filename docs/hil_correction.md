@@ -125,6 +125,8 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 - UMI SLAM position 按米处理；robot state/action 也按米处理。xArm SDK 需要 mm 的转换只发生在最终下发 `_set_xarm_pose()` 时。
 - ROS subscriber 默认 `queue_size=1`，旧 SLAM 消息会被丢弃，避免高频 SLAM 在 ROS 层堆积造成控制延迟。
 - `latest()` 会检查 `--umi_pose_max_age_s` 和 `--umi_gripper_max_age_s`，超过阈值则不发 HIL command。
+- HIL 接管默认使用 `--hil_xarm_control_mode servo`：开始接管时切到 xArm `mode=1`，每步用 `set_servo_cartesian` 非阻塞下发 TCP pose，退出接管/复位/保存/丢弃/程序结束时切回 `mode=0`。如果 SDK 或机器人固件不支持，可用 `--hil_xarm_control_mode position` 回退到旧的 `set_position(wait=True)`。
+- `servo` 模式下 `--dt` 是 HIL command 最小下发间隔，默认 `0.025s`；夹爪命令按时间和开合变化量节流，避免每个 pose 都等待夹爪动作。
 - HIL action 日志默认按 `--hil_log_interval_s 0.5` 秒节流；如果设成 `0` 会每步打印，可能显著拖慢控制环。
 - 坐标系排查使用 `scripts/debug_umi_hil_pose.py`，主 rollout 不再暴露 pose debug 参数。
 - 当前 HIL command 仍会读机械臂状态、读 front 图像并记录 LeRobot frame；如果体感仍慢，下一步应把 takeover command loop 和 image recording 解耦，或降低 HIL 记录频率。
@@ -145,6 +147,7 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 - `--hil_slam_translation_scale`：UMI 平移到 TCP 平移的比例；UMI 与 TCP 均按米处理。
 - `--hil_require_umi_tcp_alignment`：开始接管前检查 UMI orientation 是否接近当前 TCP orientation。
 - `--hil_umi_tcp_alignment_threshold_deg`：UMI-TCP orientation 对齐角度阈值，默认 `25` 度。
+- `--hil_xarm_control_mode`：HIL 接管期间的 xArm 下发模式，默认 `servo`；`position` 是阻塞式回退。
 - `--hil_log_interval_s`：HIL 状态日志打印间隔，默认 `0.5` 秒；设为 `0` 表示每步打印。
 
 ## 安全检查
