@@ -493,11 +493,11 @@ def reset_arms_to_init(
     init_pos1,
     init_rpy_deg1,
 ) -> None:
-    _set_xarm_pose(bestman0, init_pos0, init_rpy_deg0, wait=False)
-    _set_xarm_pose(bestman1, init_pos1, init_rpy_deg1, wait=False)
+    _set_xarm_pose(bestman0, init_pos0, init_rpy_deg0, wait=True)
+    _set_xarm_pose(bestman1, init_pos1, init_rpy_deg1, wait=True)
     time.sleep(2.0)
-    _set_xarm_gripper(bestman0, 1.0, arm_index=0, wait=False)
-    _set_xarm_gripper(bestman1, 1.0, arm_index=1, wait=False)
+    _set_xarm_gripper(bestman0, 1.0, arm_index=0, wait=True)
+    _set_xarm_gripper(bestman1, 1.0, arm_index=1, wait=True)
 
 
 def reset_arm_to_init(
@@ -507,9 +507,9 @@ def reset_arm_to_init(
     *,
     arm_index: int,
 ) -> None:
-    _set_xarm_pose(bestman, init_pos, init_rpy_deg, wait=False)
+    _set_xarm_pose(bestman, init_pos, init_rpy_deg, wait=True)
     time.sleep(2.0)
-    _set_xarm_gripper(bestman, 1.0, arm_index=arm_index, wait=False)
+    _set_xarm_gripper(bestman, 1.0, arm_index=arm_index, wait=True)
 
 
 def interp_and_move_one(
@@ -541,10 +541,10 @@ def interp_and_move_one(
     rpy_arr = np.outer(1.0 - interp_ts, start_rpy_arr) + np.outer(interp_ts, target_rpy_arr)
 
     for idx in range(steps + 1):
-        _set_xarm_pose(bestman, pos_arr[idx], rpy_arr[idx], wait=False)
+        _set_xarm_pose(bestman, pos_arr[idx], rpy_arr[idx], wait=True)
         time.sleep(dt)
 
-    _set_xarm_gripper(bestman, g_open, arm_index=arm_index, wait=False)
+    _set_xarm_gripper(bestman, g_open, arm_index=arm_index, wait=True)
 
 
 def interp_and_move_both(
@@ -587,12 +587,12 @@ def interp_and_move_both(
     rpy1_arr = np.outer(1.0 - ts, r1s) + np.outer(ts, r1e)
 
     for idx in range(steps + 1):
-        _set_xarm_pose(bestman0, pos0_arr[idx], rpy0_arr[idx], wait=False)
-        _set_xarm_pose(bestman1, pos1_arr[idx], rpy1_arr[idx], wait=False)
+        _set_xarm_pose(bestman0, pos0_arr[idx], rpy0_arr[idx], wait=True)
+        _set_xarm_pose(bestman1, pos1_arr[idx], rpy1_arr[idx], wait=True)
         time.sleep(dt)
 
-    _set_xarm_gripper(bestman0, g0, arm_index=0, wait=False)
-    _set_xarm_gripper(bestman1, g1, arm_index=1, wait=False)
+    _set_xarm_gripper(bestman0, g0, arm_index=0, wait=True)
+    _set_xarm_gripper(bestman1, g1, arm_index=1, wait=True)
 
 
 def _slice_actions(actions_all: np.ndarray, start: int, end: int) -> tuple[int, np.ndarray] | None:
@@ -677,11 +677,11 @@ def main():
     parser.add_argument("--hil_output_repo_id", default="fastumi/sponge_visual_guided_xarm_hil", help="HIL 成功 episode 写入的 LeRobot repo id")
     parser.add_argument("--hil_fps", type=int, default=20, help="HIL LeRobot 数据集 fps")
     parser.add_argument("--hil_pre_takeover_drop", type=int, default=3, help="接管开始时丢弃最近 N 个 policy frames")
-    parser.add_argument("--hil_max_delta_xyz", type=float, default=0.04, help="每次接管允许 UMI 映射的最大平移范数（米）")
+    parser.add_argument("--hil_max_delta_xyz", type=float, default=0, help="每次接管允许 UMI 映射的最大平移范数（米）")
     parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="每次接管允许 UMI 映射的最大旋转角（度）")
-    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI raw SLAM xyz -> robot/base xyz 的右手系轴映射，例如 z,-x,-y")
+    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI raw SLAM xyz -> robot/base xyz 的右手系轴映射，例如 z,-y,x")
     parser.add_argument("--hil_slam_delta_frame", choices=("local", "world"), default="local", help="UMI 平移 delta 在 local 或 world 坐标中计算")
-    parser.add_argument("--hil_slam_translation_scale", type=float, default=1.0, help="UMI 平移映射到机器人 TCP 的比例")
+    parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移映射到机器人 TCP 的比例")
     parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="开始接管前要求映射后的 UMI orientation 接近当前 TCP orientation")
     parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
     parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="HIL 状态日志最小打印间隔；0 表示每步都打印")
@@ -1049,8 +1049,8 @@ def main():
                             dt=args.dt,
                         )
                     else:
-                        _set_xarm_pose(arms[single_arm], hil_target.position_xyz_m.tolist(), target_rpy_deg.tolist(), wait=False)
-                        _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
+                        _set_xarm_pose(arms[single_arm], hil_target.position_xyz_m.tolist(), target_rpy_deg.tolist(), wait=True)
+                        _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=True)
                     continue
 
             print("[INFO] 机器人状态：", state_vec)
@@ -1180,10 +1180,10 @@ def main():
                             dt=args.dt,
                         )
                     else:
-                        _set_xarm_pose(arms["robot_0"], target_pos0, target_rpy0, wait=False)
-                        _set_xarm_pose(arms["robot_1"], target_pos1, target_rpy1, wait=False)
-                        _set_xarm_gripper(arms["robot_0"], g0, arm_index=0, wait=False)
-                        _set_xarm_gripper(arms["robot_1"], g1, arm_index=1, wait=False)
+                        _set_xarm_pose(arms["robot_0"], target_pos0, target_rpy0, wait=True)
+                        _set_xarm_pose(arms["robot_1"], target_pos1, target_rpy1, wait=True)
+                        _set_xarm_gripper(arms["robot_0"], g0, arm_index=0, wait=True)
+                        _set_xarm_gripper(arms["robot_1"], g1, arm_index=1, wait=True)
                     cur_pos0, cur_rpy0 = target_pos0, target_rpy0
                     cur_pos1, cur_rpy1 = target_pos1, target_rpy1
                 else:
@@ -1225,8 +1225,8 @@ def main():
                             dt=args.dt,
                         )
                     else:
-                        _set_xarm_pose(arms[single_arm], target_pos, target_rpy, wait=False)
-                        _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
+                        _set_xarm_pose(arms[single_arm], target_pos, target_rpy, wait=True)
+                        _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=True)
                     cur_pos_single, cur_rpy_single = target_pos, target_rpy
 
                 if (
