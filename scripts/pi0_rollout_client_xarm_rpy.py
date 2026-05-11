@@ -1048,6 +1048,11 @@ def main():
                                 f"scale={args.hil_slam_translation_scale} "
                                 f"max_total={args.hil_max_delta_xyz}"
                             )
+                            print(
+                                "[HIL DEBUG] rotvec_deg "
+                                f"raw={np.round(np.rad2deg(hil_target.raw_delta_rotvec_rad), 1).tolist()} "
+                                f"mapped={np.round(np.rad2deg(hil_target.mapped_delta_rotvec_rad), 1).tolist()}"
+                            )
                     if args.enable_interp:
                         interp_and_move_one(
                             arms[single_arm],

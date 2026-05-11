@@ -15,6 +15,8 @@ class RelativePoseTarget:
     raw_delta_xyz_m: np.ndarray
     mapped_delta_xyz_m: np.ndarray
     command_delta_xyz_m: np.ndarray
+    raw_delta_rotvec_rad: np.ndarray
+    mapped_delta_rotvec_rad: np.ndarray
 
 
 def parse_signed_axes(spec: str) -> tuple[tuple[int, float], tuple[int, float], tuple[int, float]]:
@@ -126,7 +128,7 @@ class RelativePoseMapper:
         """Map raw UMI SLAM pose into the configured robot/base-aligned frame."""
         raw_pos = np.asarray(position_xyz_m, dtype=np.float64)
         raw_rot = R.from_quat(np.asarray(quat_xyzw, dtype=np.float64))
-        return self._frame_rot.apply(raw_pos), self._frame_rot * raw_rot
+        return self._frame_rot.apply(raw_pos), self._frame_rot * raw_rot * self._frame_rot.inv()
 
     def orientation_error_deg(
         self,
@@ -153,12 +155,13 @@ class RelativePoseMapper:
         raw_umi_pos = np.asarray(umi_position_xyz_m, dtype=np.float64)
         raw_umi_rot = R.from_quat(np.asarray(umi_quat_xyzw, dtype=np.float64))
         raw_delta_xyz = raw_umi_pos - self._umi_start_raw_pos
-        umi_pos, _umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
-
-        mapped_delta_xyz = umi_pos - self._umi_start_pos
-        delta_xyz = mapped_delta_xyz.copy()
         if self._delta_frame == "local":
-            delta_xyz = self._umi_start_rot.inv().apply(delta_xyz)
+            raw_delta_local_xyz = self._umi_start_raw_rot.inv().apply(raw_delta_xyz)
+            mapped_delta_xyz = self._frame_rot.apply(raw_delta_local_xyz)
+        else:
+            umi_pos, _umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
+            mapped_delta_xyz = umi_pos - self._umi_start_pos
+        delta_xyz = mapped_delta_xyz.copy()
         delta_xyz = delta_xyz * self._translation_scale
 
         translation_clamped = False
@@ -191,4 +194,6 @@ class RelativePoseMapper:
             raw_delta_xyz_m=np.asarray(raw_delta_xyz, dtype=np.float64),
             mapped_delta_xyz_m=np.asarray(mapped_delta_xyz, dtype=np.float64),
             command_delta_xyz_m=np.asarray(target_pos - self._robot_start_pos, dtype=np.float64),
+            raw_delta_rotvec_rad=np.asarray(raw_delta_rot.as_rotvec(), dtype=np.float64),
+            mapped_delta_rotvec_rad=np.asarray(delta_rot.as_rotvec(), dtype=np.float64),
         )
