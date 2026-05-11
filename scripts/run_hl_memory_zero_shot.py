@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import os
 import pathlib
 
+import numpy as np
+from PIL import Image
 import torch
 import tyro
 
@@ -47,6 +50,8 @@ class ZeroShotArgs:
     rollout_jsonl: pathlib.Path | None = None
     rollout_pretty_json: pathlib.Path | None = None
     debug_dir: pathlib.Path | None = None
+    embedding_debug_dir: pathlib.Path | None = None
+    embedding_debug_max_tokens: int = 160
     debug_video_fps: float = 1.0
 
     # Runtime memory and clip selection.
@@ -229,6 +234,19 @@ def _run_single_prediction(
         payload["debug_dir"] = str(args.debug_dir)
         payload["saved_keyframe_candidate_paths"] = [str(path) for path in saved_keyframes]
         payload["debug_panel_path"] = str(debug_panel_path)
+    if args.embedding_debug_dir is not None:
+        embedding_debug_dir = pathlib.Path(args.embedding_debug_dir)
+        embedding_payload = _save_embedding_debug(
+            embedding_debug_dir,
+            adapter=adapter,
+            loaded=loaded,
+            sample=sample,
+            clips=clips,
+            device=args.device,
+            max_tokens=args.embedding_debug_max_tokens,
+        )
+        payload["embedding_debug_dir"] = str(embedding_debug_dir)
+        payload["embedding_debug"] = embedding_payload
 
     return payload
 
@@ -325,6 +343,18 @@ def _run_rollout(
                 parse_error=generation.parse_error,
             )
             debug_panel_paths.append(debug_panel_path)
+        embedding_debug_payload = None
+        if args.embedding_debug_dir is not None:
+            step_embedding_dir = pathlib.Path(args.embedding_debug_dir) / f"rollout_step_{step_index:03d}"
+            embedding_debug_payload = _save_embedding_debug(
+                step_embedding_dir,
+                adapter=adapter,
+                loaded=loaded,
+                sample=sample,
+                clips=clips,
+                device=args.device,
+                max_tokens=args.embedding_debug_max_tokens,
+            )
 
         steps.append(
             {
@@ -346,6 +376,7 @@ def _run_rollout(
                 "debug_dir": None if step_debug_dir is None else str(step_debug_dir),
                 "debug_panel_path": None if debug_panel_path is None else str(debug_panel_path),
                 "saved_keyframe_candidate_paths": saved_keyframes,
+                "embedding_debug": embedding_debug_payload,
             }
         )
 
@@ -503,6 +534,188 @@ def _load_task_config(path: pathlib.Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError(f"Task config must be a JSON object: {path}")
     return data
+
+
+def _save_embedding_debug(
+    output_dir: pathlib.Path,
+    *,
+    adapter,
+    loaded,
+    sample,
+    clips,
+    device: str | torch.device,
+    max_tokens: int,
+) -> dict[str, object]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {"output_dir": str(output_dir)}
+    try:
+        inputs = adapter._encode_prompt_only(loaded.processor, sample, clips)  # pylint: disable=protected-access
+        input_device = adapter._resolve_input_device(loaded.model, device)  # pylint: disable=protected-access
+        tensor_inputs = {
+            key: value.to(input_device)
+            for key, value in inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+        input_ids = tensor_inputs["input_ids"]
+        tokens = _decode_input_tokens(tokenizer, input_ids[0].detach().cpu())
+        image_positions = _image_like_token_positions(tokens, input_ids[0].detach().cpu(), loaded.model)
+        text_positions = [index for index in range(len(tokens)) if index not in set(image_positions)]
+        _write_tokens_file(output_dir / "tokens.txt", tokens=tokens, image_positions=set(image_positions))
+        with torch.no_grad():
+            try:
+                outputs = loaded.model(
+                    **tensor_inputs,
+                    output_attentions=True,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+            except Exception as exc:
+                logging.warning("Attention debug forward with attentions failed; retrying hidden_states only: %s", exc)
+                outputs = loaded.model(
+                    **tensor_inputs,
+                    output_hidden_states=True,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                payload["attention_error"] = f"{type(exc).__name__}: {exc}"
+        hidden_states = getattr(outputs, "hidden_states", None)
+        attentions = getattr(outputs, "attentions", None)
+        payload["input_shapes"] = {
+            key: list(value.shape)
+            for key, value in tensor_inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        payload["num_tokens"] = len(tokens)
+        payload["num_image_like_tokens"] = len(image_positions)
+
+        if hidden_states:
+            hidden = hidden_states[-1][0].detach().float().cpu()
+            torch.save(hidden, output_dir / "last_hidden_state.pt")
+            if image_positions:
+                _save_latent_pca(output_dir / "image_latent_pca.png", hidden[image_positions])
+                payload["image_latent_pca"] = str(output_dir / "image_latent_pca.png")
+
+        if attentions:
+            attention = attentions[-1][0].detach().float().cpu().mean(dim=0)
+            torch.save(attention, output_dir / "last_layer_mean_attention.pt")
+            crop = attention[:max_tokens, :max_tokens]
+            _save_heatmap(output_dir / "token_attention_heatmap.png", crop)
+            payload["token_attention_heatmap"] = str(output_dir / "token_attention_heatmap.png")
+            query_index = text_positions[-1] if text_positions else len(tokens) - 1
+            _write_top_attention_json(
+                output_dir / "text_attention_top.json",
+                attention[query_index],
+                tokens=tokens,
+                candidate_positions=text_positions,
+            )
+            if image_positions:
+                _write_top_attention_json(
+                    output_dir / "image_attention_top.json",
+                    attention[query_index],
+                    tokens=tokens,
+                    candidate_positions=image_positions,
+                )
+                _save_1d_heatmap(output_dir / "image_attention_1d.png", attention[query_index, image_positions])
+                payload["image_attention_1d"] = str(output_dir / "image_attention_1d.png")
+        else:
+            (output_dir / "attention_note.txt").write_text(
+                "Model did not return attentions. Some HF attention implementations require eager attention.\n"
+            )
+        (output_dir / "summary.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+        return payload
+    except Exception as exc:  # Debug output should not break normal inference.
+        error_payload = {"output_dir": str(output_dir), "error": f"{type(exc).__name__}: {exc}"}
+        (output_dir / "error.json").write_text(json.dumps(error_payload, indent=2, ensure_ascii=True) + "\n")
+        logging.exception("Failed to save embedding debug artifacts to %s", output_dir)
+        return error_payload
+
+
+def _decode_input_tokens(tokenizer, input_ids: torch.Tensor) -> list[str]:
+    if hasattr(tokenizer, "convert_ids_to_tokens"):
+        return [str(token) for token in tokenizer.convert_ids_to_tokens(input_ids.tolist())]
+    return [str(int(token_id)) for token_id in input_ids.tolist()]
+
+
+def _image_like_token_positions(tokens: list[str], input_ids: torch.Tensor, model) -> list[int]:
+    config = getattr(model, "config", None)
+    candidate_ids = {
+        int(value)
+        for name in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id")
+        for value in [getattr(config, name, None)]
+        if value is not None
+    }
+    positions: list[int] = []
+    for index, (token, token_id) in enumerate(zip(tokens, input_ids.tolist(), strict=False)):
+        lowered = token.lower()
+        if int(token_id) in candidate_ids or "image" in lowered or "video" in lowered or "vision" in lowered:
+            positions.append(index)
+    return positions
+
+
+def _write_tokens_file(path: pathlib.Path, *, tokens: list[str], image_positions: set[int]) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        for index, token in enumerate(tokens):
+            tag = "image" if index in image_positions else "text"
+            stream.write(f"{index}\t{tag}\t{token}\n")
+
+
+def _write_top_attention_json(
+    path: pathlib.Path,
+    scores: torch.Tensor,
+    *,
+    tokens: list[str],
+    candidate_positions: list[int],
+    limit: int = 50,
+) -> None:
+    rows = [
+        {"index": index, "token": tokens[index], "score": float(scores[index])}
+        for index in candidate_positions
+    ]
+    rows.sort(key=lambda row: row["score"], reverse=True)
+    path.write_text(json.dumps(rows[:limit], indent=2, ensure_ascii=True) + "\n")
+
+
+def _save_heatmap(path: pathlib.Path, matrix: torch.Tensor) -> None:
+    values = matrix.detach().float().cpu().numpy()
+    if values.size == 0:
+        return
+    values = values - values.min()
+    values = values / max(float(values.max()), 1e-8)
+    image = Image.fromarray(np.uint8(values * 255), mode="L")
+    image = image.resize((max(1, image.width * 4), max(1, image.height * 4)))
+    image.save(path)
+
+
+def _save_1d_heatmap(path: pathlib.Path, values: torch.Tensor) -> None:
+    arr = values.detach().float().cpu().numpy()[None, :]
+    _save_heatmap(path, torch.from_numpy(arr))
+
+
+def _save_latent_pca(path: pathlib.Path, embeddings: torch.Tensor) -> None:
+    if embeddings.numel() == 0:
+        return
+    x = embeddings.detach().float().cpu()
+    x = x - x.mean(dim=0, keepdim=True)
+    if x.shape[0] < 2:
+        projected = torch.zeros((x.shape[0], 3), dtype=torch.float32)
+    else:
+        _, _, vh = torch.linalg.svd(x, full_matrices=False)
+        components = vh[: min(3, vh.shape[0])].T
+        projected = x @ components
+        if projected.shape[1] < 3:
+            projected = torch.nn.functional.pad(projected, (0, 3 - projected.shape[1]))
+    arr = projected.numpy()
+    arr = arr - arr.min(axis=0, keepdims=True)
+    arr = arr / np.maximum(arr.max(axis=0, keepdims=True), 1e-8)
+    colors = np.uint8(arr[:, :3] * 255)
+    side = int(np.ceil(np.sqrt(max(len(colors), 1))))
+    canvas = np.zeros((side * side, 3), dtype=np.uint8)
+    canvas[: len(colors)] = colors
+    image = Image.fromarray(canvas.reshape(side, side, 3), mode="RGB")
+    image = image.resize((side * 24, side * 24), resample=Image.Resampling.NEAREST)
+    image.save(path)
 
 
 def _write_jsonl(path: pathlib.Path, rows: list[dict[str, object]]) -> None:

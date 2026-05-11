@@ -300,6 +300,7 @@ python scripts/run_hl_memory_zero_shot.py \
   --precision float16 \
   --device cuda \
   --debug-dir /tmp/hl_rollout_debug \
+  --embedding-debug-dir /tmp/hl_rollout_embedding_debug \
   --output-json /tmp/hl_rollout_debug/summary.json
 ```
 
@@ -352,6 +353,8 @@ rollout 和调试参数：
 | `--rollout-jsonl` | rollout 模式下逐步保存 compact JSONL。 |
 | `--rollout-pretty-json` | rollout 模式下逐步保存可读 JSON。 |
 | `--debug-dir` | 保存输入帧、keyframe candidates、debug panel；排查模型预测时建议开启。 |
+| `--embedding-debug-dir` | 保存 prompt token、last hidden state、可用 attention heatmap、text/image top attention、image-token latent PCA；用于分析模型是否看图/看 memory。 |
+| `--embedding-debug-max-tokens` | attention heatmap 最多可视化多少个 token，默认 `160`，避免长 prompt 图片过大。 |
 | `--debug-video-fps` | 用 debug panels 合成 rollout debug 视频的 FPS。 |
 | `--max-new-tokens` | 非 thinking 模式的最大生成 token 数。 |
 | `--enable-thinking` | 打开 Qwen thinking；默认关闭，建议先关闭以保证 JSON 输出稳定。 |
