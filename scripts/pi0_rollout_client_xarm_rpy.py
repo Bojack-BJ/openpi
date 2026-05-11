@@ -31,6 +31,7 @@ import tty
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from scipy.spatial.transform import Slerp
 
 from hil.lerobot_hil_recorder import SingleArmHilRecorder
 from hil.lerobot_hil_recorder import action7_rpy_deg_to_action8_quat
@@ -500,6 +501,31 @@ def _set_xarm_servo_pose(bestman: Bestman_Real_Xarm6, pos_m, rpy_deg) -> None:
         bestman.robot.set_servo_cartesian(pose)
 
 
+def _smooth_servo_target(
+    prev_pos_m: np.ndarray | None,
+    prev_rot: R | None,
+    target_pos_m: np.ndarray,
+    target_rot: R,
+    *,
+    pos_alpha: float,
+    rot_alpha: float,
+) -> tuple[np.ndarray, R]:
+    """EMA position + slerp rotation smoothing. alpha=1.0 disables smoothing."""
+    pos_alpha = float(np.clip(pos_alpha, 0.0, 1.0))
+    rot_alpha = float(np.clip(rot_alpha, 0.0, 1.0))
+    if prev_pos_m is None or prev_rot is None:
+        return target_pos_m, target_rot
+
+    smoothed_pos = (1.0 - pos_alpha) * prev_pos_m + pos_alpha * target_pos_m
+    if rot_alpha >= 1.0:
+        smoothed_rot = target_rot
+    elif rot_alpha <= 0.0:
+        smoothed_rot = prev_rot
+    else:
+        smoothed_rot = Slerp([0.0, 1.0], R.concatenate([prev_rot, target_rot]))([rot_alpha])[0]
+    return smoothed_pos, smoothed_rot
+
+
 def _set_xarm_gripper(
     bestman: Bestman_Real_Xarm6,
     g_open: float,
@@ -715,6 +741,8 @@ def main():
         default="servo",
         help="HIL 接管期间的 xArm 下发模式：servo 使用 set_servo_cartesian；position 回退到 set_position(wait=True)",
     )
+    parser.add_argument("--hil_servo_pos_alpha", type=float, default=0.35, help="HIL servo 位置 EMA 平滑系数，越小越稳但延迟越大；1.0 表示关闭")
+    parser.add_argument("--hil_servo_rot_alpha", type=float, default=0.25, help="HIL servo 旋转 slerp 平滑系数，越小越稳但延迟越大；1.0 表示关闭")
     parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="HIL 状态日志最小打印间隔；0 表示每步都打印")
     parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
@@ -918,6 +946,8 @@ def main():
         last_hil_gripper_update_time = 0.0
         last_hil_gripper_open = None
         last_hil_command_time = 0.0
+        last_hil_servo_pos = None
+        last_hil_servo_rot = None
         while True:
             ch = _stdin_read_char_nonblocking()
             if ch in ("s", "S"):
@@ -1057,6 +1087,8 @@ def main():
                         last_hil_gripper_update_time = 0.0
                         last_hil_gripper_open = None
                         last_hil_command_time = 0.0
+                        last_hil_servo_pos = None
+                        last_hil_servo_rot = None
                         dropped = hil_recorder.drop_recent_policy_frames(args.hil_pre_takeover_drop) if hil_recorder else 0
                         print(f"[HIL] 开始接管 takeover_id={hil_takeover_id}；已丢弃最近 policy 帧 {dropped} 条")
 
@@ -1111,7 +1143,18 @@ def main():
                             if sleep_s > 0.0:
                                 time.sleep(sleep_s)
                         now = time.monotonic()
-                        _set_xarm_servo_pose(arms[single_arm], hil_target.position_xyz_m.tolist(), target_rpy_deg.tolist())
+                        servo_pos, servo_rot = _smooth_servo_target(
+                            last_hil_servo_pos,
+                            last_hil_servo_rot,
+                            np.asarray(hil_target.position_xyz_m, dtype=np.float64),
+                            R.from_euler("xyz", hil_target.euler_xyz_rad),
+                            pos_alpha=args.hil_servo_pos_alpha,
+                            rot_alpha=args.hil_servo_rot_alpha,
+                        )
+                        servo_rpy_deg = servo_rot.as_euler("xyz", degrees=True)
+                        _set_xarm_servo_pose(arms[single_arm], servo_pos.tolist(), servo_rpy_deg.tolist())
+                        last_hil_servo_pos = servo_pos
+                        last_hil_servo_rot = servo_rot
                         if (
                             last_hil_gripper_open is None
                             or abs(gripper_open - last_hil_gripper_open) >= HIL_GRIPPER_UPDATE_THRESHOLD
