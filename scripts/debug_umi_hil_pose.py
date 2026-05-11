@@ -103,10 +103,9 @@ def main() -> None:
     parser.add_argument("--umi_ros_queue_size", type=int, default=1, help="UMI ROS subscriber queue size；默认只保留最新消息以降低延迟")
     parser.add_argument("--hil_ready_timeout_s", type=float, default=10.0, help="启动时等待 UMI SLAM+clamp 首帧的超时时间")
     parser.add_argument("--hil_max_delta_xyz", type=float, default=0.0, help="从接管起点算的累计 TCP 平移范数上限（米）；0 表示不限制")
-    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="每次接管允许 UMI 映射的最大旋转角（度）")
-    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI raw SLAM xyz -> robot/base xyz 的右手系轴映射，例如 z,-y,x")
-    parser.add_argument("--hil_slam_delta_frame", choices=("local", "world"), default="world", help="UMI 平移 delta 在 local 或 world 坐标中计算")
-    parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移映射到机器人 TCP 的比例")
+    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="从接管起点算的累计 TCP 旋转角上限（度）；0 表示不限制")
+    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI raw SLAM xyz/rpy -> robot base xyz/rpy 的右手系轴映射，例如 z,-x,-y")
+    parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移到 TCP 平移的比例；UMI 与 TCP 均按米处理")
     parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="打印 UMI/TCP orientation 对齐误差")
     parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
     parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="debug 打印间隔；0 表示尽快打印")
@@ -130,11 +129,10 @@ def main() -> None:
     mapper = RelativePoseMapper(
         axes=axes,
         translation_scale=args.hil_slam_translation_scale,
-        delta_frame=args.hil_slam_delta_frame,
         max_delta_xyz=args.hil_max_delta_xyz,
         max_delta_rpy_deg=args.hil_max_delta_rpy_deg,
     )
-    print("[CONFIG]", f"axes={args.hil_slam_axes}", f"delta_frame={args.hil_slam_delta_frame}", f"scale={args.hil_slam_translation_scale}")
+    print("[CONFIG]", f"axes={args.hil_slam_axes}", f"scale={args.hil_slam_translation_scale}")
     print(f"[CONFIG] frame_matrix raw_umi_xyz -> robot_xyz:\n{mapper.frame_matrix}")
 
     umi_reader = UmiSlamReader(

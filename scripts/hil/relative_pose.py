@@ -65,12 +65,9 @@ class RelativePoseMapper:
         *,
         axes: tuple[tuple[int, float], tuple[int, float], tuple[int, float]],
         translation_scale: float,
-        delta_frame: str,
         max_delta_xyz: float,
         max_delta_rpy_deg: float,
     ) -> None:
-        if delta_frame not in ("local", "world"):
-            raise ValueError(f"delta_frame must be 'local' or 'world', got {delta_frame!r}")
         self._axes = axes
         self._frame_matrix = signed_axes_to_matrix(axes)
         determinant = float(np.linalg.det(self._frame_matrix))
@@ -81,7 +78,6 @@ class RelativePoseMapper:
             )
         self._frame_rot = R.from_matrix(self._frame_matrix)
         self._translation_scale = float(translation_scale)
-        self._delta_frame = delta_frame
         self._max_delta_xyz = float(max_delta_xyz)
         self._max_delta_rot_rad = np.deg2rad(float(max_delta_rpy_deg))
         self._robot_start_pos: np.ndarray | None = None
@@ -155,12 +151,8 @@ class RelativePoseMapper:
         raw_umi_pos = np.asarray(umi_position_xyz_m, dtype=np.float64)
         raw_umi_rot = R.from_quat(np.asarray(umi_quat_xyzw, dtype=np.float64))
         raw_delta_xyz = raw_umi_pos - self._umi_start_raw_pos
-        if self._delta_frame == "local":
-            raw_delta_local_xyz = self._umi_start_raw_rot.inv().apply(raw_delta_xyz)
-            mapped_delta_xyz = self._frame_rot.apply(raw_delta_local_xyz)
-        else:
-            umi_pos, _umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
-            mapped_delta_xyz = umi_pos - self._umi_start_pos
+        umi_pos, _umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
+        mapped_delta_xyz = umi_pos - self._umi_start_pos
         delta_xyz = mapped_delta_xyz.copy()
         delta_xyz = delta_xyz * self._translation_scale
 
@@ -170,10 +162,7 @@ class RelativePoseMapper:
             delta_xyz = delta_xyz * (self._max_delta_xyz / max(delta_norm, 1e-9))
             translation_clamped = True
 
-        if self._delta_frame == "local":
-            target_pos = self._robot_start_pos + self._robot_start_rot.apply(delta_xyz)
-        else:
-            target_pos = self._robot_start_pos + delta_xyz
+        target_pos = self._robot_start_pos + delta_xyz
 
         raw_delta_rot = self._umi_start_raw_rot.inv() * raw_umi_rot
         delta_rot = self._frame_rot * raw_delta_rot * self._frame_rot.inv()
@@ -185,7 +174,7 @@ class RelativePoseMapper:
             delta_rot = R.from_rotvec(delta_rotvec)
             rotation_clamped = True
 
-        target_rot = self._robot_start_rot * delta_rot
+        target_rot = delta_rot * self._robot_start_rot
         return RelativePoseTarget(
             position_xyz_m=np.asarray(target_pos, dtype=np.float64),
             euler_xyz_rad=np.asarray(target_rot.as_euler("xyz"), dtype=np.float64),

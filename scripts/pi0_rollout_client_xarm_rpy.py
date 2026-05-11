@@ -677,15 +677,13 @@ def main():
     parser.add_argument("--hil_output_repo_id", default="fastumi/sponge_visual_guided_xarm_hil", help="HIL 成功 episode 写入的 LeRobot repo id")
     parser.add_argument("--hil_fps", type=int, default=20, help="HIL LeRobot 数据集 fps")
     parser.add_argument("--hil_pre_takeover_drop", type=int, default=3, help="接管开始时丢弃最近 N 个 policy frames")
-    parser.add_argument("--hil_max_delta_xyz", type=float, default=0, help="每次接管允许 UMI 映射的最大平移范数（米）")
-    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="每次接管允许 UMI 映射的最大旋转角（度）")
-    parser.add_argument("--hil_slam_axes", default="z,-x,-y", help="UMI raw SLAM xyz -> robot/base xyz 的右手系轴映射，例如 z,-y,x")
-    parser.add_argument("--hil_slam_delta_frame", choices=("local", "world"), default="local", help="UMI 平移 delta 在 local 或 world 坐标中计算")
-    parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移映射到机器人 TCP 的比例")
+    parser.add_argument("--hil_max_delta_xyz", type=float, default=0, help="从接管起点算的累计 TCP 平移范数上限（米）；0 表示不限制")
+    parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="从接管起点算的累计 TCP 旋转角上限（度）；0 表示不限制")
+    parser.add_argument("--hil_slam_axes", default="z,-x,-y", help="UMI raw SLAM xyz/rpy -> robot base xyz/rpy 的右手系轴映射，例如 z,-x,-y")
+    parser.add_argument("--hil_slam_translation_scale", type=float, default=0.5, help="UMI 平移到 TCP 平移的比例；UMI 与 TCP 均按米处理")
     parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="开始接管前要求映射后的 UMI orientation 接近当前 TCP orientation")
     parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
     parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="HIL 状态日志最小打印间隔；0 表示每步都打印")
-    parser.add_argument("--hil_pose_debug", action="store_true", help="打印 UMI raw/mapped/command delta，单位均为米，用于调试坐标轴和比例")
     parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
 
@@ -797,7 +795,6 @@ def main():
         hil_mapper = RelativePoseMapper(
             axes=axes,
             translation_scale=args.hil_slam_translation_scale,
-            delta_frame=args.hil_slam_delta_frame,
             max_delta_xyz=args.hil_max_delta_xyz,
             max_delta_rpy_deg=args.hil_max_delta_rpy_deg,
         )
@@ -811,11 +808,9 @@ def main():
             "[HIL] 已启用：t=开始/结束接管，e=保存成功 episode，x=丢弃当前 episode；"
             "接管期间使用 UMI SLAM 相对位姿映射到当前 xArm TCP；"
             f"slam_axes={args.hil_slam_axes}；"
-            f"delta_frame={args.hil_slam_delta_frame}；"
+            f"translation_scale={args.hil_slam_translation_scale}；"
             f"umi_tcp_alignment={'on' if args.hil_require_umi_tcp_alignment else 'off'}"
         )
-        if args.hil_pose_debug:
-            print(f"[HIL DEBUG] frame_matrix raw_umi_xyz -> robot_xyz:\n{hil_mapper.frame_matrix}")
 
     input("按 Enter 开始")
     mask_debug_dir = pathlib.Path(args.mask_debug_dir) if args.mask_debug_dir else None
@@ -1039,20 +1034,6 @@ def main():
                     if args.hil_log_interval_s <= 0.0 or now - last_hil_log_time >= args.hil_log_interval_s:
                         last_hil_log_time = now
                         print(f"[HIL] takeover={hil_takeover_id} action:", action)
-                        if args.hil_pose_debug:
-                            print(
-                                "[HIL DEBUG] delta_m "
-                                f"raw={np.round(hil_target.raw_delta_xyz_m, 4).tolist()} "
-                                f"mapped={np.round(hil_target.mapped_delta_xyz_m, 4).tolist()} "
-                                f"cmd={np.round(hil_target.command_delta_xyz_m, 4).tolist()} "
-                                f"scale={args.hil_slam_translation_scale} "
-                                f"max_total={args.hil_max_delta_xyz}"
-                            )
-                            print(
-                                "[HIL DEBUG] rotvec_deg "
-                                f"raw={np.round(np.rad2deg(hil_target.raw_delta_rotvec_rad), 1).tolist()} "
-                                f"mapped={np.round(np.rad2deg(hil_target.mapped_delta_rotvec_rad), 1).tolist()}"
-                            )
                     if args.enable_interp:
                         interp_and_move_one(
                             arms[single_arm],
