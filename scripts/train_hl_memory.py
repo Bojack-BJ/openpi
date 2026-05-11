@@ -42,6 +42,13 @@ class TrainArgs:
     tensor_parallel_plan: str = "auto"
     learning_rate: float = 1e-5
     weight_decay: float = 1e-4
+    lora_enabled: bool = False
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    language_memory_dropout: float = 0.0
+    language_memory_dropout_value: str = "Task started."
     batch_size: int = 1
     grad_accum_steps: int = 1
     num_train_steps: int = 100
@@ -110,6 +117,8 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         model_path=None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         device=device,
     )
+    if args.lora_enabled:
+        loaded = dataclasses.replace(loaded, model=_apply_lora(loaded.model, args=args, is_main=is_main))
     loaded.model.train()
     if distributed:
         loaded = dataclasses.replace(
@@ -120,7 +129,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
             ),
         )
     optimizer = torch.optim.AdamW(
-        loaded.model.parameters(),
+        (parameter for parameter in loaded.model.parameters() if parameter.requires_grad),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -158,6 +167,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                 )
                 with sync_context:
                     for sample in batch:
+                        sample = _maybe_drop_language_memory(sample, args=args, rng=rng)
                         data_start_time = time.perf_counter()
                         clips = load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
                         inputs = adapter.prepare_training_inputs(loaded, sample, clips, device=device)
@@ -239,6 +249,41 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
+
+def _apply_lora(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> torch.nn.Module:
+    try:
+        from peft import LoraConfig
+        from peft import TaskType
+        from peft import get_peft_model
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError("LoRA training requires `peft`. Install it or run without --lora-enabled.") from exc
+
+    target_modules = [module.strip() for module in args.lora_target_modules.split(",") if module.strip()]
+    if not target_modules:
+        raise ValueError("--lora-target-modules must contain at least one module name.")
+    lora_config = LoraConfig(
+        r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+    model = get_peft_model(model, lora_config)
+    if is_main:
+        model.print_trainable_parameters()
+    return model
+
+
+def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
+    if args.language_memory_dropout <= 0.0:
+        return sample
+    if not 0.0 <= args.language_memory_dropout <= 1.0:
+        raise ValueError(f"--language-memory-dropout must be in [0, 1], got {args.language_memory_dropout}")
+    if rng.random() >= args.language_memory_dropout:
+        return sample
+    return dataclasses.replace(sample, language_memory=args.language_memory_dropout_value)
 
 
 def _init_distributed(args: TrainArgs) -> bool:

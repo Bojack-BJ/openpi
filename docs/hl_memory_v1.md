@@ -205,6 +205,31 @@ torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
 
 这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。开启 wandb 后 rank0 会记录 `train/loss`、`time/data_s_per_it`、`time/step_s_per_it`、`time/data_fraction`、`train/lr` 和 `train/global_batch_size`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
 
+如果 full finetune 出现过度依赖 language memory 或通用视觉能力退化，优先尝试 LoRA + language memory dropout：
+
+```bash
+torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
+  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
+  --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35_lora \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_2b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
+  --precision bfloat16 \
+  --learning-rate 1e-4 \
+  --lora-enabled \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --language-memory-dropout 0.5 \
+  --language-memory-dropout-value "Task started." \
+  --batch-size 4 \
+  --grad-accum-steps 1 \
+  --num-train-steps 2000 \
+  --save-interval 200
+```
+
+LoRA 需要安装 `peft`。默认 LoRA target modules 是 Qwen 常见 attention/MLP 线性层：`q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`。`--language-memory-dropout` 会在训练时随机把输入 `language_memory` 替换成指定文本，逼模型更多依赖视觉和 recent clip。
+
 可用 backend / variant：
 
 - `--vlm-backend qwen2_5_vl`

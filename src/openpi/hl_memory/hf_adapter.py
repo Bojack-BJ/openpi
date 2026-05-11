@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import pathlib
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -58,12 +59,16 @@ class BaseHLVLMAdapter:
             )
             torch_dtype = torch.float16
         pretrained_path = model_path or self.config.resolved_model_id
+        peft_adapter_path = _as_peft_adapter_path(pretrained_path)
         logging.info("[stage] loading processor from %s", pretrained_path)
         processor = transformers.AutoProcessor.from_pretrained(pretrained_path, trust_remote_code=True)
         logging.info("[stage] processor loaded in %.1fs", time.perf_counter() - started_at)
         model_started_at = time.perf_counter()
         logging.info("[stage] loading model weights from %s dtype=%s", pretrained_path, torch_dtype)
-        model = self._load_model(transformers, pretrained_path, torch_dtype=torch_dtype)
+        if peft_adapter_path is None:
+            model = self._load_model(transformers, pretrained_path, torch_dtype=torch_dtype)
+        else:
+            model = self._load_peft_model(transformers, peft_adapter_path, torch_dtype=torch_dtype)
         logging.info("[stage] model weights loaded in %.1fs", time.perf_counter() - model_started_at)
         if self._uses_parallel_model_loading():
             logging.info(
@@ -437,6 +442,19 @@ class BaseHLVLMAdapter:
     def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
         raise NotImplementedError
 
+    def _load_peft_model(self, transformers: Any, adapter_path: pathlib.Path, *, torch_dtype: torch.dtype) -> Any:
+        try:
+            from peft import PeftConfig
+            from peft import PeftModel
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError("Loading a LoRA HL checkpoint requires `peft` to be installed.") from exc
+
+        peft_config = PeftConfig.from_pretrained(str(adapter_path))
+        base_model_path = peft_config.base_model_name_or_path or self.config.resolved_model_id
+        logging.info("[stage] detected LoRA adapter; loading base model from %s", base_model_path)
+        base_model = self._load_model(transformers, base_model_path, torch_dtype=torch_dtype)
+        return PeftModel.from_pretrained(base_model, str(adapter_path))
+
     def _encode_prompt_only(
         self,
         processor: Any,
@@ -632,6 +650,13 @@ def _import_transformers() -> Any:
             "The HL memory adapters require `transformers` to be installed in the active environment."
         ) from exc
     return transformers
+
+
+def _as_peft_adapter_path(pretrained_path: str) -> pathlib.Path | None:
+    path = pathlib.Path(pretrained_path)
+    if path.exists() and (path / "adapter_config.json").exists():
+        return path
+    return None
 
 
 def _cuda_supports_bfloat16() -> bool:
