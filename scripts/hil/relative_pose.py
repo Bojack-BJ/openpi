@@ -44,6 +44,14 @@ def apply_signed_axes(
     return np.asarray([sign * value[index] for index, sign in axes], dtype=np.float64)
 
 
+def signed_axes_to_matrix(axes: tuple[tuple[int, float], tuple[int, float], tuple[int, float]]) -> np.ndarray:
+    """Return a matrix that maps raw SLAM xyz vectors into the configured frame."""
+    matrix = np.zeros((3, 3), dtype=np.float64)
+    for output_index, (input_index, sign) in enumerate(axes):
+        matrix[output_index, input_index] = sign
+    return matrix
+
+
 class RelativePoseMapper:
     """Maps UMI relative SLAM motion onto a robot TCP pose locked at takeover start."""
 
@@ -59,6 +67,14 @@ class RelativePoseMapper:
         if delta_frame not in ("local", "world"):
             raise ValueError(f"delta_frame must be 'local' or 'world', got {delta_frame!r}")
         self._axes = axes
+        self._frame_matrix = signed_axes_to_matrix(axes)
+        determinant = float(np.linalg.det(self._frame_matrix))
+        if determinant < 0.0:
+            raise ValueError(
+                "hil_slam_axes must describe a right-handed frame when mapping orientation; "
+                f"got determinant {determinant:.1f} for axes={axes!r}"
+            )
+        self._frame_rot = R.from_matrix(self._frame_matrix)
         self._translation_scale = float(translation_scale)
         self._delta_frame = delta_frame
         self._max_delta_xyz = float(max_delta_xyz)
@@ -78,8 +94,10 @@ class RelativePoseMapper:
     ) -> None:
         self._robot_start_pos = np.asarray(robot_tcp_position_xyz_m, dtype=np.float64)
         self._robot_start_rot = R.from_euler("xyz", np.asarray(robot_tcp_euler_xyz_rad, dtype=np.float64))
-        self._umi_start_pos = np.asarray(umi_position_xyz_m, dtype=np.float64)
-        self._umi_start_rot = R.from_quat(np.asarray(umi_quat_xyzw, dtype=np.float64))
+        self._umi_start_pos, self._umi_start_rot = self.map_umi_pose(
+            position_xyz_m=umi_position_xyz_m,
+            quat_xyzw=umi_quat_xyzw,
+        )
 
     def reset(self) -> None:
         self._robot_start_pos = None
@@ -91,6 +109,23 @@ class RelativePoseMapper:
     def active(self) -> bool:
         return self._robot_start_pos is not None
 
+    def map_umi_pose(self, *, position_xyz_m: np.ndarray, quat_xyzw: np.ndarray) -> tuple[np.ndarray, R]:
+        """Map raw UMI SLAM pose into the configured robot/base-aligned frame."""
+        raw_pos = np.asarray(position_xyz_m, dtype=np.float64)
+        raw_rot = R.from_quat(np.asarray(quat_xyzw, dtype=np.float64))
+        return self._frame_rot.apply(raw_pos), self._frame_rot * raw_rot
+
+    def orientation_error_deg(
+        self,
+        *,
+        robot_tcp_euler_xyz_rad: np.ndarray,
+        umi_quat_xyzw: np.ndarray,
+    ) -> float:
+        """Return angular distance between current robot TCP and mapped UMI orientation."""
+        robot_rot = R.from_euler("xyz", np.asarray(robot_tcp_euler_xyz_rad, dtype=np.float64))
+        umi_rot = self.map_umi_pose(position_xyz_m=np.zeros(3, dtype=np.float64), quat_xyzw=umi_quat_xyzw)[1]
+        return float(np.rad2deg((robot_rot.inv() * umi_rot).magnitude()))
+
     def target(self, *, umi_position_xyz_m: np.ndarray, umi_quat_xyzw: np.ndarray) -> RelativePoseTarget:
         if (
             self._robot_start_pos is None
@@ -100,13 +135,12 @@ class RelativePoseMapper:
         ):
             raise RuntimeError("RelativePoseMapper.begin() must be called before target().")
 
-        umi_pos = np.asarray(umi_position_xyz_m, dtype=np.float64)
-        umi_rot = R.from_quat(np.asarray(umi_quat_xyzw, dtype=np.float64))
+        umi_pos, umi_rot = self.map_umi_pose(position_xyz_m=umi_position_xyz_m, quat_xyzw=umi_quat_xyzw)
 
         delta_xyz = umi_pos - self._umi_start_pos
         if self._delta_frame == "local":
             delta_xyz = self._umi_start_rot.inv().apply(delta_xyz)
-        delta_xyz = apply_signed_axes(delta_xyz, self._axes) * self._translation_scale
+        delta_xyz = delta_xyz * self._translation_scale
 
         translation_clamped = False
         delta_norm = float(np.linalg.norm(delta_xyz))

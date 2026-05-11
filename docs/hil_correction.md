@@ -54,6 +54,10 @@ python scripts/pi0_rollout_client_xarm_rpy.py \
   --description "Put the target object into the target slot" \
   --hil_correction \
   --umi_xv_serial <umi_serial> \
+  --hil_slam_axes z,-x,-y \
+  --hil_slam_delta_frame world \
+  --hil_require_umi_tcp_alignment \
+  --hil_umi_tcp_alignment_threshold_deg 25 \
   --hil_output_repo_id fastumi/sponge_visual_guided_xarm_hil \
   --hil_fps 20
 ```
@@ -73,7 +77,7 @@ python scripts/pi0_rollout_client_xarm_rpy.py \
 - `Enter`：开始主循环。
 - `s`：reset arm 到 init pose，丢弃当前 HIL buffer，暂停 inference。
 - `c`：继续 policy inference。
-- `t`：切换人工接管。第一次按会在下一帧锁定当前 UMI pose 和 xArm TCP 作为相对运动原点；再次按会结束接管并恢复 policy。
+- `t`：切换人工接管。第一次按会在下一帧锁定当前 UMI pose 和 xArm TCP 作为相对运动原点；再次按会结束接管并恢复 policy。开启 `--hil_require_umi_tcp_alignment` 后，如果 UMI orientation 和当前 TCP orientation 差距超过阈值，会拒绝开始接管。
 - `e`：把当前 buffer 保存为一个成功 LeRobot episode，然后清空 buffer 并暂停。
 - `x`：丢弃当前 buffer，不保存。
 
@@ -103,6 +107,17 @@ $HF_LEROBOT_HOME/<hil_output_repo_id>/hil_metadata.jsonl
 
 `e` 保存的是当前 buffer 里的 policy + human frames。`t` 开始接管时会按 `--hil_pre_takeover_drop` 删除最近若干 policy frames，避免把接管前明显失败的动作写进成功片段。
 
+## SLAM 坐标系与 UMI-TCP 对齐
+
+UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM world 原点和轴方向来自 UMI 开机/初始化时的姿态。因此推荐流程是：
+
+- UMI 开机/初始化时先按固定姿态握持，让 raw SLAM world frame 和 robot base frame 只有确定的轴映射关系。
+- 用 `--hil_slam_axes` 把 raw SLAM xyz 映射到 robot/base xyz。常见 xArm base 约定是 `x` 向前、`y` 向左、`z` 向上，对应 UMI camera frame 可先试 `--hil_slam_axes z,-x,-y`。
+- 如果采用上面的开机标准姿态，建议先用 `--hil_slam_delta_frame world`，直接把 UMI 在 base 对齐坐标系里的位移加到 TCP；`local` 更适合希望 UMI 局部坐标跟随 TCP 起始姿态的相对控制。
+- `--hil_slam_axes` 现在会同时作用于 UMI position 和 orientation；它必须是右手系映射，否则 orientation 变换没有物理意义，程序会拒绝启动。
+- 如果要让操作更直观，开启 `--hil_require_umi_tcp_alignment`。接管前先把 UMI 转到接近当前 TCP 的 orientation，再按 `t`；超过 `--hil_umi_tcp_alignment_threshold_deg` 会拒绝接管并暂停。
+- 轴方向一定要用小位移验证。若 TCP 运动方向反了，优先改 `--hil_slam_axes` 的符号或排列。
+
 ## 关键参数
 
 - `--umi_xv_serial`：UMI XV serial，HIL 模式必填。
@@ -114,14 +129,16 @@ $HF_LEROBOT_HOME/<hil_output_repo_id>/hil_metadata.jsonl
 - `--hil_pre_takeover_drop`：开始接管时丢弃最近多少个 policy frames。
 - `--hil_max_delta_xyz`：单步 TCP 平移最大变化，安全限幅。
 - `--hil_max_delta_rpy_deg`：单步 RPY 最大变化，安全限幅。
-- `--hil_slam_axes`：UMI SLAM 平移轴映射，例如 `x,y,z` 或 `-y,x,z`。
+- `--hil_slam_axes`：UMI raw SLAM xyz 到 robot/base xyz 的右手系轴映射，例如 `z,-x,-y`。
 - `--hil_slam_delta_frame`：`local` 表示在 UMI 起始姿态局部系里解释位移，`world` 表示直接用世界系 delta。
 - `--hil_slam_translation_scale`：UMI 平移缩放系数。
+- `--hil_require_umi_tcp_alignment`：开始接管前检查 UMI orientation 是否接近当前 TCP orientation。
+- `--hil_umi_tcp_alignment_threshold_deg`：UMI-TCP orientation 对齐角度阈值，默认 `25` 度。
 
 ## 安全检查
 
 - 第一次测试建议把 `--hil_max_delta_xyz` 降到 `0.02`，确认方向正确后再提高。
-- 正式采集前先用很小的 UMI 位移检查 `--hil_slam_axes` 和 `--hil_slam_delta_frame`。
+- 正式采集前先用很小的 UMI 位移检查 `--hil_slam_axes` 和 `--hil_slam_delta_frame`；建议先开 `--hil_require_umi_tcp_alignment`。
 - 出现 clipping warning 时，优先减小 UMI 手部动作；只有确认安全后再提高限幅。
 - 失败 episode 用 `x` 丢弃，不要按 `e`。
 - 不要在不确认的情况下使用 `--hil_overwrite_dataset`。

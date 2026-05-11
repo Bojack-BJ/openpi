@@ -678,9 +678,11 @@ def main():
     parser.add_argument("--hil_pre_takeover_drop", type=int, default=3, help="接管开始时丢弃最近 N 个 policy frames")
     parser.add_argument("--hil_max_delta_xyz", type=float, default=0.04, help="每次接管允许 UMI 映射的最大平移范数（米）")
     parser.add_argument("--hil_max_delta_rpy_deg", type=float, default=20.0, help="每次接管允许 UMI 映射的最大旋转角（度）")
-    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI 平移轴映射，例如 x,y,z 或 -y,x,z")
+    parser.add_argument("--hil_slam_axes", default="x,y,z", help="UMI raw SLAM xyz -> robot/base xyz 的右手系轴映射，例如 z,-x,-y")
     parser.add_argument("--hil_slam_delta_frame", choices=("local", "world"), default="local", help="UMI 平移 delta 在 local 或 world 坐标中计算")
     parser.add_argument("--hil_slam_translation_scale", type=float, default=1.0, help="UMI 平移映射到机器人 TCP 的比例")
+    parser.add_argument("--hil_require_umi_tcp_alignment", action="store_true", help="开始接管前要求映射后的 UMI orientation 接近当前 TCP orientation")
+    parser.add_argument("--hil_umi_tcp_alignment_threshold_deg", type=float, default=25.0, help="--hil_require_umi_tcp_alignment 的角度阈值")
     parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
 
@@ -803,7 +805,10 @@ def main():
         )
         print(
             "[HIL] 已启用：t=开始/结束接管，e=保存成功 episode，x=丢弃当前 episode；"
-            "接管期间使用 UMI SLAM 相对位姿映射到当前 xArm TCP"
+            "接管期间使用 UMI SLAM 相对位姿映射到当前 xArm TCP；"
+            f"slam_axes={args.hil_slam_axes}；"
+            f"delta_frame={args.hil_slam_delta_frame}；"
+            f"umi_tcp_alignment={'on' if args.hil_require_umi_tcp_alignment else 'off'}"
         )
 
     input("按 Enter 开始")
@@ -900,7 +905,7 @@ def main():
                     pending_takeover_start = True
                     print("[HIL] 请求开始人工接管；将在下一帧锁定 UMI 与 xArm TCP 基准")
 
-            if paused:
+            if paused and not pending_takeover_start:
                 time.sleep(0.02)
                 continue
 
@@ -938,6 +943,21 @@ def main():
                         print("[HIL][WARN] UMI SLAM/clamp 数据过期或未就绪，无法开始接管")
                         pending_takeover_start = False
                     else:
+                        if args.hil_require_umi_tcp_alignment:
+                            alignment_error_deg = hil_mapper.orientation_error_deg(
+                                robot_tcp_euler_xyz_rad=np.deg2rad(np.asarray(cur_rpy_single, dtype=np.float64)),
+                                umi_quat_xyzw=umi_sample.quat_xyzw,
+                            )
+                            if alignment_error_deg > args.hil_umi_tcp_alignment_threshold_deg:
+                                print(
+                                    "[HIL][WARN] UMI-TCP orientation 未对齐，拒绝开始接管："
+                                    f"error={alignment_error_deg:.1f}deg > "
+                                    f"{args.hil_umi_tcp_alignment_threshold_deg:.1f}deg；"
+                                    "请先旋转 UMI 接近当前 TCP 姿态后再按 t"
+                                )
+                                pending_takeover_start = False
+                                paused = True
+                                continue
                         hil_takeover_id += 1
                         hil_mapper.begin(
                             robot_tcp_position_xyz_m=cur_pos_arr,
@@ -947,6 +967,7 @@ def main():
                         )
                         hil_takeover_active = True
                         pending_takeover_start = False
+                        paused = False
                         dropped = hil_recorder.drop_recent_policy_frames(args.hil_pre_takeover_drop) if hil_recorder else 0
                         print(f"[HIL] 开始接管 takeover_id={hil_takeover_id}；已丢弃最近 policy 帧 {dropped} 条")
 
