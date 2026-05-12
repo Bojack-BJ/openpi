@@ -128,9 +128,10 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 - HIL 接管默认使用 `--hil_xarm_control_mode servo`：开始接管时切到 xArm `mode=1`，每步用 `set_servo_cartesian` 非阻塞下发 TCP pose，退出接管/复位/保存/丢弃/程序结束时切回 `mode=0`。如果 SDK 或机器人固件不支持，可用 `--hil_xarm_control_mode position` 回退到旧的 `set_position(wait=True)`。
 - `servo` 模式下 `--dt` 是 HIL command 最小下发间隔，默认 `0.025s`；夹爪命令按时间和开合变化量节流，避免每个 pose 都等待夹爪动作。
 - `servo` 模式会在下发前做平滑：位置用 EMA，旋转用 slerp。`--hil_servo_pos_alpha` / `--hil_servo_rot_alpha` 越小越稳但滞后越大；`1.0` 表示关闭对应平滑。
+- `servo` 模式会先下发 xArm command，再按 `--hil_servo_record_interval_s` 记录 LeRobot frame。这样相机读图和 recorder 不再阻塞每一条 servo command；如果仍有一顿一顿的体感，先把记录间隔临时调到 `0.2` 验证控制链路。
 - HIL action 日志默认按 `--hil_log_interval_s 0.5` 秒节流；如果设成 `0` 会每步打印，可能显著拖慢控制环。
 - 坐标系排查使用 `scripts/debug_umi_hil_pose.py`，主 rollout 不再暴露 pose debug 参数。
-- 当前 HIL command 仍会读机械臂状态、读 front 图像并记录 LeRobot frame；如果体感仍慢，下一步应把 takeover command loop 和 image recording 解耦，或降低 HIL 记录频率。
+- 当前 HIL servo command 已和 LeRobot frame 记录降频解耦；如果体感仍慢，下一步应把 xArm command loop 放到独立线程，彻底避免记录过程影响控制节奏。
 
 ## 关键参数
 
@@ -151,6 +152,7 @@ UMI XV SLAM pose 是 camera frame：`z` 向前、`x` 向右、`y` 向下；SLAM 
 - `--hil_xarm_control_mode`：HIL 接管期间的 xArm 下发模式，默认 `servo`；`position` 是阻塞式回退。
 - `--hil_servo_pos_alpha`：HIL servo 位置平滑系数，默认 `0.35`；越小越稳但越滞后。
 - `--hil_servo_rot_alpha`：HIL servo 旋转平滑系数，默认 `0.25`；越小越稳但越滞后。
+- `--hil_servo_record_interval_s`：HIL servo 模式下记录 LeRobot frame 的最小间隔，默认 `0.1s`；`0` 表示每条 command 都记录。
 - `--hil_log_interval_s`：HIL 状态日志打印间隔，默认 `0.5` 秒；设为 `0` 表示每步打印。
 
 ## 安全检查

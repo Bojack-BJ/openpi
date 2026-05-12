@@ -743,6 +743,7 @@ def main():
     )
     parser.add_argument("--hil_servo_pos_alpha", type=float, default=0.35, help="HIL servo 位置 EMA 平滑系数，越小越稳但延迟越大；1.0 表示关闭")
     parser.add_argument("--hil_servo_rot_alpha", type=float, default=0.25, help="HIL servo 旋转 slerp 平滑系数，越小越稳但延迟越大；1.0 表示关闭")
+    parser.add_argument("--hil_servo_record_interval_s", type=float, default=0.1, help="HIL servo 模式下记录 LeRobot frame 的最小间隔；0 表示每条 command 都记录")
     parser.add_argument("--hil_log_interval_s", type=float, default=0.5, help="HIL 状态日志最小打印间隔；0 表示每步都打印")
     parser.add_argument("--hil_overwrite_dataset", action="store_true", help="若 HIL 输出 repo 已存在，启动时覆盖它")
     args = parser.parse_args()
@@ -948,6 +949,7 @@ def main():
         last_hil_command_time = 0.0
         last_hil_servo_pos = None
         last_hil_servo_rot = None
+        last_hil_record_time = 0.0
         while True:
             ch = _stdin_read_char_nonblocking()
             if ch in ("s", "S"):
@@ -1006,6 +1008,96 @@ def main():
 
             if paused and not pending_takeover_start:
                 time.sleep(0.02)
+                continue
+
+            if (
+                not is_dual
+                and args.hil_correction
+                and hil_takeover_active
+                and args.hil_xarm_control_mode == "servo"
+            ):
+                assert single_arm is not None
+                assert umi_reader is not None and hil_mapper is not None
+                if last_hil_command_time > 0.0:
+                    sleep_s = max(args.dt, 0.0) - (time.monotonic() - last_hil_command_time)
+                    if sleep_s > 0.0:
+                        time.sleep(sleep_s)
+
+                umi_sample = umi_reader.latest()
+                if umi_sample is None:
+                    print("[HIL][WARN] UMI SLAM/clamp 数据过期，暂停 HIL command")
+                    time.sleep(args.dt)
+                    continue
+
+                hil_target = hil_mapper.target(
+                    umi_position_xyz_m=umi_sample.position_xyz_m,
+                    umi_quat_xyzw=umi_sample.quat_xyzw,
+                )
+                gripper_open = float(np.clip(umi_sample.gripper_open, 0.0, 1.0))
+                target_rpy_deg = np.rad2deg(hil_target.euler_xyz_rad)
+                action = np.asarray(
+                    [
+                        *hil_target.position_xyz_m.tolist(),
+                        *target_rpy_deg.tolist(),
+                        gripper_open,
+                    ],
+                    dtype=np.float64,
+                )
+                now = time.monotonic()
+                servo_pos, servo_rot = _smooth_servo_target(
+                    last_hil_servo_pos,
+                    last_hil_servo_rot,
+                    np.asarray(hil_target.position_xyz_m, dtype=np.float64),
+                    R.from_euler("xyz", hil_target.euler_xyz_rad),
+                    pos_alpha=args.hil_servo_pos_alpha,
+                    rot_alpha=args.hil_servo_rot_alpha,
+                )
+                servo_rpy_deg = servo_rot.as_euler("xyz", degrees=True)
+                _set_xarm_servo_pose(arms[single_arm], servo_pos.tolist(), servo_rpy_deg.tolist())
+                last_hil_command_time = now
+                last_hil_servo_pos = servo_pos
+                last_hil_servo_rot = servo_rot
+
+                if (
+                    last_hil_gripper_open is None
+                    or abs(gripper_open - last_hil_gripper_open) >= HIL_GRIPPER_UPDATE_THRESHOLD
+                    or now - last_hil_gripper_update_time >= HIL_GRIPPER_UPDATE_INTERVAL_S
+                ):
+                    _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
+                    last_hil_gripper_open = gripper_open
+                    last_hil_gripper_update_time = now
+
+                if hil_target.translation_clamped or hil_target.rotation_clamped:
+                    print(
+                        "[HIL][WARN] command 已限幅 "
+                        f"translation={hil_target.translation_clamped} rotation={hil_target.rotation_clamped}"
+                    )
+                if args.hil_log_interval_s <= 0.0 or now - last_hil_log_time >= args.hil_log_interval_s:
+                    last_hil_log_time = now
+                    print(f"[HIL] takeover={hil_takeover_id} action:", action)
+
+                should_record_hil = (
+                    hil_recorder is not None
+                    and (
+                        args.hil_servo_record_interval_s <= 0.0
+                        or now - last_hil_record_time >= args.hil_servo_record_interval_s
+                    )
+                )
+                if should_record_hil:
+                    state_vec, image_obs, _, _ = read_single_observation()
+                    hil_recorder.record(
+                        state_8d=state_vec,
+                        action_8d=action7_rpy_deg_to_action8_quat(action),
+                        image_front=image_obs[args.single_image_key],
+                        task=args.description,
+                        subtask="hil_correction",
+                        timestamp=time.time(),
+                        control_mode="human",
+                        base_action_7d=last_policy_action_7d,
+                        human_action_7d=action,
+                        takeover_id=hil_takeover_id,
+                    )
+                    last_hil_record_time = time.monotonic()
                 continue
 
             if is_dual:
@@ -1089,6 +1181,7 @@ def main():
                         last_hil_command_time = 0.0
                         last_hil_servo_pos = None
                         last_hil_servo_rot = None
+                        last_hil_record_time = 0.0
                         dropped = hil_recorder.drop_recent_policy_frames(args.hil_pre_takeover_drop) if hil_recorder else 0
                         print(f"[HIL] 开始接管 takeover_id={hil_takeover_id}；已丢弃最近 policy 帧 {dropped} 条")
 
@@ -1137,34 +1230,7 @@ def main():
                     if args.hil_log_interval_s <= 0.0 or now - last_hil_log_time >= args.hil_log_interval_s:
                         last_hil_log_time = now
                         print(f"[HIL] takeover={hil_takeover_id} action:", action)
-                    if args.hil_xarm_control_mode == "servo":
-                        if last_hil_command_time > 0.0:
-                            sleep_s = max(args.dt, 0.0) - (time.monotonic() - last_hil_command_time)
-                            if sleep_s > 0.0:
-                                time.sleep(sleep_s)
-                        now = time.monotonic()
-                        servo_pos, servo_rot = _smooth_servo_target(
-                            last_hil_servo_pos,
-                            last_hil_servo_rot,
-                            np.asarray(hil_target.position_xyz_m, dtype=np.float64),
-                            R.from_euler("xyz", hil_target.euler_xyz_rad),
-                            pos_alpha=args.hil_servo_pos_alpha,
-                            rot_alpha=args.hil_servo_rot_alpha,
-                        )
-                        servo_rpy_deg = servo_rot.as_euler("xyz", degrees=True)
-                        _set_xarm_servo_pose(arms[single_arm], servo_pos.tolist(), servo_rpy_deg.tolist())
-                        last_hil_servo_pos = servo_pos
-                        last_hil_servo_rot = servo_rot
-                        if (
-                            last_hil_gripper_open is None
-                            or abs(gripper_open - last_hil_gripper_open) >= HIL_GRIPPER_UPDATE_THRESHOLD
-                            or now - last_hil_gripper_update_time >= HIL_GRIPPER_UPDATE_INTERVAL_S
-                        ):
-                            _set_xarm_gripper(arms[single_arm], gripper_open, arm_index=single_arm_index, wait=False)
-                            last_hil_gripper_open = gripper_open
-                            last_hil_gripper_update_time = now
-                        last_hil_command_time = now
-                    elif args.enable_interp:
+                    if args.enable_interp:
                         interp_and_move_one(
                             arms[single_arm],
                             cur_pos_single,
