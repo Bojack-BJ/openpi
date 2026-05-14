@@ -41,10 +41,10 @@ from Bestman_real_xarm6 import Bestman_Real_Xarm6  # noqa: E402
 
 # ====== policy server 参数 ======
 SERVER_IP = "180.184.74.93"
-PORT = 8004
+PORT = 8005
 
 # ====== 摄像头（YU12 / I420）参数 ======
-DEV = 1
+DEV = 0
 W, H, FPS = 1280, 1280, 100
 
 MASK_OVERLAY_KEY = "__mask_overlay"
