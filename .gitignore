@@ -40,3 +40,5 @@ cross_task_datasets/
 dataprocess_new/test/
 
 /exp_intermediate
+
+pi0_rollout_single_xarm_lxh.py
