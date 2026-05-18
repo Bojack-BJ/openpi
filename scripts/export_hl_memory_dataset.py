@@ -43,6 +43,10 @@ class ExportArgs:
     source_config_name: str
     annotations_jsonl: pathlib.Path
     output_dir: pathlib.Path | None = None
+    repo_id_override: str | None = None
+    asset_id_override: str | None = None
+    subtask_segments_path_override: str | None = None
+    force_prompt_from_task: bool = True
     output_train_dir: pathlib.Path | None = None
     output_val_dir: pathlib.Path | None = None
     visual_mode: Literal["raw", "config"] = "raw"
@@ -71,6 +75,7 @@ def main(args: ExportArgs) -> None:
     start_time = time.perf_counter()
     logging.info("Resolving training config: %s", args.source_config_name)
     config = training_config.get_config(args.source_config_name)
+    config = _apply_export_overrides(config, args)
     config = _resolve_hl_visual_config(config, visual_mode=args.visual_mode)
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(
@@ -228,6 +233,43 @@ def _export_split(
     )
 
 
+def _apply_export_overrides(config: Any, args: ExportArgs) -> Any:
+    if (
+        args.repo_id_override is None
+        and args.asset_id_override is None
+        and args.subtask_segments_path_override is None
+        and not args.force_prompt_from_task
+    ):
+        return config
+
+    data_factory = config.data
+    base_config = getattr(data_factory, "base_config", None) or training_config.DataConfig()
+    subtask_segments_path = (
+        args.subtask_segments_path_override
+        if args.subtask_segments_path_override is not None
+        else base_config.subtask_segments_path
+    )
+    if args.repo_id_override is not None and subtask_segments_path is None:
+        subtask_segments_path = "subtask_segments.json"
+
+    base_config = dataclasses.replace(
+        base_config,
+        prompt_from_task=True if args.force_prompt_from_task else base_config.prompt_from_task,
+        subtask_segments_path=subtask_segments_path,
+    )
+
+    replacements: dict[str, Any] = {"base_config": base_config}
+    if args.repo_id_override is not None:
+        replacements["repo_id"] = args.repo_id_override
+    if args.asset_id_override is not None or args.repo_id_override is not None:
+        assets = getattr(data_factory, "assets", training_config.AssetsConfig())
+        replacements["assets"] = dataclasses.replace(
+            assets,
+            asset_id=args.asset_id_override or args.repo_id_override,
+        )
+    return dataclasses.replace(config, data=dataclasses.replace(data_factory, **replacements))
+
+
 def _resolve_hl_visual_config(config: Any, *, visual_mode: str) -> Any:
     if visual_mode == "config":
         logging.info("HL export visual_mode=config still loads only RGB image columns; masks and overlays are excluded.")
@@ -273,8 +315,8 @@ def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loa
     if repo_id == "fake":
         raise ValueError("HL export does not support fake datasets.")
 
-    dataset_meta = openpi_lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset_root = openpi_lerobot_dataset.HF_LEROBOT_HOME / repo_id
+    dataset_meta = _load_lerobot_metadata(repo_id, dataset_root)
     selected_columns = _resolve_hl_export_columns(data_config, dataset_meta)
     parquet_files = sorted((dataset_root / "data").glob("**/*.parquet"))
     if not parquet_files:
@@ -300,6 +342,34 @@ def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loa
             ],
         )
     return dataset
+
+
+@dataclasses.dataclass(frozen=True)
+class _LocalLeRobotMetadata:
+    features: dict[str, Any]
+    tasks: dict[int, str]
+
+
+def _load_lerobot_metadata(repo_id: str, dataset_root: pathlib.Path) -> Any:
+    try:
+        return openpi_lerobot_dataset.LeRobotDatasetMetadata(repo_id, dataset_root)
+    except Exception as exc:  # LeRobot v2.1 may query Hugging Face refs before reading local metadata.
+        logging.warning("Falling back to local meta files for %s because metadata init failed: %s", repo_id, exc)
+        info_path = dataset_root / "meta" / "info.json"
+        tasks_path = dataset_root / "meta" / "tasks.jsonl"
+        if not info_path.is_file():
+            raise FileNotFoundError(info_path) from exc
+        with info_path.open("r", encoding="utf-8") as stream:
+            info = json.load(stream)
+        tasks: dict[int, str] = {}
+        if tasks_path.is_file():
+            with tasks_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    tasks[int(row["task_index"])] = str(row["task"])
+        return _LocalLeRobotMetadata(features=dict(info.get("features", {})), tasks=tasks)
 
 
 def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any) -> tuple[str, ...]:

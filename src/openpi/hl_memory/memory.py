@@ -73,4 +73,3 @@ class EpisodicKeyframeMemory:
     def visible_indices(self, current_context_indices: Sequence[int]) -> list[int]:
         hidden = set(int(index) for index in current_context_indices)
         return [index for index in self.selected_indices() if index not in hidden]
-
