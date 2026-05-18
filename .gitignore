@@ -42,3 +42,4 @@ dataprocess_new/test/
 /exp_intermediate
 /hl_memory_ckpts
 /docs/hl_memory_code_design_notes.md
+dataprocess_new/test/
