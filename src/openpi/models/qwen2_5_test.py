@@ -7,8 +7,13 @@ import openpi.models.qwen2_5.text as _qwen2_5_text
 import openpi.models.vlm_backbone_config as _vlm_backbone_config
 
 
-def _make_qwen_config(action_expert_variant: _vlm_backbone_config.Variant = "qwen2_5_3b") -> _pi0_config.Pi0Config:
+def _make_qwen_config(
+    action_expert_variant: _vlm_backbone_config.Variant = "qwen2_5_3b",
+    *,
+    pi05: bool = False,
+) -> _pi0_config.Pi0Config:
     return _pi0_config.Pi0Config(
+        pi05=pi05,
         vlm_backend="qwen2_5_vl",
         vlm_backbone_variant="qwen2_5_3b",
         action_expert_variant=action_expert_variant,
@@ -79,6 +84,34 @@ def test_qwen2_5_small_action_expert_model_builds():
 
     assert any("action_in_proj/kernel" in path for path in flat_paths)
     assert any("vlm_with_expert/llm/layers_0/pre_attention_norm_1" in path for path in flat_paths)
+
+
+def test_qwen2_5_pi05_builds_with_adarms_and_suffix_excludes_state():
+    config = _make_qwen_config(action_expert_variant="qwen2_5_3b_action_400m", pi05=True)
+    model = config.create(jax.random.key(0))
+    obs, actions = config.fake_obs(batch_size=2), config.fake_act(batch_size=2)
+    suffix_tokens, suffix_mask, _, adarms_cond = model.embed_suffix(
+        obs,
+        actions,
+        jax.numpy.ones((2,), dtype=jax.numpy.float32),
+    )
+
+    expert_config = _vlm_backbone_config.get_config("qwen2_5_3b_action_400m")
+    assert config.discrete_state_input
+    assert suffix_tokens.shape == (2, config.action_horizon, expert_config.width)
+    assert suffix_mask.shape == (2, config.action_horizon)
+    assert adarms_cond.shape == (2, expert_config.width)
+
+
+def test_qwen2_5_pi05_adarms_params_exist():
+    config = _make_qwen_config(action_expert_variant="qwen2_5_3b_action_400m", pi05=True)
+    abstract_model = nnx.eval_shape(config.create, jax.random.key(0))
+    flat_state = nnx.state(abstract_model, nnx.Param).flat_state()
+    flat_paths = ["/".join(str(part) for part in path) for path in flat_state]
+
+    assert any("pre_attention_norm_1/Dense_0/kernel" in path for path in flat_paths)
+    assert any("pre_ffw_norm_1/Dense_0/kernel" in path for path in flat_paths)
+    assert any("final_norm_1/Dense_0/kernel" in path for path in flat_paths)
 
 
 def test_qwen_jax_scaffold_embed_image_and_multimodal_positions():

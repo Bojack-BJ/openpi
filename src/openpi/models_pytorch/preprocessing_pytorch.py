@@ -34,6 +34,7 @@ def preprocess_observation_pytorch(
     batch_shape = observation.state.shape[:-1]
 
     out_images = {}
+    has_guidance_mask_images = any("mask" in key for key in image_keys)
     for key in image_keys:
         image = observation.images[key]
 
@@ -49,7 +50,7 @@ def preprocess_observation_pytorch(
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad_torch(image, *image_resolution)
 
-        if train:
+        if train and not has_guidance_mask_images:
             # Convert from [-1, 1] to [0, 1] for PyTorch augmentations
             image = image / 2.0 + 0.5
 

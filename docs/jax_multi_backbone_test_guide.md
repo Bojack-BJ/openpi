@@ -51,6 +51,30 @@ In other words:
 - `qwen3_5_vl` now exercises a much more faithful official 3.5 text + vision architecture
 - `qwen3_5_vl` now targets the official HF Qwen3.5 checkpoint tree more directly, but still needs runtime validation in your environment
 
+### Qwen Pi05
+
+JAX Qwen now supports the `Pi0Config(pi05=True, vlm_backend="qwen2_5_vl" | "qwen3_5_vl")` path.
+
+The important Pi05-specific behavior is:
+
+- robot state must be encoded as discrete language text in the prompt/prefix
+- `ModelTransformFactory` should use `discrete_state_input=True`
+- Qwen tokenizers format the state through the Pi05 prompt text path before model input
+- `Pi0.embed_suffix(...)` skips the continuous state token for Pi05, so the suffix contains action tokens only
+- the Qwen action expert uses AdaRMS timestep conditioning through `use_adarms=[False, True]`
+
+The config now guards this invariant:
+
+- Qwen Pi05 with `discrete_state_input=False` raises a clear `ValueError`
+- PaliGemma Pi05 behavior is unchanged
+
+HF loading expectation:
+
+- `Qwen2_5WeightLoader(..., load_action_expert=False)` and `Qwen3_5WeightLoader(..., load_action_expert=False)` remain the intended Pi05 defaults
+- pretrained Qwen VLM params are loaded from HF/local snapshots
+- action-expert AdaRMS params are newly initialized
+- old Pi0 Qwen full train states should not be expected to resume directly as Pi05 full train states
+
 ## Prerequisites
 
 Your Python environment should have at least:
@@ -82,6 +106,46 @@ What these cover:
 - Qwen JAX `embed_prefix()` now runs instead of failing on image embedding
 - Qwen JAX backend-owned multimodal positions are produced with shape `[3, B, T]`
 - Qwen3.5 JAX vision embedding and merged image grid metadata are produced with the expected shapes
+- Qwen Pi05 validates discrete state input and builds AdaRMS action-expert params
+
+### Qwen Pi05 targeted unit tests
+
+Run these when touching Pi05 state handling, Qwen action-expert norms, or Qwen config defaults.
+
+```bash
+python -m pytest src/openpi/models/pi0_test.py::test_qwen_pi05_requires_discrete_state_input -q
+python -m pytest \
+  src/openpi/models/qwen2_5_test.py::test_qwen2_5_pi05_builds_with_adarms_and_suffix_excludes_state \
+  src/openpi/models/qwen2_5_test.py::test_qwen2_5_pi05_adarms_params_exist \
+  -q
+python -m pytest \
+  src/openpi/models/qwen3_5_test.py::test_qwen3_5_pi05_builds_with_adarms_and_suffix_excludes_state \
+  src/openpi/models/qwen3_5_test.py::test_qwen3_5_pi05_adarms_params_exist \
+  -q
+```
+
+Expected:
+
+- Qwen Pi05 rejects `discrete_state_input=False`
+- suffix token count is exactly `action_horizon`
+- suffix no longer includes a continuous state token
+- `adarms_cond` is produced for the action expert branch
+- adaptive norm params exist under action-expert norms and final norm
+
+If the environment does not have `pytest`, use this as a syntax-only fallback before remote testing:
+
+```bash
+python -m py_compile \
+  src/openpi/models/pi0_config.py \
+  src/openpi/models/qwen2_5/text.py \
+  src/openpi/models/qwen3_5/text.py \
+  src/openpi/models/qwen2_5/adapter.py \
+  src/openpi/models/qwen3_5/adapter.py \
+  src/openpi/models/pi0_test.py \
+  src/openpi/models/qwen2_5_test.py \
+  src/openpi/models/qwen3_5_test.py \
+  src/openpi/training/config.py
+```
 
 ## 2. Minimal Forward Smoke
 
@@ -179,6 +243,54 @@ Interpretation:
 
 - if this passes, it means the JAX `Qwen3.5` hybrid text + vision backbone is wired into `Pi0`
 - it still does **not** by itself guarantee full end-to-end checkpointed training parity
+
+### Qwen Pi05 forward smoke
+
+This checks the Pi05 prefix/suffix split without entering the trainer.
+
+```bash
+python - <<'PY'
+import jax
+import jax.numpy as jnp
+from openpi.models import pi0_config
+
+cfg = pi0_config.Pi0Config(
+    pi05=True,
+    vlm_backend="qwen2_5_vl",
+    vlm_backbone_variant="qwen2_5_3b",
+    action_expert_variant="qwen2_5_3b_action_400m",
+)
+model = cfg.create(jax.random.key(0))
+obs, act = cfg.fake_obs(2), cfg.fake_act(2)
+
+prefix_tokens, prefix_mask, _, _ = model.embed_prefix(obs)
+suffix_tokens, suffix_mask, _, adarms_cond = model.embed_suffix(
+    obs,
+    act,
+    jnp.ones((2,), dtype=jnp.float32),
+)
+
+print("prefix shape:", prefix_tokens.shape)
+print("suffix shape:", suffix_tokens.shape)
+print("suffix mask shape:", suffix_mask.shape)
+print("adarms cond shape:", adarms_cond.shape)
+PY
+```
+
+Expected:
+
+- prefix embedding accepts tokenized prompts that already include discretized state
+- suffix shape is `(batch, action_horizon, expert_width)`
+- suffix mask shape is `(batch, action_horizon)`
+- `adarms_cond` is present for the action expert
+
+Repeat the same smoke for Qwen3.5 by changing:
+
+```python
+vlm_backend="qwen3_5_vl"
+vlm_backbone_variant="qwen3_5_2b"
+action_expert_variant="qwen3_5_2b_action_400m"
+```
 
 ## 3. Tiny Training Smoke
 
@@ -307,6 +419,56 @@ Current expectation:
 - successful execution still needs to be validated in your own JAX runtime
 - `Qwen3_5WeightLoader` initializes the VLM branch by default; the action expert remains random-init unless `load_action_expert=True`
 
+### Qwen Pi05 tiny training smoke
+
+Use these named configs to validate the JAX Qwen Pi05 trainer path on fake data.
+
+```bash
+python scripts/train.py debug_qwen2_5_pi05 \
+  --overwrite \
+  --no-wandb-enabled \
+  --num_train_steps 1
+```
+
+```bash
+python scripts/train.py debug_qwen3_5_pi05 \
+  --overwrite \
+  --no-wandb-enabled \
+  --num_train_steps 1
+```
+
+What this checks:
+
+- `Pi0Config(pi05=True, vlm_backend=...)` builds for Qwen
+- discrete state remains on the prefix/tokenizer side
+- suffix contains action tokens only
+- action-expert AdaRMS params are initialized
+- one fake-data train step can compile and execute
+
+### Qwen Pi05 pretrained-loader smoke
+
+Use these only when the local snapshot paths exist or after updating the config paths.
+
+```bash
+python scripts/train.py debug_qwen2_5_pi05_pretrained \
+  --overwrite \
+  --no-wandb-enabled \
+  --num_train_steps 1
+```
+
+```bash
+python scripts/train.py debug_qwen3_5_pi05_pretrained \
+  --overwrite \
+  --no-wandb-enabled \
+  --num_train_steps 1
+```
+
+Expected:
+
+- Qwen VLM params load from HF/local safetensors
+- action-expert AdaRMS params remain random-init
+- the run should not attempt to load HF weights into action-expert AdaRMS params
+
 ## 4. Real-Geometry Qwen Training Smoke
 
 If the tiny Qwen smoke passes, move on to the real JAX Qwen config already present in the repo:
@@ -410,8 +572,13 @@ Run tests in this order:
 6. `debug` tiny training smoke for `qwen2_5_vl`
 7. optional `debug_qwen2_5_pretrained` tiny training smoke
 8. optional `debug` tiny training smoke for `qwen3_5_vl`
-9. `fruit_classification_Aa_qwen` real-geometry smoke
-10. optional `fruit_classification_Aa_qwen3_5` real-geometry smoke with official loader
+9. Qwen Pi05 targeted unit tests
+10. `debug_qwen2_5_pi05` tiny training smoke
+11. `debug_qwen3_5_pi05` tiny training smoke
+12. optional `debug_qwen2_5_pi05_pretrained` loader smoke
+13. optional `debug_qwen3_5_pi05_pretrained` loader smoke
+14. `fruit_classification_Aa_qwen` real-geometry smoke
+15. optional `fruit_classification_Aa_qwen3_5` real-geometry smoke with official loader
 
 This order keeps failures easy to localize:
 
@@ -447,6 +614,8 @@ Current JAX Qwen limitations:
 - vision path is pragmatic rather than checkpoint-faithful
 - `Qwen2_5WeightLoader` currently loads text weights only
 - this should be treated as a structural/runtime migration milestone, not final parity
+- Qwen Pi05 should use VLM-only HF loading by default; action-expert AdaRMS params are new trainable params
+- old Pi0 Qwen full train states are not expected to resume as Pi05 full train states because the action-expert norm structure changed
 
 Current `qwen3_5_vl` limitations:
 

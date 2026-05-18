@@ -90,6 +90,13 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional episode-level subtask segmentation JSON. If set, the LeRobot data loader will attach
+    # a frame-level "subtask" field before the normal repack/model transforms.
+    subtask_segments_path: str | None = None
+
+    # Optional column projection for LeRobot parquet loading. Use this to avoid decoding unused image/video columns.
+    dataset_columns: Sequence[str] | None = None
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -790,6 +797,284 @@ class FastUMIdualData14DRPYConfig(DataConfigFactory):
             action_sequence_keys=keys,
         )
 
+
+@dataclasses.dataclass(frozen=True)
+class FastUMIData7DRPYGuidedConfig(DataConfigFactory):
+    """Single-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
+
+    overlay_alpha: float = 0.35
+    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay", "mask_images"] = "online_overlay"
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay", "mask_images"):
+            raise ValueError(f"Unsupported guidance_image_mode: {self.guidance_image_mode}")
+        image_path = (
+            "observation.images.front_overlay"
+            if self.guidance_image_mode == "offline_overlay"
+            else "observation.images.front"
+        )
+        use_online_overlay = self.guidance_image_mode == "online_overlay"
+        use_mask_images = self.guidance_image_mode == "mask_images"
+        image_structure: dict[str, Any] = {"front": image_path}
+        repack_structure: dict[str, Any] = {
+            "state": "observation.state",
+            "actions": "action",
+            "image": image_structure,
+            "subtask": "subtask",
+            "prompt": "prompt",
+        }
+        if use_online_overlay or use_mask_images:
+            repack_structure["mask"] = {"front": "observation.masks.front_mask"}
+
+        dataset_columns = [
+            "observation.state",
+            "action",
+            "robot_0_state",
+            image_path,
+            "subtask",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        ]
+        if use_online_overlay or use_mask_images:
+            dataset_columns.append("observation.masks.front_mask")
+
+        repack = _transforms.Group(
+            inputs=[
+                _transforms.InjectOptionalGuidanceFields(
+                    image_to_mask_paths={
+                        "observation.images.front": "observation.masks.front_mask",
+                    }
+                    if use_online_overlay or use_mask_images
+                    else {},
+                    image_default_paths={
+                        "observation.images.front_overlay": "observation.images.front",
+                    }
+                    if self.guidance_image_mode == "offline_overlay"
+                    else {},
+                ),
+                _transforms.RepackTransform(repack_structure),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                _transforms.ToNumpy(),
+                *(
+                    [
+                        _transforms.OverlayMasksOnImages(
+                            image_to_mask_keys={"front": "front"},
+                            alpha=self.overlay_alpha,
+                        )
+                    ]
+                    if self.guidance_image_mode == "online_overlay"
+                    else []
+                ),
+                _transforms.ComposePromptWithSubtask(),
+                fastumi_policy.FastUMIInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    include_mask_images=use_mask_images,
+                ),
+                _transforms.ChunkRelDeltaPoseRPY(
+                    pos_slice=slice(0, 3),
+                    quat_slice=slice(3, 7),
+                    grip_slice=slice(7, 8),
+                    action_key="actions",
+                    degrees=True,
+                    include_gripper=True,
+                    gripper_as_delta=True,
+                    mask=None,
+                ),
+                _transforms.PadStatesAndActions(
+                    model_action_dim=model_config.action_dim,
+                ),
+            ],
+            outputs=[
+                _transforms.SliceActions(
+                    dim=7,
+                    action_key="actions",
+                ),
+                _transforms.ChunkRelDeltaPoseRPYInverse(
+                    pos_slice=slice(0, 3),
+                    quat_slice=slice(3, 7),
+                    grip_slice=slice(7, 8),
+                    action_key="actions",
+                    degrees=True,
+                    include_gripper=True,
+                    gripper_as_delta=True,
+                    euler_order="xyz",
+                    mask=None,
+                ),
+                fastumi_policy.FastUMIOutputs(
+                    original_action_dim=7,
+                ),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+        keys: Sequence[str] = ("action",)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=keys,
+            dataset_columns=tuple(dataset_columns),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class FastUMIdualData14DRPYGuidedConfig(DataConfigFactory):
+    """Dual-arm FastUMI config with optional mask overlay and subtask prompt conditioning."""
+
+    overlay_alpha: float = 0.35
+    guidance_image_mode: Literal["raw", "online_overlay", "offline_overlay", "mask_images"] = "online_overlay"
+
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.guidance_image_mode not in ("raw", "online_overlay", "offline_overlay", "mask_images"):
+            raise ValueError(f"Unsupported guidance_image_mode: {self.guidance_image_mode}")
+        robot_0_image_path = (
+            "observation.images.robot_0_overlay"
+            if self.guidance_image_mode == "offline_overlay"
+            else "observation.images.robot_0_image"
+        )
+        robot_1_image_path = (
+            "observation.images.robot_1_overlay"
+            if self.guidance_image_mode == "offline_overlay"
+            else "observation.images.robot_1_image"
+        )
+        use_online_overlay = self.guidance_image_mode == "online_overlay"
+        use_mask_images = self.guidance_image_mode == "mask_images"
+        repack_structure: dict[str, Any] = {
+            "state": "observation.state",
+            "actions": "action",
+            "image": {
+                "robot_0": robot_0_image_path,
+                "robot_1": robot_1_image_path,
+            },
+            "subtask": "subtask",
+            "prompt": "prompt",
+        }
+        if use_online_overlay or use_mask_images:
+            repack_structure["mask"] = {
+                "robot_0": "observation.masks.robot_0_mask",
+                "robot_1": "observation.masks.robot_1_mask",
+            }
+
+        dataset_columns = [
+            "observation.state",
+            "action",
+            "robot_0_state",
+            "robot_1_state",
+            robot_0_image_path,
+            robot_1_image_path,
+            "subtask",
+            "timestamp",
+            "frame_index",
+            "episode_index",
+            "index",
+            "task_index",
+        ]
+        if use_online_overlay or use_mask_images:
+            dataset_columns.extend(
+                [
+                    "observation.masks.robot_0_mask",
+                    "observation.masks.robot_1_mask",
+                ]
+            )
+
+        repack = _transforms.Group(
+            inputs=[
+                _transforms.InjectOptionalGuidanceFields(
+                    image_to_mask_paths={
+                        "observation.images.robot_0_image": "observation.masks.robot_0_mask",
+                        "observation.images.robot_1_image": "observation.masks.robot_1_mask",
+                    }
+                    if use_online_overlay or use_mask_images
+                    else {},
+                    image_default_paths={
+                        "observation.images.robot_0_overlay": "observation.images.robot_0_image",
+                        "observation.images.robot_1_overlay": "observation.images.robot_1_image",
+                    }
+                    if self.guidance_image_mode == "offline_overlay"
+                    else {},
+                ),
+                _transforms.RepackTransform(repack_structure),
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                _transforms.ToNumpy(),
+                *(
+                    [
+                        _transforms.OverlayMasksOnImages(
+                            image_to_mask_keys={
+                                "robot_0": "robot_0",
+                                "robot_1": "robot_1",
+                            },
+                            alpha=self.overlay_alpha,
+                        )
+                    ]
+                    if self.guidance_image_mode == "online_overlay"
+                    else []
+                ),
+                _transforms.ComposePromptWithSubtask(),
+                fastumi_policy.FastUMIInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    include_mask_images=use_mask_images,
+                ),
+                _transforms.ChunkRelDeltaRPYBimanual(
+                    left_state_slice=slice(0, 8),
+                    right_state_slice=slice(8, 16),
+                    left_action_slice=slice(0, 8),
+                    right_action_slice=slice(8, 16),
+                    action_key="actions",
+                    gripper_as_delta=True,
+                    degrees=True,
+                    mask=None,
+                ),
+                _transforms.PadStatesAndActions(
+                    model_action_dim=model_config.action_dim,
+                ),
+            ],
+            outputs=[
+                _transforms.SliceActions(
+                    dim=14,
+                    action_key="actions",
+                ),
+                _transforms.ChunkRelDeltaRPYInverseBimanual(
+                    left_state_slice=slice(0, 8),
+                    right_state_slice=slice(8, 16),
+                    action_key="actions",
+                    gripper_as_delta=True,
+                    degrees=True,
+                    euler_order="xyz",
+                    mask=None,
+                ),
+                fastumi_policy.FastUMIOutputs(
+                    original_action_dim=14,
+                ),
+            ],
+        )
+
+        model_transforms = ModelTransformFactory()(model_config)
+        keys: Sequence[str] = ("action",)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=keys,
+            dataset_columns=tuple(dataset_columns),
+        )
+
 @dataclasses.dataclass(frozen=True)
 class FastUMIDepthDataConfig(DataConfigFactory):
 
@@ -974,6 +1259,10 @@ class TrainConfig:
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
+    # Number of already-materialized training batches to keep in a host/device-side prefetch buffer.
+    train_prefetch_batches: int = 2
+    # If true, log host-side efficiency metrics such as data wait time and examples/sec to W&B.
+    log_efficiency_metrics: bool = True
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -2049,6 +2338,215 @@ _CONFIGS = [
         qwen3_5_remat_mode="linear_only",
         ),
     TrainConfig(
+        name="toy_block_placement_Ba_qwen3_5_2b_400m_guided",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_2B,
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        data=FastUMIdualData14DRPYGuidedConfig(
+            repo_id="fastumi/20260312H081Ba_toy_block",
+            assets=AssetsConfig(
+                assets_dir="./assets/20260312H081Ba_toy_block",
+                asset_id="fastumi/20260312H081Ba_toy_block",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                subtask_segments_path="subtask_segments.json",
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_2B, local_files_only=True),
+        num_train_steps=60_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=32,
+        qwen3_5_remat_mode="linear_only",
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_pi0_xarm",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_xarm",
+            guidance_image_mode="offline_overlay",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_xarm",
+                asset_id="fastumi/sponge_visual_guided_xarm",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi0_xarm",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_xarm",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_xarm",
+                asset_id="fastumi/sponge_visual_guided_xarm",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi0_touch",
+        model=pi0_config.Pi0Config(),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_touch",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_touch",
+                asset_id="fastumi/sponge_visual_guided_touch",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_pi05_touch",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_touch",
+            guidance_image_mode="offline_overlay",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_touch",
+                asset_id="fastumi/sponge_visual_guided_touch",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi05_xarm",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_xarm",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_xarm",
+                asset_id="fastumi/sponge_visual_guided_xarm",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_mask_keys_pi05_touch",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided_touch",
+            guidance_image_mode="mask_images",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided_touch",
+                asset_id="fastumi/sponge_visual_guided_touch",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_qwen2_5_3b_400m",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_2_5_3B,
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="offline_overlay",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(LOCAL_QWEN_2_5_3B, local_files_only=True),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+    ),
+    TrainConfig(
+        name="sponge_visual_guided_qwen3_5_2b_400m",
+        model=pi0_config.Pi0Config(
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id=LOCAL_QWEN_3_5_2B,
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        data=FastUMIData7DRPYGuidedConfig(
+            repo_id="fastumi/sponge_visual_guided",
+            guidance_image_mode="offline_overlay",
+            assets=AssetsConfig(
+                assets_dir="./assets/sponge_visual_guided",
+                asset_id="fastumi/sponge_visual_guided",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(LOCAL_QWEN_3_5_2B, local_files_only=True),
+        num_train_steps=120_000,
+        ema_decay=None,
+        batch_size=32,
+        num_workers=8,
+        qwen3_5_remat_mode="linear_only",
+    ),
+    TrainConfig(
         name="unplug_network_cable",
         # Here is an example of loading a pi0 model for LoRA fine-tuning.
         model=pi0_config.Pi0Config(),
@@ -2643,6 +3141,82 @@ _CONFIGS = [
         weight_loader=weight_loaders.Qwen2_5WeightLoader("Qwen/Qwen2.5-VL-3B-Instruct", local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct"),
         overwrite=True,
         exp_name="debug_qwen2_5_3B_400M",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_pi05",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-3B",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        overwrite=True,
+        exp_name="debug_qwen2_5_pi05",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen2_5_pi05_pretrained",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            vlm_backend="qwen2_5_vl",
+            vlm_hf_model_id="Qwen/Qwen2.5-VL-3B-Instruct",
+            vlm_backbone_variant="qwen2_5_3b",
+            action_expert_variant="qwen2_5_3b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen2_5WeightLoader(
+            "Qwen/Qwen2.5-VL-3B-Instruct",
+            local_snapshot_path="/root/Users/lixiaotong/Qwen2.5-VL-3B-Instruct",
+        ),
+        overwrite=True,
+        exp_name="debug_qwen2_5_pi05_pretrained",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_pi05",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        overwrite=True,
+        exp_name="debug_qwen3_5_pi05",
+        num_train_steps=10,
+        ema_decay=None,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="debug_qwen3_5_pi05_pretrained",
+        data=FakeDataConfig(),
+        batch_size=2,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            vlm_backend="qwen3_5_vl",
+            vlm_hf_model_id="Qwen/Qwen3.5-2B",
+            vlm_backbone_variant="qwen3_5_2b",
+            action_expert_variant="qwen3_5_2b_action_400m",
+        ),
+        weight_loader=weight_loaders.Qwen3_5WeightLoader(
+            "Qwen/Qwen3.5-2B",
+            local_snapshot_path="/root/Users/lixiaotong/Qwen3.5-2B",
+        ),
+        overwrite=True,
+        exp_name="debug_qwen3_5_pi05_pretrained",
         num_train_steps=10,
         ema_decay=None,
         wandb_enabled=False,

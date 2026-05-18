@@ -82,3 +82,63 @@ def test_with_real_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_parse_subtask_segments_from_boundaries_payload():
+    payload = {
+        "boundaries_frame_indices": [168, 462],
+        "subtask": ["pick up the sponge", "place the sponge in the grid", "return home"],
+        "subtask_instruction": [
+            {"[0,167]": "pick up the sponge"},
+            {"[168,461]": "place the sponge in the grid"},
+            {"[462,900]": "return home"},
+        ],
+    }
+
+    segments = _data_loader._parse_subtask_segments(payload)
+
+    assert segments[0] == (
+        (0, 168, "pick up the sponge"),
+        (168, 462, "place the sponge in the grid"),
+        (462, 901, "return home"),
+    )
+
+
+def test_parse_subtask_segments_from_episode_mapping():
+    payload = {
+        "episodes": {
+            "3": {
+                "segments": [
+                    {"start_frame": 0, "end_frame": 5, "subtask": "pick"},
+                    {"start_frame": 5, "end_frame": 9, "subtask": "place"},
+                ]
+            }
+        }
+    }
+
+    segments = _data_loader._parse_subtask_segments(payload)
+
+    assert segments[3] == ((0, 5, "pick"), (5, 9, "place"))
+
+
+def test_parse_subtask_segments_from_episode_list():
+    payload = {
+        "episodes": [
+            {
+                "episode_index": 2,
+                "segments": [
+                    {"start_frame": 1, "end_frame": 4, "subtask": "align"},
+                ],
+            }
+        ]
+    }
+
+    segments = _data_loader._parse_subtask_segments(payload)
+
+    assert segments[2] == ((1, 4, "align"),)
+
+
+def test_load_subtask_segments_missing_file_returns_empty(tmp_path):
+    segments = _data_loader._load_subtask_segments("missing_subtask_segments.json", tmp_path)
+
+    assert segments == {}

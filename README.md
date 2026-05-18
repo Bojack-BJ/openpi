@@ -53,6 +53,31 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
+## HL Memory Experiments
+
+This repo also contains a standalone high-level memory / subtask pipeline under [`src/openpi/hl_memory`](src/openpi/hl_memory), separate from the existing LL action models.
+
+- The current V1 runtime path is Qwen-based and consumes two ordered visual clips:
+  - historical memory keyframes
+  - recent observation window
+- Runtime backends currently include `qwen2_5_vl` and `qwen3_5_vl`; Qwen3.5 supports `vlm_variant` values
+  `qwen3_5_2b` / `qwen3_5_4b` / `qwen3_5_27b`.
+- For Qwen3.5 27B OOM, use `--parallel-mode device_map --device-map auto` first. Native tensor parallel is exposed as
+  `--parallel-mode tensor_parallel --tensor-parallel-plan auto` and should be launched with `torchrun` when supported by
+  the active Transformers/checkpoint config.
+- Qwen3.5 thinking is disabled by default for HL memory because this task expects short structured JSON. Use
+  `--enable-thinking` only when you explicitly want reasoning traces; the parser will clean the output and extract the
+  final JSON.
+- It predicts:
+  - updated language memory
+  - current subtask
+  - recent-window keyframe candidate positions
+- A zero-shot inference entrypoint for your own single-view or left/right view videos is available at
+  [`scripts/run_hl_memory_zero_shot.py`](scripts/run_hl_memory_zero_shot.py)
+- The same entrypoint also supports interval rollout with `--rollout-interval-sec`, saving per-step raw model output,
+  language-memory updates, recent/memory frames, and selected keyframe candidates under `--debug-dir`.
+- Overview and dataset/export/train/eval instructions: [docs/hl_memory_v1.md](docs/hl_memory_v1.md)
+- CrossTask smoke workflow: [`scripts/hl_memory_crosstask_smoke.sh`](scripts/hl_memory_crosstask_smoke.sh)
 
 
 

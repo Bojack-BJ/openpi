@@ -52,6 +52,10 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.pi05 and self.vlm_backend in ("qwen2_vl", "qwen2_5_vl", "qwen3_5_vl") and not self.discrete_state_input:
+            raise ValueError(
+                "Qwen Pi05 requires `discrete_state_input=True` so robot state is encoded in the prefix prompt."
+            )
         if self.vlm_backend not in ("paligemma", "qwen2_vl", "qwen2_5_vl", "qwen3_5_vl", "internvl3"):
             raise ValueError(f"Unsupported vlm_backend: {self.vlm_backend}")
         if self.vlm_backend in ("qwen2_vl", "qwen2_5_vl") and self.vlm_hf_model_id is None:

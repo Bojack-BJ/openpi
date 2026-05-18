@@ -22,8 +22,6 @@ class Qwen2_5_VLWithExpertModel(nnx.Module):
         hf_model_id: str | None = None,
     ):
         self.hf_model_id = hf_model_id
-        if any(use_adarms):
-            raise NotImplementedError("JAX Qwen adapter does not support pi05/AdaRMS conditioning yet.")
         if vlm_config.depth != action_expert_config.depth:
             raise ValueError(
                 "JAX Qwen adapter currently requires matching prefix/expert depth: "

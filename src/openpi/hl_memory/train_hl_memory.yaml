@@ -1,0 +1,8 @@
+dataset_dir: /path/to/hl_memory_train_local
+output_dir: /path/to/hl_memory_ckpts
+vlm_backend: qwen2_5_vl
+local_vlm_ckpt_path: /path/to/local/qwen-vl-checkpoint
+device: cuda
+batch_size: 1
+grad_accum_steps: 4
+num_train_steps: 1000

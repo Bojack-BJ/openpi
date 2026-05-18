@@ -15,6 +15,47 @@ def _parse_image(image) -> np.ndarray:
     return img
 
 
+def _mask_to_rgb_image(mask, reference_image: np.ndarray) -> np.ndarray:
+    """Convert an optional 2D/1CH/3CH mask to an HWC uint8 RGB image."""
+    mask_np = np.asarray(mask)
+    if mask_np.ndim == 3:
+        if mask_np.shape[-1] == 1:
+            mask_np = mask_np[..., 0]
+        elif mask_np.shape[0] == 1:
+            mask_np = mask_np[0]
+        elif mask_np.shape[-1] in (3, 4):
+            mask_np = np.max(mask_np[..., :3], axis=-1)
+        elif mask_np.shape[0] in (3, 4):
+            mask_np = np.max(mask_np[:3], axis=0)
+    if mask_np.ndim != 2:
+        raise ValueError(f"Expected mask rank 2 or single-channel/rgb rank 3, got shape={mask_np.shape}")
+    if mask_np.shape != reference_image.shape[:2]:
+        raise ValueError(f"Mask shape {mask_np.shape} does not match image shape {reference_image.shape[:2]}")
+
+    if mask_np.dtype == np.bool_:
+        mask_bool = mask_np
+    elif np.issubdtype(mask_np.dtype, np.floating):
+        mask_bool = mask_np > (0.0 if np.nanmax(mask_np) > 1.0 else 0.5)
+    else:
+        mask_bool = mask_np > 0
+
+    mask_rgb = np.zeros_like(reference_image, dtype=np.uint8)
+    mask_rgb[mask_bool] = 255
+    return mask_rgb
+
+
+def _optional_mask_image(data: dict, img_dict: dict, name: str, reference_image: np.ndarray) -> tuple[np.ndarray, bool]:
+    mask_dict = data.get("mask", {})
+    if isinstance(mask_dict, dict) and name in mask_dict:
+        return _mask_to_rgb_image(mask_dict[name], reference_image), True
+
+    for key in (f"{name}_mask", f"{name}_mask_rgb"):
+        if key in img_dict:
+            return _mask_to_rgb_image(img_dict[key], reference_image), True
+
+    return np.zeros_like(reference_image, dtype=np.uint8), False
+
+
 def _infer_bimanual(data: dict) -> bool:
     """自动判断单臂/双臂：优先看 image keys，其次看 state 维度。"""
     img = data.get("image", {})
@@ -39,9 +80,10 @@ class FastUMIInputs(transforms.DataTransformFn):
     model_type: _model.ModelType = _model.ModelType.PI0
     bimanual: bool | None = None
     use_depth_as_left_wrist: bool = False
+    include_mask_images: bool = False
 
     def __call__(self, data: dict) -> dict:
-        mask_padding = (self.model_type == _model.ModelType.PI0)
+        mask_padding = (self.model_type == _model.ModelType.PI0) or self.include_mask_images
 
         state = np.asarray(data["state"])
 
@@ -61,6 +103,9 @@ class FastUMIInputs(transforms.DataTransformFn):
             base_mask = True
             left_mask = (not mask_padding)
             right_mask = (not mask_padding)
+            base_mask_rgb, base_guidance_mask = _optional_mask_image(data, img_dict, "front", base_rgb)
+            left_mask_rgb, left_guidance_mask = zero_img, False
+            right_mask_rgb, right_guidance_mask = zero_img, False
 
         else:
             if "robot_0" not in img_dict or "robot_1" not in img_dict:
@@ -77,25 +122,47 @@ class FastUMIInputs(transforms.DataTransformFn):
             base_mask = (not mask_padding)
             left_mask = True
             right_mask = True
+            base_mask_rgb, base_guidance_mask = zero_img, False
+            left_mask_rgb, left_guidance_mask = _optional_mask_image(data, img_dict, "robot_0", left_rgb)
+            right_mask_rgb, right_guidance_mask = _optional_mask_image(data, img_dict, "robot_1", right_rgb)
 
         if self.use_depth_as_left_wrist:
             if "depth" not in img_dict:
                 raise KeyError("use_depth_as_left_wrist=True but image['depth'] is missing.")
             left_rgb = _parse_image(img_dict["depth"])
             left_mask = True
+            left_mask_rgb, left_guidance_mask = _optional_mask_image(data, img_dict, "depth", left_rgb)
+
+        image = {
+            "base_0_rgb": base_rgb,
+            "left_wrist_0_rgb": left_rgb,
+            "right_wrist_0_rgb": right_rgb,
+        }
+        image_mask = {
+            "base_0_rgb": base_mask,
+            "left_wrist_0_rgb": left_mask,
+            "right_wrist_0_rgb": right_mask,
+        }
+        if self.include_mask_images:
+            image.update(
+                {
+                    "base_0_mask_rgb": base_mask_rgb,
+                    "left_wrist_0_mask_rgb": left_mask_rgb,
+                    "right_wrist_0_mask_rgb": right_mask_rgb,
+                }
+            )
+            image_mask.update(
+                {
+                    "base_0_mask_rgb": base_guidance_mask,
+                    "left_wrist_0_mask_rgb": left_guidance_mask,
+                    "right_wrist_0_mask_rgb": right_guidance_mask,
+                }
+            )
 
         inputs = {
             "state": state,
-            "image": {
-                "base_0_rgb": base_rgb,
-                "left_wrist_0_rgb": left_rgb,
-                "right_wrist_0_rgb": right_rgb,
-            },
-            "image_mask": {
-                "base_0_rgb": base_mask,
-                "left_wrist_0_rgb": left_mask,
-                "right_wrist_0_rgb": right_mask,
-            },
+            "image": image,
+            "image_mask": image_mask,
         }
 
         if "actions" in data:
