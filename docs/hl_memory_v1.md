@@ -124,6 +124,35 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
 
 如果 rule-based annotations 的 `current_subtask` 太像状态文本，或者你希望 `task_progress` 是更自然的累积历史，可以先用离线 LLM 归一化 annotations。推荐用大模型只生成 GT sidecar，不要在训练或 rollout 时在线调用。
 
+多任务批量归一化推荐用 batch 脚本。它会加载一次 LLM，然后依次处理每个 task 的 `hl_annotations.jsonl`：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py \
+  --annotation-root /root/Users/dataset/lerobot_home/subtask \
+  --model-path /root/Users/lixiaotong/Qwen3.5-27B \
+  --device-map auto \
+  --skip-existing \
+  --continue-on-error
+```
+
+输出默认写在每个 task 目录：
+
+```text
+/root/Users/dataset/lerobot_home/subtask/<task_id>/hl_annotations_llm_normalized.jsonl
+```
+
+如果只处理部分任务，`--only-task-id` 支持一次给多个 id，也支持重复：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py \
+  --annotation-root /root/Users/dataset/lerobot_home/subtask \
+  --only-task-id 20260323O058A 20260324H125A 20260324H127A \
+  --model-path /root/Users/lixiaotong/Qwen3.5-27B \
+  --skip-existing
+```
+
+单文件归一化仍然可以直接调用底层脚本：
+
 ```bash
 PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
   --input-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
