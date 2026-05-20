@@ -3,9 +3,15 @@ from __future__ import annotations
 from collections.abc import Sequence
 import dataclasses
 
+from openpi.hl_memory.schema import render_language_memory_fields
 
 _ALLOWED_EVENT_TYPES = {"none", "subtask_boundary", "success", "failure", "progress", "discovery"}
-DEFAULT_LANGUAGE_MEMORY = "No progress has been recorded yet."
+DEFAULT_LANGUAGE_MEMORY = render_language_memory_fields(
+    task_progress="No completed subtask yet.",
+    current_objective="continue the task",
+    relevant_objects=(),
+    notes="none",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -17,6 +23,10 @@ class SubtaskAnnotation:
     phase: str = ""
     target_query: str = ""
     goal_query: str = ""
+    task_progress: str = ""
+    current_objective: str = ""
+    relevant_objects: tuple[str, ...] = ()
+    notes: str = ""
     event_type: str = "none"
     event_text: str = ""
 
@@ -38,6 +48,10 @@ class SubtaskAnnotation:
             phase=str(data.get("phase", "")).strip(),
             target_query=str(data.get("target_query", "")).strip(),
             goal_query=str(data.get("goal_query", "")).strip(),
+            task_progress=str(data.get("task_progress", "")).strip(),
+            current_objective=str(data.get("current_objective", data.get("objective", ""))).strip(),
+            relevant_objects=_parse_relevant_objects(data.get("relevant_objects", ())),
+            notes=str(data.get("notes", "")).strip(),
             event_type=str(data.get("event_type", "none")).strip(),
             event_text=str(data.get("event_text", "")).strip(),
         )
@@ -51,6 +65,10 @@ class TaskProgressState:
     phase: str = ""
     target_query: str = ""
     goal_query: str = ""
+    task_progress: str = ""
+    current_objective: str = ""
+    relevant_objects: tuple[str, ...] = ()
+    notes: str = ""
 
 
 def annotation_emits_keyframe(
@@ -107,27 +125,32 @@ def update_progress_state(
         phase=annotation.phase or annotation.current_subtask,
         target_query=annotation.target_query,
         goal_query=annotation.goal_query,
+        task_progress=annotation.task_progress,
+        current_objective=annotation.current_objective or annotation.phase or annotation.current_subtask,
+        relevant_objects=annotation.relevant_objects
+        or tuple(value for value in (annotation.target_query, annotation.goal_query) if value),
+        notes=annotation.notes,
     )
 
 
+def render_language_memory_fields_from_state(state: TaskProgressState) -> dict[str, object]:
+    relevant_objects = state.relevant_objects or tuple(value for value in (state.target_query, state.goal_query) if value)
+    return {
+        "task_progress": state.task_progress or _render_task_progress(state),
+        "current_objective": state.current_objective or state.phase or "continue the task",
+        "relevant_objects": relevant_objects,
+        "notes": state.notes or "none",
+    }
+
+
 def render_language_memory(state: TaskProgressState) -> str:
-    parts: list[str] = []
-    if state.completed_subtasks:
-        parts.append(f"Completed subtasks: {', '.join(state.completed_subtasks)}.")
-    if state.failed_subtasks:
-        parts.append(f"Failures: {', '.join(state.failed_subtasks)}.")
-    if state.recent_events:
-        normalized_events = " | ".join(event.rstrip(". ") for event in state.recent_events)
-        parts.append(f"Recent events: {normalized_events}.")
-    if state.phase:
-        parts.append(f"Current phase: {state.phase}.")
-    if state.target_query:
-        parts.append(f"Target query: {state.target_query}.")
-    if state.goal_query:
-        parts.append(f"Goal query: {state.goal_query}.")
-    if not parts:
-        return DEFAULT_LANGUAGE_MEMORY
-    return " ".join(parts)
+    fields = render_language_memory_fields_from_state(state)
+    return render_language_memory_fields(
+        task_progress=str(fields["task_progress"]),
+        current_objective=str(fields["current_objective"]),
+        relevant_objects=tuple(fields["relevant_objects"]),  # type: ignore[arg-type]
+        notes=str(fields["notes"]),
+    )
 
 
 def expected_event_text(annotation: SubtaskAnnotation) -> str:
@@ -148,3 +171,31 @@ def _event_text(annotation: SubtaskAnnotation) -> str:
     if annotation.event_type == "progress":
         return f"Progressed on {annotation.current_subtask}."
     return ""
+
+
+def _render_task_progress(state: TaskProgressState) -> str:
+    parts: list[str] = []
+    if state.completed_subtasks:
+        parts.append(f"Completed subtasks: {', '.join(state.completed_subtasks)}.")
+    if state.failed_subtasks:
+        parts.append(f"Failed subtasks: {', '.join(state.failed_subtasks)}.")
+    if not parts:
+        return "No completed subtask yet."
+    return " ".join(parts)
+
+
+def _parse_relevant_objects(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list | tuple):
+        raw_items = value
+    else:
+        raw_items = str(value).replace(";", ",").split(",")
+    objects: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.lower() == "none":
+            continue
+        if text.lower() not in {existing.lower() for existing in objects}:
+            objects.append(text)
+    return tuple(objects)

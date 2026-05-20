@@ -55,5 +55,6 @@ def test_evaluate_ablation_modes_tracks_sequence_accuracy():
 
     metrics = evaluate_ablation_modes(samples, HLMemoryConfig(), predict)
 
+    assert metrics["full"]["objective_exact_match"] == 1.0
     assert metrics["full"]["subtask_exact_match"] == 1.0
     assert metrics["full"]["episode_sequence_accuracy"] == 1.0

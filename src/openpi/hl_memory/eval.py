@@ -44,6 +44,10 @@ def compute_prediction_metrics(
         _normalize_text(expected.updated_language_memory),
     ).ratio()
     return {
+        "objective_exact_match": float(prediction.current_objective == expected.current_objective),
+        "objective_normalized_match": float(
+            _normalize_text(prediction.current_objective) == _normalize_text(expected.current_objective)
+        ),
         "subtask_exact_match": float(prediction.current_subtask == expected.current_subtask),
         "subtask_normalized_match": float(
             _normalize_text(prediction.current_subtask) == _normalize_text(expected.current_subtask)
@@ -107,7 +111,7 @@ def run_offline_rollout(
             metrics = compute_prediction_metrics(prediction, sample)
             for key, value in metrics.items():
                 totals[key] += value
-            sequence_ok &= _normalize_text(prediction.current_subtask) == _normalize_text(sample.current_subtask)
+            sequence_ok &= _normalize_text(prediction.current_objective) == _normalize_text(sample.target_prediction().current_objective)
             total_steps += 1
 
             if mode in ("language_memory_only", "full"):

@@ -20,6 +20,8 @@ def test_derive_keyframe_positions_uses_boundaries_and_events():
 
 def test_render_language_memory_defaults_when_no_progress():
     assert render_language_memory(TaskProgressState()) == DEFAULT_LANGUAGE_MEMORY
+    assert "Task progress: No completed subtask yet." in DEFAULT_LANGUAGE_MEMORY
+    assert "Current objective: continue the task" in DEFAULT_LANGUAGE_MEMORY
 
 
 def test_render_language_memory_tracks_recent_state():
@@ -52,9 +54,7 @@ def test_render_language_memory_tracks_recent_state():
 
     rendered = render_language_memory(state)
 
-    assert "Completed subtasks: pick apple." in rendered
-    assert "Recent events: Started pick apple. | Apple picked successfully.." not in rendered
-    assert "Recent events: Started pick apple | Apple picked successfully." in rendered
-    assert "Current phase: place." in rendered
-    assert "Target query: apple." in rendered
-    assert "Goal query: basket." in rendered
+    assert "Task progress: Completed subtasks: pick apple." in rendered
+    assert "Current objective: place" in rendered
+    assert "Relevant objects: apple, basket" in rendered
+    assert "Notes: none" in rendered

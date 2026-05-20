@@ -2,7 +2,7 @@
 
 : <<'USAGE'
 用途:
-  1. 调用 test_query_public_export.py 提交 query_public 导出任务并轮询结果
+  1. 调用 tests/test_query_public_export.py 提交 query_public 导出任务并轮询结果
   2. 下载接口返回的 jsonl 结果文件到当前脚本所在目录
   3. 从 jsonl 中筛选 record_type == "data_item" 的记录
   4. 读取每条记录的 session_path / out_task_id / tos_bucket
@@ -55,7 +55,7 @@
         --task-id A --task-id B --task-id C
 
 透传参数:
-  除脚本自身参数外，其余参数都会原样传给 test_query_public_export.py，
+  除脚本自身参数外，其余参数都会原样传给 tests/test_query_public_export.py，
   例如 --tenant-id / --evaluate-status / --base-url / --start-time / --end-time。
 
 性能相关:
@@ -75,7 +75,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-API_SCRIPT="${SCRIPT_DIR}/test_query_public_export.py"
+API_SCRIPT="${SCRIPT_DIR}/tests/test_query_public_export.py"
 COPY_ROOT_DEFAULT="/root/Users/dataset"
 RCLONE_PARALLEL_JOBS="${RCLONE_PARALLEL_JOBS:-4}"
 RCLONE_TRANSFERS="${RCLONE_TRANSFERS:-8}"
@@ -120,7 +120,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       cat <<EOF
 用法:
-  $(basename "$0") [脚本自身参数] [test_query_public_export.py 参数]
+  $(basename "$0") [脚本自身参数] [tests/test_query_public_export.py 参数]
 
 脚本自身参数:
   --copy-name NAME   下载完成后，把数据拷贝到 ${COPY_ROOT_DEFAULT}/NAME 下并按 out_task_id 分类

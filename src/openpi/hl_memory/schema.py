@@ -4,12 +4,15 @@ from collections.abc import Iterator
 import dataclasses
 import json
 
-_PREDICTION_REQUIRED_KEYS = {
+_NEW_PREDICTION_KEYS = {
+    "task_progress",
+    "current_objective",
+    "relevant_objects",
+    "notes",
+}
+_LEGACY_PREDICTION_KEYS = {
     "updated_language_memory",
     "current_subtask",
-    "phase",
-    "target_query",
-    "goal_query",
 }
 
 
@@ -21,37 +24,71 @@ class HLMemoryPrediction:
     phase: str
     target_query: str
     goal_query: str
+    task_progress: str = ""
+    current_objective: str = ""
+    relevant_objects: tuple[str, ...] = ()
+    notes: str = ""
     sam_text_prompt: str = ""
     sam_point_xy: tuple[int, int] | None = None
+    target_bbox_xyxy: tuple[int, int, int, int] | None = None
 
     def __post_init__(self) -> None:
-        if not self.updated_language_memory.strip():
-            raise ValueError("updated_language_memory must be non-empty.")
-        if not self.current_subtask.strip():
-            raise ValueError("current_subtask must be non-empty.")
-        if not self.phase.strip():
-            raise ValueError("phase must be non-empty.")
+        parsed_memory = _parse_ll_memory_fields(self.updated_language_memory)
+        current_objective = (self.current_objective or self.current_subtask or parsed_memory.get("current objective", "")).strip()
+        if not current_objective:
+            raise ValueError("current_objective must be non-empty.")
+        task_progress = (self.task_progress or parsed_memory.get("task progress", "") or "No completed subtask yet.").strip()
+        notes = (self.notes or parsed_memory.get("notes", "") or "none").strip()
+        relevant_objects = self.relevant_objects or _parse_relevant_objects(parsed_memory.get("relevant objects", ""))
+        if not relevant_objects:
+            relevant_objects = tuple(
+                value
+                for value in (self.target_query.strip(), self.goal_query.strip())
+                if value and value.lower() != "none"
+            )
+        updated_language_memory = self.updated_language_memory.strip() or render_language_memory_fields(
+            task_progress=task_progress,
+            current_objective=current_objective,
+            relevant_objects=relevant_objects,
+            notes=notes,
+        )
+        current_subtask = self.current_subtask.strip() or current_objective
+        phase = self.phase.strip() or current_objective
+        object.__setattr__(self, "task_progress", task_progress)
+        object.__setattr__(self, "current_objective", current_objective)
+        object.__setattr__(self, "current_subtask", current_subtask)
+        object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "relevant_objects", tuple(str(item).strip() for item in relevant_objects if str(item).strip()))
+        object.__setattr__(self, "notes", notes)
+        object.__setattr__(self, "updated_language_memory", updated_language_memory)
         for position in self.keyframe_candidate_positions:
             if position <= 0:
                 raise ValueError("keyframe_candidate_positions must be positive and 1-indexed.")
 
-    def to_dict(self) -> dict[str, object]:
+    def to_dict(self, *, include_legacy: bool = True) -> dict[str, object]:
         result: dict[str, object] = {
-            "updated_language_memory": self.updated_language_memory,
-            "current_subtask": self.current_subtask,
+            "task_progress": self.task_progress,
+            "current_objective": self.current_objective,
+            "relevant_objects": list(self.relevant_objects),
+            "notes": self.notes,
             "keyframe_candidate_positions": list(self.keyframe_candidate_positions),
             "phase": self.phase,
             "target_query": self.target_query,
             "goal_query": self.goal_query,
         }
+        if include_legacy:
+            result["updated_language_memory"] = self.updated_language_memory
+            result["current_subtask"] = self.current_subtask
         if self.sam_text_prompt:
             result["sam_text_prompt"] = self.sam_text_prompt
         if self.sam_point_xy is not None:
             result["sam_point_xy"] = [int(self.sam_point_xy[0]), int(self.sam_point_xy[1])]
+        if self.target_bbox_xyxy is not None:
+            result["target_bbox_xyxy"] = [int(value) for value in self.target_bbox_xyxy]
         return result
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=True, separators=(",", ":"))
+        return json.dumps(self.to_dict(include_legacy=False), ensure_ascii=True, separators=(",", ":"))
 
     def with_recent_position_limit(self, recent_valid_length: int) -> "HLMemoryPrediction":
         """Drops keyframe positions that point outside the valid recent clip."""
@@ -65,10 +102,9 @@ class HLMemoryPrediction:
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "HLMemoryPrediction":
-        missing = _PREDICTION_REQUIRED_KEYS - set(data)
-        if missing:
-            raise ValueError(f"Missing prediction keys: {sorted(missing)}")
         raw_positions = data.get("keyframe_candidate_positions", data.get("keyframe_positions", []))
+        if raw_positions is None:
+            raw_positions = []
         if not isinstance(raw_positions, list):
             raise ValueError("keyframe_candidate_positions must be a list.")
         keyframe_candidate_positions: list[int] = []
@@ -81,13 +117,32 @@ class HLMemoryPrediction:
                 continue
             if position not in keyframe_candidate_positions:
                 keyframe_candidate_positions.append(position)
+        updated_language_memory = str(data.get("updated_language_memory", "")).strip()
+        parsed_memory = _parse_ll_memory_fields(updated_language_memory)
+        current_objective = str(
+            data.get(
+                "current_objective",
+                data.get("objective", data.get("current_subtask", parsed_memory.get("current objective", ""))),
+            )
+        ).strip()
+        task_progress = str(data.get("task_progress", parsed_memory.get("task progress", ""))).strip()
+        notes = str(data.get("notes", parsed_memory.get("notes", ""))).strip()
+        if not current_objective and not updated_language_memory:
+            raise ValueError("Prediction must include current_objective, current_subtask, or updated_language_memory.")
+        target_query = str(data.get("target_query", "")).strip()
+        goal_query = str(data.get("goal_query", "")).strip()
+        relevant_objects = _parse_relevant_objects(data.get("relevant_objects", parsed_memory.get("relevant objects", "")))
         return cls(
-            updated_language_memory=str(data["updated_language_memory"]).strip(),
-            current_subtask=str(data["current_subtask"]).strip(),
+            updated_language_memory=updated_language_memory,
+            current_subtask=str(data.get("current_subtask", current_objective)).strip(),
             keyframe_candidate_positions=tuple(keyframe_candidate_positions),
-            phase=str(data["phase"]).strip(),
-            target_query=str(data["target_query"]).strip(),
-            goal_query=str(data["goal_query"]).strip(),
+            phase=str(data.get("phase", current_objective)).strip(),
+            target_query=target_query,
+            goal_query=goal_query,
+            task_progress=task_progress,
+            current_objective=current_objective,
+            relevant_objects=relevant_objects,
+            notes=notes,
             sam_text_prompt=str(data.get("sam_text_prompt", data.get("sam_prompt", ""))).strip(),
             sam_point_xy=_parse_optional_point(
                 data.get("sam_point_xy")
@@ -95,6 +150,7 @@ class HLMemoryPrediction:
                 or data.get("target_point")
                 or data.get("point_prompt")
             ),
+            target_bbox_xyxy=_parse_optional_bbox(data.get("target_bbox_xyxy") or data.get("bbox_xyxy") or data.get("target_bbox")),
         )
 
     @classmethod
@@ -142,13 +198,19 @@ def _iter_json_objects(text: str) -> Iterator[dict[str, object]]:
         try:
             parsed, _ = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
-            continue
+            repaired = _escape_control_newlines_inside_strings(text[index:])
+            if repaired == text[index:]:
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(repaired)
+            except json.JSONDecodeError:
+                continue
         if isinstance(parsed, dict):
             yield parsed
 
 
 def _looks_like_prediction(data: dict[str, object]) -> bool:
-    return _PREDICTION_REQUIRED_KEYS.issubset(data)
+    return bool(_NEW_PREDICTION_KEYS & set(data) or _LEGACY_PREDICTION_KEYS & set(data))
 
 
 def _parse_optional_point(value: object) -> tuple[int, int] | None:
@@ -159,6 +221,100 @@ def _parse_optional_point(value: object) -> tuple[int, int] | None:
     if isinstance(value, list | tuple) and len(value) >= 2:
         return int(round(float(value[0]))), int(round(float(value[1])))
     return None
+
+
+def _parse_optional_bbox(value: object) -> tuple[int, int, int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        if {"x1", "y1", "x2", "y2"}.issubset(value):
+            return (
+                int(round(float(value["x1"]))),
+                int(round(float(value["y1"]))),
+                int(round(float(value["x2"]))),
+                int(round(float(value["y2"]))),
+            )
+        if {"left", "top", "right", "bottom"}.issubset(value):
+            return (
+                int(round(float(value["left"]))),
+                int(round(float(value["top"]))),
+                int(round(float(value["right"]))),
+                int(round(float(value["bottom"]))),
+            )
+    if isinstance(value, list | tuple) and len(value) >= 4:
+        return tuple(int(round(float(item))) for item in value[:4])  # type: ignore[return-value]
+    return None
+
+
+def _parse_ll_memory_fields(memory: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in memory.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip().lower()] = value.strip()
+    return fields
+
+
+def _parse_relevant_objects(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list | tuple):
+        raw_items = value
+    else:
+        raw_items = str(value).replace(";", ",").split(",")
+    objects: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.lower() == "none":
+            continue
+        if text.lower() not in {existing.lower() for existing in objects}:
+            objects.append(text)
+    return tuple(objects)
+
+
+def render_language_memory_fields(
+    *,
+    task_progress: str,
+    current_objective: str,
+    relevant_objects: tuple[str, ...] | list[str],
+    notes: str,
+) -> str:
+    objects = ", ".join(str(item).strip() for item in relevant_objects if str(item).strip()) or "none"
+    return "\n".join(
+        [
+            f"Task progress: {task_progress.strip() or 'No completed subtask yet.'}",
+            f"Current objective: {current_objective.strip() or 'continue the task'}",
+            f"Relevant objects: {objects}",
+            f"Notes: {notes.strip() or 'none'}",
+        ]
+    )
+
+
+def _escape_control_newlines_inside_strings(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    changed = False
+    for char in text:
+        if escaped:
+            result.append(char)
+            escaped = False
+            continue
+        if char == "\\" and in_string:
+            result.append(char)
+            escaped = True
+            continue
+        if char == '"':
+            result.append(char)
+            in_string = not in_string
+            continue
+        if in_string and char in {"\n", "\r"}:
+            result.append("\\n")
+            changed = True
+            continue
+        result.append(char)
+    return "".join(result) if changed else text
 
 
 def _extract_fenced_blocks(text: str) -> list[str]:
