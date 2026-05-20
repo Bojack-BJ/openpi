@@ -24,7 +24,7 @@ done
 
 echo "[eval] $(date) starting full eval" | tee -a "$LOG"
 CUDA_VISIBLE_DEVICES="$GPU_ID" PYTHONPATH=src /root/Users/miniconda3/envs/hl_qwen35/bin/python \
-  scripts/eval_hl_memory_multitask.py \
+  scripts/hl_memory/eval_hl_memory_multitask.py \
   --dataset-root /root/Users/dataset/hl_memory/subtask \
   --dataset-glob '*/val' \
   --model-path hl_memory_ckpts/subtask_multitask_qwen3_5_2b_lora_ddp/checkpoint-step-006000 \
@@ -38,7 +38,7 @@ CUDA_VISIBLE_DEVICES="$GPU_ID" PYTHONPATH=src /root/Users/miniconda3/envs/hl_qwe
 
 echo "[analyze] $(date) summarizing by task" | tee -a "$LOG"
 /root/Users/miniconda3/envs/hl_qwen35/bin/python \
-  scripts/analyze_hl_memory_eval_by_task.py \
+  scripts/hl_memory/analyze_hl_memory_eval_by_task.py \
   --predictions-jsonl "$RUN_DIR/predictions.jsonl" \
   --output-md "$RUN_DIR/task_summary.md" \
   --output-json "$RUN_DIR/task_summary.json" \

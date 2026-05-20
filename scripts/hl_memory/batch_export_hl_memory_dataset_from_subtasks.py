@@ -18,7 +18,7 @@ from pathlib import Path
 cd /root/Users/donggaoqi/openpi_vlm_finetune
 
 PYTHONPATH=src /root/Users/miniconda3/envs/pi0_dgq/bin/python \
-  scripts/batch_export_hl_memory_dataset_from_subtasks.py \
+  scripts/hl_memory/batch_export_hl_memory_dataset_from_subtasks.py \
   --source-config-name toy_block_placement_Ba_qwen3_5_2b_400m_guided \
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --output-root /root/Users/dataset/hl_memory/subtask \

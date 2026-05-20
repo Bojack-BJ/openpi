@@ -18,6 +18,7 @@ from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.data import build_loaded_video_clips_from_frames
 from openpi.hl_memory.frame_composer import compose_observation_frame
+from openpi.hl_memory.labels import DEFAULT_LANGUAGE_MEMORY
 from openpi.hl_memory.schema import HLMemoryPrediction
 
 
@@ -36,6 +37,7 @@ _GENERIC_MEMORY_STRINGS = {
     "task started.",
     "no progress has been recorded yet",
     "no progress has been recorded yet.",
+    "task progress: no completed subtask yet. current objective: continue the task relevant objects: none notes: none",
 }
 
 
@@ -356,7 +358,7 @@ def apply_rollout_language_memory_rule(
     should_replace = (
         _is_generic_memory(model_memory)
         or _normalize_text(model_memory) == _normalize_text(previous_memory)
-        or _looks_like_instruction_echo(model_memory, prediction.current_subtask)
+        or _looks_like_instruction_echo(model_memory, prediction.current_objective)
         or _looks_like_debug_log_memory(model_memory)
         or not _has_ll_memory_fields(model_memory)
     )
@@ -387,7 +389,7 @@ def build_zero_shot_sample(
         frame_index=int(recent_seconds[-1]) if recent_seconds else 0,
         instruction=instruction,
         language_memory=language_memory,
-        updated_language_memory=language_memory or "No progress has been recorded yet.",
+        updated_language_memory=language_memory or DEFAULT_LANGUAGE_MEMORY,
         current_subtask="placeholder",
         phase="placeholder",
         target_query="",
@@ -492,6 +494,8 @@ def save_prediction_debug_panel(
     _safe_draw_text(draw, (margin, 16), title, font=title_font, fill=(245, 247, 250))
 
     image_box = (margin, margin + title_height, margin + image_width, margin + title_height + image_height)
+    if prediction.target_bbox_xyxy is not None:
+        current_frame = _draw_target_bbox(current_frame, prediction.target_bbox_xyxy, label=prediction.target_query or "target")
     _paste_debug_image(panel, current_frame, image_box)
     _draw_rect(draw, image_box, fill=(116, 227, 255), width=3)
     _safe_draw_text(
@@ -609,10 +613,12 @@ def _build_debug_text_lines(
     _append_wrapped_debug_line(lines, "Recent end", _format_optional_second(recent_end_sec), style="muted")
     _append_wrapped_debug_line(lines, "Current frame", _format_optional_second(current_second), style="accent")
     lines.append(("", ""))
-    _append_wrapped_debug_line(lines, "Current task", prediction.current_subtask, style="accent", max_lines=3)
+    _append_wrapped_debug_line(lines, "Current objective", prediction.current_objective, style="accent", max_lines=3)
     _append_wrapped_debug_line(lines, "Phase", prediction.phase, max_lines=2)
     _append_wrapped_debug_line(lines, "Target", prediction.target_query or "none", max_lines=2)
     _append_wrapped_debug_line(lines, "Goal", prediction.goal_query or "none", max_lines=2)
+    if prediction.target_bbox_xyxy is not None:
+        _append_wrapped_debug_line(lines, "Target bbox", str(list(prediction.target_bbox_xyxy)), max_lines=1)
     _append_wrapped_debug_line(
         lines,
         "Keyframes",
@@ -720,6 +726,32 @@ def _paste_debug_image(panel: Image.Image, image: Image.Image, box: tuple[int, i
     paste_x = x0 + (x1 - x0 - frame.width) // 2
     paste_y = y0 + (y1 - y0 - frame.height) // 2
     panel.paste(frame, (paste_x, paste_y))
+
+
+def _draw_target_bbox(
+    image: Image.Image,
+    bbox_xyxy: tuple[int, int, int, int],
+    *,
+    label: str,
+) -> Image.Image:
+    frame = image.convert("RGB").copy()
+    draw = ImageDraw.Draw(frame)
+    width, height = frame.size
+    x1, y1, x2, y2 = bbox_xyxy
+    x1 = max(0, min(width - 1, int(x1)))
+    y1 = max(0, min(height - 1, int(y1)))
+    x2 = max(0, min(width - 1, int(x2)))
+    y2 = max(0, min(height - 1, int(y2)))
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    color = (255, 96, 96)
+    for offset in range(3):
+        draw.rectangle((x1 + offset, y1 + offset, x2 - offset, y2 - offset), outline=color)
+    if label:
+        _safe_draw_text(draw, (x1 + 4, max(0, y1 - 22)), label, font=_load_debug_font(14), fill=color)
+    return frame
 
 
 def _draw_rect(
@@ -946,7 +978,7 @@ def _parse_ll_memory(memory: str) -> dict[str, str]:
 
 
 def _render_ll_memory(fields: dict[str, str], prediction: HLMemoryPrediction) -> str:
-    current_subtask = _clean_memory_field(prediction.current_subtask) or "continue the task"
+    current_subtask = _clean_memory_field(prediction.current_objective) or "continue the task"
     previous_progress = _clean_memory_field(fields.get("task progress", ""))
     progress = _progress_sentence(previous_progress, current_subtask)
     relevant_objects = _merge_relevant_objects(

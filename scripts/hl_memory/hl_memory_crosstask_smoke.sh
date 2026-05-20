@@ -30,7 +30,7 @@ METRICS_JSON="${METRICS_JSON:-$DATA_ROOT/hl_memory_val_smoke_metrics.json}"
 cd "$REPO_ROOT"
 
 echo "[1/4] Export CrossTask smoke train split"
-uv run python scripts/export_hl_memory_crosstask.py \
+uv run python scripts/hl_memory/export_hl_memory_crosstask.py \
   --crosstask-release-dir "$DATA_ROOT/crosstask_release" \
   --videos-root "$DATA_ROOT/missing_videos" \
   --split train \
@@ -43,7 +43,7 @@ uv run python scripts/export_hl_memory_crosstask.py \
   --overwrite
 
 echo "[2/4] Export CrossTask smoke val split"
-uv run python scripts/export_hl_memory_crosstask.py \
+uv run python scripts/hl_memory/export_hl_memory_crosstask.py \
   --crosstask-release-dir "$DATA_ROOT/crosstask_release" \
   --videos-root "$DATA_ROOT/missing_videos" \
   --split val \
@@ -56,7 +56,7 @@ uv run python scripts/export_hl_memory_crosstask.py \
   --overwrite
 
 echo "[3/4] Train HL memory smoke model"
-uv run python scripts/train_hl_memory.py \
+uv run python scripts/hl_memory/train_hl_memory.py \
   --dataset-dir "$TRAIN_EXPORT_DIR" \
   --output-dir "$CKPT_DIR" \
   --vlm-backend "$MODEL_BACKEND" \
@@ -72,7 +72,7 @@ uv run python scripts/train_hl_memory.py \
 CHECKPOINT_PATH="$CKPT_DIR/checkpoint-step-$(printf '%06d' "$TRAIN_STEPS")"
 
 echo "[4/4] Evaluate smoke checkpoint"
-uv run python scripts/eval_hl_memory_rollout.py \
+uv run python scripts/hl_memory/eval_hl_memory_rollout.py \
   --dataset-dir "$VAL_EXPORT_DIR" \
   --model-path "$CHECKPOINT_PATH" \
   --vlm-backend "$MODEL_BACKEND" \

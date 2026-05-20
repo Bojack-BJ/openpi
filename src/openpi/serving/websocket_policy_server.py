@@ -56,6 +56,7 @@ class WebsocketPolicyServer:
             try:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
+                async_rollout_meta = obs.pop("__async_rollout", None) if isinstance(obs, dict) else None
 
                 infer_time = time.monotonic()
                 action = self._policy.infer(obs)
@@ -67,6 +68,8 @@ class WebsocketPolicyServer:
                 if prev_total_time is not None:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
+                if async_rollout_meta is not None:
+                    action["async_rollout_echo"] = async_rollout_meta
 
                 await websocket.send(packer.pack(action))
                 prev_total_time = time.monotonic() - start_time

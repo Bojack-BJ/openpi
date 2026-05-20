@@ -76,7 +76,7 @@ Startup will fail fast if the local checkpoint path does not exist or if SAM3 ca
 Example:
 
 ```bash
-python scripts/pi0_rollout_client_fasttouch_rpy.py \
+python scripts/rollout/pi0_rollout_client_fasttouch_rpy.py \
   --description "..." \
   --arm_mode dual \
   --mask_overlay \
@@ -214,7 +214,7 @@ Missing RGB or mask views are present as zero images with `image_mask=False`, so
 
 - The SAM3 wrapper lives in `src/openpi/serving/mask_overlay.py`.
 - The server integration lives in `scripts/serve_policy.py`.
-- The rollout click/preview flow lives in `scripts/pi0_rollout_client_fasttouch_rpy.py` and `scripts/pi0_rollout_client_xarm_rpy.py`.
+- The rollout click/preview flow lives in `scripts/rollout/pi0_rollout_client_fasttouch_rpy.py` and `scripts/rollout/pi0_rollout_client_xarm_rpy.py`.
 - `image` mode uses SAM3 image interactivity with the previous mask/logits/bounding box as the next prompt.
 - `video_window` mode uses SAM3's video predictor, but SAM3 initializes video state from a fixed image list/video path rather than an appendable stream. The server therefore rebuilds a short session from the latest frames for each policy inference, prompts frame 0 with the tracked bbox, and propagates forward to the newest frame.
 - `text_select_video` mode uses text to detect instances in frame 0 of each short session, picks one instance by clicked point or previous bbox, propagates all text-matched objects, and chooses the best continuity match on each propagated frame. Point and text are not sent to SAM3 as one combined point prompt; point is used for instance selection after text detection.

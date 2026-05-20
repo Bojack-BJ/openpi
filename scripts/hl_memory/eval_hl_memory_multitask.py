@@ -209,7 +209,9 @@ def _run_multitask_rollout(
                 metrics = compute_prediction_metrics(prediction, item.sample)
                 for key, value in metrics.items():
                     totals[key] += value
-                sequence_ok &= _normalize(prediction.current_subtask) == _normalize(item.sample.current_subtask)
+                sequence_ok &= _normalize(prediction.current_objective) == _normalize(
+                    item.sample.target_prediction().current_objective
+                )
                 total_steps += 1
                 if prediction_rows is not None:
                     prediction_rows.append(_prediction_row(item, prediction, metrics))

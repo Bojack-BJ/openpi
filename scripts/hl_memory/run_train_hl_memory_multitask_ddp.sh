@@ -129,7 +129,7 @@ fi
 "$PYTHON_BIN" -m torch.distributed.run \
   --nproc_per_node "$NPROC_PER_NODE" \
   --master_port "$MASTER_PORT" \
-  scripts/train_hl_memory_multitask.py \
+  scripts/hl_memory/train_hl_memory_multitask.py \
   --dataset-root "$DATASET_ROOT" \
   --dataset-glob "$DATASET_GLOB" \
   --output-dir "$OUTPUT_DIR" \

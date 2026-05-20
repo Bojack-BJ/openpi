@@ -34,7 +34,7 @@ from openpi.hl_memory.hf_adapter import create_hf_adapter
 cd /root/Users/donggaoqi/openpi_vlm_finetune
 
 PYTHONPATH=src /root/Users/miniconda3/envs/hl_qwen35/bin/python \
-  scripts/train_hl_memory_multitask.py \
+  scripts/hl_memory/train_hl_memory_multitask.py \
   --dataset-root /root/Users/dataset/hl_memory/subtask \
   --dataset-glob '*/train' \
   --output-dir /root/Users/donggaoqi/openpi_vlm_finetune/hl_memory_ckpts/subtask_multitask_qwen3_5_2b_lora \
@@ -76,15 +76,15 @@ class TrainArgs:
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-6
     weight_decay: float = 1e-4
     lora_enabled: bool = False
-    lora_r: int = 16
-    lora_alpha: int = 32
+    lora_r: int = 8
+    lora_alpha: int = 16
     lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
-    language_memory_dropout: float = 0.0
-    language_memory_dropout_value: str = "Task started."
+    language_memory_dropout: float = 0.3
+    language_memory_dropout_value: str = "No progress has been recorded yet."
     batch_size: int = 1
     grad_accum_steps: int = 1
     num_train_steps: int = 100

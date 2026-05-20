@@ -68,6 +68,10 @@ class ExportedHLMemorySample:
     recent_valid_length: int
     event_type: str = "none"
     event_text: str = ""
+    task_progress: str = ""
+    current_objective: str = ""
+    relevant_objects: tuple[str, ...] = ()
+    notes: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ExportedHLMemorySample":
@@ -94,6 +98,10 @@ class ExportedHLMemorySample:
             recent_valid_length=int(data.get("recent_valid_length", len(data["recent_frame_paths"]))),
             event_type=str(data.get("event_type", "none")),
             event_text=str(data.get("event_text", "")),
+            task_progress=str(data.get("task_progress", "")).strip(),
+            current_objective=str(data.get("current_objective", data.get("current_subtask", ""))).strip(),
+            relevant_objects=_parse_relevant_objects(data.get("relevant_objects", ())),
+            notes=str(data.get("notes", "")).strip(),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -118,6 +126,10 @@ class ExportedHLMemorySample:
             "recent_valid_length": self.recent_valid_length,
             "event_type": self.event_type,
             "event_text": self.event_text,
+            "task_progress": self.task_progress,
+            "current_objective": self.current_objective,
+            "relevant_objects": list(self.relevant_objects),
+            "notes": self.notes,
         }
 
     def target_prediction(self) -> HLMemoryPrediction:
@@ -128,6 +140,10 @@ class ExportedHLMemorySample:
             phase=self.phase,
             target_query=self.target_query,
             goal_query=self.goal_query,
+            task_progress=self.task_progress,
+            current_objective=self.current_objective or self.current_subtask,
+            relevant_objects=self.relevant_objects,
+            notes=self.notes,
         )
 
     def with_runtime_context(
@@ -252,6 +268,23 @@ def load_video_clips_for_sample(
         recent_valid_length=sample.recent_valid_length,
         already_resized=frame_cache is not None,
     )
+
+
+def _parse_relevant_objects(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list | tuple):
+        raw_items = value
+    else:
+        raw_items = str(value).replace(";", ",").split(",")
+    objects: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text or text.lower() == "none":
+            continue
+        if text.lower() not in {existing.lower() for existing in objects}:
+            objects.append(text)
+    return tuple(objects)
 
 
 def build_loaded_video_clips_from_frames(

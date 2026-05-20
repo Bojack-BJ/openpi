@@ -23,6 +23,7 @@ from openpi.hl_memory.labels import DEFAULT_LANGUAGE_MEMORY
 from openpi.hl_memory.labels import TaskProgressState
 from openpi.hl_memory.labels import derive_keyframe_positions
 from openpi.hl_memory.labels import render_language_memory
+from openpi.hl_memory.labels import render_language_memory_fields_from_state
 from openpi.hl_memory.labels import update_progress_state
 from openpi.hl_memory.memory import EpisodicKeyframeMemory
 from openpi.hl_memory.memory import build_recent_context_indices
@@ -221,6 +222,7 @@ def _export_episode(
             current_language_memory = render_language_memory(progress_state)
             next_progress_state = update_progress_state(progress_state, annotation)
             updated_language_memory = render_language_memory(next_progress_state)
+            next_memory_fields = render_language_memory_fields_from_state(next_progress_state)
             keyframe_candidate_positions = derive_keyframe_positions(annotations, step_index, recent_indices)
 
             sample = ExportedHLMemorySample(
@@ -244,6 +246,10 @@ def _export_episode(
                 recent_valid_length=len(recent_frame_paths),
                 event_type=annotation.event_type,
                 event_text=annotation.event_text,
+                task_progress=str(next_memory_fields["task_progress"]),
+                current_objective=str(next_memory_fields["current_objective"]),
+                relevant_objects=tuple(next_memory_fields["relevant_objects"]),  # type: ignore[arg-type]
+                notes=str(next_memory_fields["notes"]),
             )
             samples.append(sample)
 

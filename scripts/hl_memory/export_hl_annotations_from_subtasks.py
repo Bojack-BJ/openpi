@@ -31,7 +31,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Convert FastUMI subtask.json / subtask_segments.json files into the annotations.jsonl "
-            "format consumed by scripts/export_hl_memory_dataset.py."
+            "format consumed by scripts/hl_memory/export_hl_memory_dataset.py."
         )
     )
     input_group = parser.add_mutually_exclusive_group(required=True)

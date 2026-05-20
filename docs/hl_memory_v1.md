@@ -10,11 +10,11 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 代码入口：
 
 - `src/openpi/hl_memory/`
-- `scripts/export_hl_annotations_from_subtasks.py`
-- `scripts/export_hl_memory_dataset.py`
-- `scripts/train_hl_memory.py`
-- `scripts/eval_hl_memory_rollout.py`
-- `scripts/run_hl_memory_zero_shot.py`
+- `scripts/hl_memory/export_hl_annotations_from_subtasks.py`
+- `scripts/hl_memory/export_hl_memory_dataset.py`
+- `scripts/hl_memory/train_hl_memory.py`
+- `scripts/hl_memory/eval_hl_memory_rollout.py`
+- `scripts/hl_memory/run_hl_memory_zero_shot.py`
 
 当前支持 Qwen2.5-VL / Qwen3.5-VL。当前不做在线 robot wrapper、target mask 训练或低层 action 闭环。
 
@@ -76,7 +76,7 @@ $HF_LEROBOT_HOME/fastumi/sponge_visual_guided/subtask_segments.json
 推荐从 LeRobot root 或 repo id 生成：
 
 ```bash
-python scripts/export_hl_annotations_from_subtasks.py \
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --repo-id fastumi/sponge_visual_guided_xarm \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --instruction "Put the target object into the target slot" \
@@ -86,7 +86,7 @@ python scripts/export_hl_annotations_from_subtasks.py \
 等价路径输入：
 
 ```bash
-python scripts/export_hl_annotations_from_subtasks.py \
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --lerobot-dir /root/Users/dataset/lerobot_home/fastumi/sponge_visual_guided \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --overwrite
@@ -95,7 +95,7 @@ python scripts/export_hl_annotations_from_subtasks.py \
 raw fallback 只用于检查或没有 LeRobot sidecar 的临时场景：
 
 ```bash
-python scripts/export_hl_annotations_from_subtasks.py \
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --raw-dir /path/to/raw_task_root \
   --output-jsonl /tmp/annotations.jsonl \
   --overwrite
@@ -106,7 +106,7 @@ python scripts/export_hl_annotations_from_subtasks.py \
 长 segment 可以按长度补充 progress 样本，但建议加上 cap，避免长时间段主导训练：
 
 ```bash
-python scripts/export_hl_annotations_from_subtasks.py \
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --repo-id fastumi/sponge_visual_guided_xarm \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --instruction "Put the target object into the target slot" \
@@ -119,7 +119,7 @@ python scripts/export_hl_annotations_from_subtasks.py \
 ### 3. HL Annotation JSONL To HL Dataset
 
 ```bash
-python scripts/export_hl_memory_dataset.py \
+python scripts/hl_memory/export_hl_memory_dataset.py \
   --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
   --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --output-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
@@ -147,7 +147,7 @@ exported/
 推荐按 episode 做 held-out split，而不是直接用同一个 `exported/` 同时训练和评估。下面这条命令会在一次运行里计算一次 split，并同时生成互斥的 train / val episode，避免两次运行时误填不同 ratio/seed：
 
 ```bash
-python scripts/export_hl_memory_dataset.py \
+python scripts/hl_memory/export_hl_memory_dataset.py \
   --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
   --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --output-train-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
@@ -165,7 +165,7 @@ python scripts/export_hl_memory_dataset.py \
 ### 4. Train
 
 ```bash
-python scripts/train_hl_memory.py \
+python scripts/hl_memory/train_hl_memory.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
   --vlm-backend qwen3_5_vl \
@@ -186,7 +186,7 @@ export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src
 export WANDB_API_KEY="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"
 export WANDB_MODE=online
 
-torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35 \
   --vlm-backend qwen3_5_vl \
@@ -208,7 +208,7 @@ torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
 如果 full finetune 出现过度依赖 language memory 或通用视觉能力退化，优先尝试 LoRA + language memory dropout：
 
 ```bash
-torchrun --standalone --nproc_per_node 8 scripts/train_hl_memory.py \
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-dir /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35_lora \
   --vlm-backend qwen3_5_vl \
@@ -247,13 +247,13 @@ Qwen3.5 建议：
 也可用 YAML：
 
 ```bash
-python scripts/train_hl_memory.py --config-yaml src/openpi/hl_memory/train_hl_memory.yaml
+python scripts/hl_memory/train_hl_memory.py --config-yaml src/openpi/hl_memory/train_hl_memory.yaml
 ```
 
 ### 5. Eval
 
 ```bash
-python scripts/eval_hl_memory_rollout.py \
+python scripts/hl_memory/eval_hl_memory_rollout.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
   --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-001000 \
   --vlm-backend qwen3_5_vl \
@@ -268,7 +268,7 @@ python scripts/eval_hl_memory_rollout.py \
 快速 smoke eval 可以先只跑少量未见 episode 或单个 ablation：
 
 ```bash
-python scripts/eval_hl_memory_rollout.py \
+python scripts/hl_memory/eval_hl_memory_rollout.py \
   --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
   --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-001000 \
   --vlm-backend qwen3_5_vl \
@@ -293,7 +293,7 @@ Eval 会打印阶段日志并显示每种 ablation 的 tqdm 进度条：
 单视角：
 
 ```bash
-python scripts/run_hl_memory_zero_shot.py \
+python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --video-path /path/to/front.mp4 \
   --instruction "Put the target object into the target slot" \
   --language-memory "Task started." \
@@ -310,7 +310,7 @@ python scripts/run_hl_memory_zero_shot.py \
 双视角 rollout：
 
 ```bash
-python scripts/run_hl_memory_zero_shot.py \
+python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --left-video-path /path/to/left.mp4 \
   --right-video-path /path/to/right.mp4 \
   --instruction "Put the target object into the target slot" \
@@ -390,7 +390,7 @@ rollout 和调试参数：
 
 ### HL Annotation JSONL
 
-一行一个 JSON，是 `scripts/export_hl_memory_dataset.py` 的输入。
+一行一个 JSON，是 `scripts/hl_memory/export_hl_memory_dataset.py` 的输入。
 
 最小行：
 
@@ -468,7 +468,7 @@ subtask
 CrossTask 只用于 action-free HL smoke。建议只用 18 个有 temporal boundary 的 primary tasks。
 
 ```bash
-python scripts/export_hl_memory_crosstask.py \
+python scripts/hl_memory/export_hl_memory_crosstask.py \
   --crosstask-release-dir /path/to/crosstask_release \
   --videos-root /path/to/missing_videos \
   --split train \
@@ -488,13 +488,13 @@ DEVICE=cuda \
 MODEL_BACKEND=qwen2_5_vl \
 MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct \
 TRAIN_STEPS=20 \
-scripts/hl_memory_crosstask_smoke.sh
+scripts/hl_memory/hl_memory_crosstask_smoke.sh
 ```
 
 可先检查本地视频覆盖率：
 
 ```bash
-python scripts/check_crosstask_video_coverage.py \
+python scripts/hl_memory/check_crosstask_video_coverage.py \
   --crosstask-release-dir /path/to/crosstask_release \
   --videos-root /path/to/missing_videos \
   --split train \

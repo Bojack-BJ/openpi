@@ -107,7 +107,7 @@ echo "[eval] dataset=$DATASET_ROOT/$DATASET_GLOB max_samples=$MAX_SAMPLES modes=
 echo "[eval] metrics=$METRICS_JSON"
 echo "[eval] predictions=$PREDICTIONS_JSONL"
 
-"$PYTHON_BIN" scripts/eval_hl_memory_multitask.py \
+"$PYTHON_BIN" scripts/hl_memory/eval_hl_memory_multitask.py \
   --dataset-root "$DATASET_ROOT" \
   --dataset-glob "$DATASET_GLOB" \
   --model-path "$MODEL_PATH" \

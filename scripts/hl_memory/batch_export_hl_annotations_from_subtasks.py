@@ -17,7 +17,7 @@ from pathlib import Path
 
 '''
 
-python /root/Users/donggaoqi/openpi_vlm_finetune/scripts/batch_export_hl_annotations_from_subtasks.py \
+python /root/Users/donggaoqi/openpi_vlm_finetune/scripts/hl_memory/batch_export_hl_annotations_from_subtasks.py \
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --workers 8 \
   --overwrite \

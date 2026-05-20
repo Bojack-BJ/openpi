@@ -13,6 +13,7 @@ from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.schema import HLMemoryPrediction
+from openpi.hl_memory.schema import render_language_memory_fields
 
 
 def create_hf_adapter(config: HLMemoryConfig) -> "BaseHLVLMAdapter":
@@ -227,14 +228,14 @@ class BaseHLVLMAdapter:
             f"In the recent observation clip, position 1 is the oldest valid recent frame and position "
             f"{clips.recent_valid_length} is the current frame. If the model internally sees 0-indexed frames, "
             f"frame 0 is oldest and frame {max(clips.recent_valid_length - 1, 0)} is current.\n"
-            "`current_subtask`, `phase`, `target_query`, `goal_query`, and the `Current objective` line must describe "
+            "`current_objective`, `phase`, `target_query`, `goal_query`, and `target_bbox_xyxy` must describe "
             "the state/action at the last valid recent frame, not the most salient earlier action in the clip.\n"
             "Use earlier recent frames only as temporal context for deciding how the final frame was reached.\n"
             "If there are two concatenated views in each frame, the left view shows the robot's left hand and the right"
-            "view shows the robot's right hand. Predict the current subtask and other fields from the perspective of"
+            "view shows the robot's right hand. Predict the current objective and other fields from the perspective of"
             "the active hand, which is the hand currently moving, manipulating, or positioned at a target, and name the"
-            "active hand in the subtask, e.g., `approach with left hand` or `place with right hand`. If both hands are active, "
-            "describe the subtasks of both hands in the same `current_subtask` field, e.g., `left hand place, right hand hold`.\n"
+            "active hand in the objective, e.g., `approach with left hand` or `place with right hand`. If both hands are active, "
+            "describe both hands in the same `current_objective` field, e.g., `left hand place, right hand hold`.\n"
             "Use visual evidence first. The HL input frames are raw RGB observations; no segmentation mask, mask "
             "overlay, or target highlight is provided. Treat language memory as a compact progress hint, and correct it when it "
             "conflicts with the current visual evidence.\n"
@@ -252,7 +253,7 @@ class BaseHLVLMAdapter:
             "`target_query` even if the instruction or previous memory mentions a different object.\n"
             "- For multi-object tasks, mark an object completed only after it is visibly released at its target. "
             "Do not advance to the next object until release plus return/transition is visually supported.\n"
-            "- If the final recent frame shows an object already released at its slot, do not keep `current_subtask` "
+            "- If the final recent frame shows an object already released at its slot, do not keep `current_objective` "
             "as place/release for that object unless release is happening in that final frame. Advance to the visible "
             "post-release state: retreat/return if a hand is moving back, transition to the next object if one "
             "remains, "
@@ -271,25 +272,30 @@ class BaseHLVLMAdapter:
             "- Ground only the task-relevant target instance for the current subtask, not every object of the same "
             "class. If no target instance is visible, set `sam_text_prompt` to an empty string and omit "
             "`sam_point_xy`.\n"
-            "Predict the current low-level subtask and nominate recent frames worth remembering after they leave "
+            "BBox debug output:\n"
+            "- If the current target instance is visible in the last valid recent frame, optionally include "
+            "`target_bbox_xyxy` as [x1, y1, x2, y2] in current-frame pixel coordinates. The box should cover only "
+            "the task-relevant target instance. If not visible, omit the field.\n"
+            "Predict the current low-level objective and nominate recent frames worth remembering after they leave "
             "the recent window.\n"
             "Return exactly one JSON object with keys "
-            "`updated_language_memory`, `current_subtask`, `keyframe_candidate_positions`, `phase`, "
-            "`target_query`, `goal_query`, and optionally `sam_text_prompt`, `sam_point_xy`.\n"
+            "`task_progress`, `current_objective`, `relevant_objects`, `notes`, `keyframe_candidate_positions`, "
+            "`phase`, `target_query`, `goal_query`, and optionally `sam_text_prompt`, `sam_point_xy`, "
+            "`target_bbox_xyxy`.\n"
             f"{thinking_instruction}"
-            "`updated_language_memory` will be read by a downstream low-level VLM policy. It must be compact, stable, "
-            "and action-useful, not a verbose log.\n"
-            "`updated_language_memory` must use exactly this four-line plain-text format:\n"
-            "Task progress: <one short sentence about completed/observed progress>\n"
-            "Current objective: <one short executable objective for the low-level policy>\n"
-            "Relevant objects: <comma-separated object/location phrases, or none>\n"
-            "Notes: <one short caution, spatial fact, or none>\n"
+            "`task_progress` is a compact history summary. It should accumulate completed milestones or stable "
+            "state, compressed into one short sentence. Do not put the current action here unless it is already "
+            "completed or stable.\n"
+            "`current_objective` is the one short executable objective for the downstream low-level policy.\n"
+            "`relevant_objects` is a short JSON list of object/location phrases needed for the current objective.\n"
+            "`notes` is one short caution or spatial fact, or `none`.\n"
             "Do not include timestamps, frame numbers, bullet lists, JSON inside the string, or per-step debug logs "
-            "inside `updated_language_memory`.\n"
-            "If the current subtask is unchanged, update `updated_language_memory` only when new action-useful state "
+            "inside any string field.\n"
+            "If the current objective is unchanged, update `task_progress` only when new action-useful state "
             "is observed; otherwise keep it semantically unchanged and concise.\n"
-            "If memory is getting long or repetitive, compress it into the four fields above.\n"
-            "`current_subtask` must be a short executable robot subtask.\n"
+            "If memory is getting long or repetitive, compress it.\n"
+            "`current_objective` must be a short executable robot instruction, not a passive state such as "
+            "`the calculator is picked up`; that belongs in `task_progress`.\n"
             "`target_query` and `goal_query` must be short grounding phrases or noun phrases, not questions.\n"
             "`keyframe_candidate_positions` must be 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
@@ -318,7 +324,7 @@ class BaseHLVLMAdapter:
             "low-level robot controller and to select task-relevant keyframes for future memory. Be concise, "
             "ground decisions in the provided images, and output only valid JSON. The recent observation clip is "
             "a past-to-current sequence; the last valid recent frame is the current state that must determine "
-            f"`current_subtask`. {thinking_instruction}"
+            f"`current_objective`. {thinking_instruction}"
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
@@ -329,24 +335,25 @@ class BaseHLVLMAdapter:
 
     def _fallback_prediction(self, sample: ExportedHLMemorySample) -> HLMemoryPrediction:
         previous_fields = _parse_ll_memory_fields(sample.language_memory)
-        objective = previous_fields.get("current objective", "").strip()
-        if _is_usable_fallback_objective(objective, sample.instruction):
-            current_subtask = objective
-        else:
-            current_subtask = "continue the observed manipulation step"
-        memory = (
-            "Task progress: Continue the task using the current visual observations.\n"
-            f"Current objective: {current_subtask}\n"
-            "Relevant objects: none\n"
-            "Notes: Use current visual observations."
+        previous_progress = previous_fields.get("task progress", "").strip()
+        current_objective = "continue the observed manipulation step"
+        memory = render_language_memory_fields(
+            task_progress=previous_progress or "Use current visual observations.",
+            current_objective=current_objective,
+            relevant_objects=(),
+            notes="Parse failed; use current visual observations.",
         )
         return HLMemoryPrediction(
             updated_language_memory=memory,
-            current_subtask=current_subtask,
+            current_subtask=current_objective,
             keyframe_candidate_positions=(),
             phase="unknown",
             target_query="",
             goal_query="",
+            task_progress=previous_progress or "Use current visual observations.",
+            current_objective=current_objective,
+            relevant_objects=(),
+            notes="Parse failed; use current visual observations.",
         )
 
     def _render_image_text_messages(
