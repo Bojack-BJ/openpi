@@ -1,3 +1,19 @@
+'''
+export HF_LEROBOT_HOME=/root/Users/dataset/lerobot_home
+PYTHONPATH=src python dataprocess_new/batch_fastumi_raw_to_lerobot_v21.py \
+  --raw-root /root/Users/segmentation_data_dtw \
+  --repo-prefix subtask/ \
+  --task-workers  \
+  --continue-on-error \
+  -- \
+  --robot-type fasttouch \
+  --fps 20 \
+  --traj-source merge \
+  --mode image \
+  --include-guidance  
+'''
+
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -52,7 +68,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task-json",
         type=Path,
-        default=Path("/root/Users/donggaoqi/mmgj/merged_1_12_0424.json"),
+        default=Path("/root/Users/donggaoqi/mmgj/api_search_history/merged_1_12_0424.json"),
         help="JSON file containing taskid -> task description records.",
     )
     parser.add_argument(
