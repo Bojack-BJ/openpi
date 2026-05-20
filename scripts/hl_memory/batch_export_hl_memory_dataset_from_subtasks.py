@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,6 +49,7 @@ class Job:
     annotations_jsonl: Path
     train_dir: Path
     val_dir: Path
+    log_path: Path
     cmd: list[str]
     annotation_cmd: list[str] | None
 
@@ -57,6 +62,7 @@ class Result:
     train_dir: str
     val_dir: str
     annotations_jsonl: str
+    log_path: str
     error: str = ""
 
 
@@ -78,6 +84,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--continue-on-error", action="store_true")
+    parser.add_argument("--status-interval-s", type=float, default=60.0, help="Print batch heartbeat while jobs are still running.")
+    parser.add_argument("--stream-output", action="store_true", help="Also stream child process output to the terminal with task prefixes.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--auto-export-annotations", action="store_true", help="Create hl_annotations.jsonl when missing.")
     parser.add_argument("--emit-success-events", action="store_true", help="Forward to annotation exporter when auto-exporting.")
@@ -107,18 +115,34 @@ def main() -> None:
             results.append(result_from_job(job, returncode=0))
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            future_to_job = {pool.submit(run_job, job): job for job in jobs}
-            for future in as_completed(future_to_job):
-                job = future_to_job[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # pragma: no cover - CLI diagnostic path
-                    result = result_from_job(job, returncode=1, error=str(exc))
-                results.append(result)
-                status = "OK" if result.returncode == 0 else f"FAIL:{result.returncode}"
-                print(f"[{status}] {job.task_id} repo_id={job.repo_id}")
-                if result.returncode != 0 and not args.continue_on_error:
-                    raise SystemExit(f"Task {job.task_id} failed: {result.error}")
+            future_to_job = {}
+            for job in jobs:
+                print(f"[Queue] {job.task_id} repo_id={job.repo_id} log={job.log_path}", flush=True)
+                future_to_job[pool.submit(run_job, job, stream_output=args.stream_output)] = job
+            pending = set(future_to_job)
+            while pending:
+                done, pending = wait(pending, timeout=args.status_interval_s, return_when=FIRST_COMPLETED)
+                if not done:
+                    running = [future_to_job[future].task_id for future in pending]
+                    preview = ", ".join(running[: min(8, len(running))])
+                    suffix = "" if len(running) <= 8 else f", ... +{len(running) - 8}"
+                    print(
+                        f"[Status] done={len(results)}/{len(jobs)} running={len(running)} "
+                        f"tasks=[{preview}{suffix}]",
+                        flush=True,
+                    )
+                    continue
+                for future in done:
+                    job = future_to_job[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:  # pragma: no cover - CLI diagnostic path
+                        result = result_from_job(job, returncode=1, error=str(exc))
+                    results.append(result)
+                    status = "OK" if result.returncode == 0 else f"FAIL:{result.returncode}"
+                    print(f"[{status}] {job.task_id} repo_id={job.repo_id} log={job.log_path}", flush=True)
+                    if result.returncode != 0 and not args.continue_on_error:
+                        raise SystemExit(f"Task {job.task_id} failed: {result.error}\nLog: {job.log_path}")
 
     summary_path = args.summary_json or (args.output_root / SUMMARY_NAME)
     if not args.dry_run:
@@ -152,6 +176,7 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             continue
         train_dir = args.output_root / task_id / "train"
         val_dir = args.output_root / task_id / "val"
+        log_path = args.output_root / task_id / "batch_export.log"
         if args.skip_existing and not args.overwrite and (train_dir / "samples.jsonl").exists() and (val_dir / "samples.jsonl").exists():
             print(f"[Skip] {task_id}: train/val samples already exist")
             continue
@@ -200,21 +225,74 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
         if args.overwrite:
             cmd.append("--overwrite")
         cmd.extend(passthrough)
-        jobs.append(Job(task_id, task_dir, repo_id, annotations_jsonl, train_dir, val_dir, cmd, annotation_cmd))
+        jobs.append(Job(task_id, task_dir, repo_id, annotations_jsonl, train_dir, val_dir, log_path, cmd, annotation_cmd))
     return jobs
 
 
-def run_job(job: Job) -> Result:
+def run_job(job: Job, *, stream_output: bool) -> Result:
     env = os.environ.copy()
     env.setdefault("HF_LEROBOT_HOME", str(job.task_dir.parent.parent))
-    if job.annotation_cmd is not None:
-        annotation = subprocess.run(job.annotation_cmd, text=True, capture_output=True, check=False, env=env)
-        if annotation.returncode != 0:
-            return result_from_job(job, annotation.returncode, annotation.stderr or annotation.stdout)
-    proc = subprocess.run(job.cmd, text=True, capture_output=True, check=False, env=env)
-    if proc.returncode != 0:
-        return result_from_job(job, proc.returncode, proc.stderr or proc.stdout)
+    job.log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[Running] {job.task_id} repo_id={job.repo_id} log={job.log_path}", flush=True)
+    with job.log_path.open("w", encoding="utf-8") as log:
+        log.write(f"[Task] {job.task_id}\n[Repo] {job.repo_id}\n")
+        log.write(f"[HF_LEROBOT_HOME] {env.get('HF_LEROBOT_HOME', '')}\n")
+        if job.annotation_cmd is not None:
+            returncode, tail = run_command(
+                job.annotation_cmd,
+                env=env,
+                log=log,
+                task_id=job.task_id,
+                stage="annotations",
+                stream_output=stream_output,
+            )
+            if returncode != 0:
+                return result_from_job(job, returncode, tail)
+        returncode, tail = run_command(
+            job.cmd,
+            env=env,
+            log=log,
+            task_id=job.task_id,
+            stage="export",
+            stream_output=stream_output,
+        )
+    if returncode != 0:
+        return result_from_job(job, returncode, tail)
     return result_from_job(job, 0)
+
+
+def run_command(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    log,
+    task_id: str,
+    stage: str,
+    stream_output: bool,
+) -> tuple[int, str]:
+    log.write(f"\n[Command:{stage}] {' '.join(cmd)}\n")
+    log.flush()
+    tail: deque[str] = deque(maxlen=120)
+    start_time = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        log.write(line)
+        tail.append(line.rstrip("\n"))
+        if stream_output:
+            print(f"[{task_id}:{stage}] {line}", end="", flush=True)
+    returncode = proc.wait()
+    elapsed_s = time.perf_counter() - start_time
+    log.write(f"\n[Exit:{stage}] returncode={returncode} elapsed_s={elapsed_s:.1f}\n")
+    log.flush()
+    return returncode, "\n".join(tail)
 
 
 def result_from_job(job: Job, returncode: int, error: str = "") -> Result:
@@ -225,12 +303,13 @@ def result_from_job(job: Job, returncode: int, error: str = "") -> Result:
         train_dir=str(job.train_dir),
         val_dir=str(job.val_dir),
         annotations_jsonl=str(job.annotations_jsonl),
+        log_path=str(job.log_path),
         error=error[-4000:],
     )
 
 
 def render_job(job: Job) -> str:
-    lines = [f"[Task] {job.task_id}", f"[Repo] {job.repo_id}"]
+    lines = [f"[Task] {job.task_id}", f"[Repo] {job.repo_id}", f"[Log] {job.log_path}"]
     if job.annotation_cmd is not None:
         lines.append("[AnnotationCmd] " + " ".join(job.annotation_cmd))
     lines.append("[ExportCmd] " + " ".join(job.cmd))
