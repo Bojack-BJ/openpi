@@ -1,11 +1,13 @@
 # HL Memory V1
 
-HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observation clip、任务文本和上一轮 language memory 中预测：
+HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observation clip、任务文本和上一轮 language memory 中预测结构化高层状态：
 
-- `current_subtask`：给低层 policy 的当前可执行子任务
-- `updated_language_memory`：给下一轮 HL 和低层 policy 读的紧凑状态
+- `task_progress`：历史状态，累积已经完成或稳定成立的任务进展
+- `current_objective`：给低层 policy 的当前可执行目标
+- `relevant_objects` / `notes`：当前目标相关的物体、位置和动作约束
 - `keyframe_candidate_positions`：recent clip 内值得进入 historical memory 的候选帧，1-indexed
 - `phase` / `target_query` / `goal_query`
+- `target_bbox_xyxy`：推理 debug 可选字段，训练 GT 不要求
 
 代码入口：
 
@@ -17,6 +19,8 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 - `scripts/hl_memory/run_hl_memory_zero_shot.py`
 
 当前支持 Qwen2.5-VL / Qwen3.5-VL。当前不做在线 robot wrapper、target mask 训练或低层 action 闭环。
+
+兼容性说明：`current_subtask` 和 `updated_language_memory` 仍然会读写，用于兼容旧数据和旧 checkpoint；新协议以 `current_objective` 和四字段 language memory 为准。
 
 ## FastUMI Pipeline
 
@@ -116,12 +120,40 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
-### 3. HL Annotation JSONL To HL Dataset
+### 3. Optional LLM GT Normalization
+
+如果 rule-based annotations 的 `current_subtask` 太像状态文本，或者你希望 `task_progress` 是更自然的累积历史，可以先用离线 LLM 归一化 annotations。推荐用大模型只生成 GT sidecar，不要在训练或 rollout 时在线调用。
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
+  --input-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
+  --model-path /root/Users/lixiaotong/Qwen3.5-27B \
+  --device-map auto \
+  --resume
+```
+
+归一化输出会在原 row 上补充这些字段：
+
+```json
+{
+  "task_progress": "The motor has been picked up.",
+  "current_objective": "place the motor into the box",
+  "relevant_objects": ["motor", "box"],
+  "notes": "keep the motor aligned with the box opening",
+  "target_query": "motor",
+  "goal_query": "box"
+}
+```
+
+`task_progress` 只能描述历史和已完成状态，不能把未来完整流程提前写进去。`current_objective` 必须是当前帧对应的低层可执行目标，不能写成 `motor is picked up` 这种被动状态。
+
+### 4. HL Annotation JSONL To HL Dataset
 
 ```bash
 python scripts/hl_memory/export_hl_memory_dataset.py \
   --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
-  --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
   --output-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
   --visual-mode raw \
   --recent-frames-length 8 \
@@ -144,12 +176,37 @@ exported/
 
 `--visual-mode raw` 是默认值，也是推荐值。HL export 只读取必要的 parquet columns：episode/frame/task/subtask/prompt 和 RGB image columns；不会读取 state/action，也不会读取或传给 HL 任何 mask / overlay / 高亮目标。`--visual-mode config` 只影响优先选择哪些已配置的 RGB camera column，仍然会排除 mask/overlay。
 
+每条 sample 的核心字段：
+
+```json
+{
+  "sample_id": "episode_000000_frame_000276",
+  "episode_index": 0,
+  "frame_index": 276,
+  "instruction": "put the motor into the box",
+  "language_memory": "Task progress: ...\nCurrent objective: ...\nRelevant objects: ...\nNotes: ...",
+  "updated_language_memory": "Task progress: ...\nCurrent objective: ...\nRelevant objects: ...\nNotes: ...",
+  "task_progress": "The motor has been picked up.",
+  "current_objective": "place the motor into the box",
+  "relevant_objects": ["motor", "box"],
+  "notes": "none",
+  "current_subtask": "place the motor into the box",
+  "phase": "place the motor into the box",
+  "target_query": "motor",
+  "goal_query": "box",
+  "recent_frames": ["frames/frame_....png"],
+  "memory_frames": ["frames/frame_....png"]
+}
+```
+
+训练 target JSON 来自 `task_progress/current_objective/relevant_objects/notes/...`。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。
+
 推荐按 episode 做 held-out split，而不是直接用同一个 `exported/` 同时训练和评估。下面这条命令会在一次运行里计算一次 split，并同时生成互斥的 train / val episode，避免两次运行时误填不同 ratio/seed：
 
 ```bash
 python scripts/hl_memory/export_hl_memory_dataset.py \
   --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
-  --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
   --output-train-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-val-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
   --val-ratio 0.1 \
@@ -162,7 +219,7 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
 
 如果报 `Episode ... was not found in dataset`，说明 `annotations.jsonl` 的 episode index 和当前 LeRobot dataset 不匹配；优先用上一步的 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 重新生成 annotations。只有确认要导出交集时才加 `--missing-episode-policy skip`。
 
-### 4. Train
+### 5. Train
 
 ```bash
 python scripts/hl_memory/train_hl_memory.py \
@@ -215,13 +272,13 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
   --vlm-variant qwen3_5_2b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
   --precision bfloat16 \
-  --learning-rate 1e-4 \
+  --learning-rate 5e-6 \
   --lora-enabled \
-  --lora-r 16 \
-  --lora-alpha 32 \
+  --lora-r 8 \
+  --lora-alpha 16 \
   --lora-dropout 0.05 \
-  --language-memory-dropout 0.5 \
-  --language-memory-dropout-value "Task started." \
+  --language-memory-dropout 0.3 \
+  --language-memory-dropout-value "No progress has been recorded yet." \
   --batch-size 4 \
   --grad-accum-steps 1 \
   --num-train-steps 2000 \
@@ -229,6 +286,8 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
 ```
 
 LoRA 需要安装 `peft`。默认 LoRA target modules 是 Qwen 常见 attention/MLP 线性层：`q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`。`--language-memory-dropout` 会在训练时随机把输入 `language_memory` 替换成指定文本，逼模型更多依赖视觉和 recent clip。
+
+当前脚本默认值已经偏保守：`--learning-rate 5e-6`、`--lora-r 8`、`--lora-alpha 16`、`--language-memory-dropout 0.3`。如果模型第一步就背出完整流程，优先检查 GT 是否泄漏未来，再降低 learning rate / 训练步数，而不是增大 LoRA rank。
 
 可用 backend / variant：
 
@@ -250,7 +309,7 @@ Qwen3.5 建议：
 python scripts/hl_memory/train_hl_memory.py --config-yaml src/openpi/hl_memory/train_hl_memory.yaml
 ```
 
-### 5. Eval
+### 6. Eval
 
 ```bash
 python scripts/hl_memory/eval_hl_memory_rollout.py \
@@ -263,7 +322,7 @@ python scripts/hl_memory/eval_hl_memory_rollout.py \
   --output-json /root/Users/dataset/hl_memory/sponge_visual_guided/eval_metrics.json
 ```
 
-评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标是 subtask match、phase/target/goal accuracy、keyframe precision/recall、memory similarity/drift、event accuracy。
+评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标包括 `objective_exact_match` / `objective_normalized_match`、legacy subtask match、phase/target/goal accuracy、keyframe precision/recall、memory similarity/drift、event accuracy。
 
 快速 smoke eval 可以先只跑少量未见 episode 或单个 ablation：
 
@@ -288,7 +347,7 @@ Eval 会打印阶段日志并显示每种 ablation 的 tqdm 进度条：
 - `HL eval <mode>`：已经进入逐 sample rollout；如果停在某个 sample，通常是该 sample 的视频 processor encode 或 `generate()` 慢。
 - `--frame-cache-size` 控制 resized frame LRU cache，默认 `512`；如果 eval 反复读取同一批帧且 CPU 内存足够，可以适当增大。
 
-### 6. Video Inference
+### 7. Video Inference
 
 单视角：
 
@@ -334,8 +393,8 @@ Input rules：
 - 单视角 `--video-path` 映射为 `front`。
 - 双视角 `--left-video-path` / `--right-video-path` 映射为 `robot_0` / `robot_1`，同一时间抽帧后横向拼接。
 - memory clip 和 recent clip 都按时间从旧到新排列。
-- recent clip 最后一张有效帧定义当前状态，`current_subtask` 必须描述最后有效帧。
-- rollout 会把上一轮 `updated_language_memory` 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
+- recent clip 最后一张有效帧定义当前状态，`current_objective` 必须描述最后有效帧对应的当前低层目标。
+- rollout 会把上一轮四字段 language memory 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
 
 常用参数说明：
 
@@ -386,6 +445,8 @@ rollout 和调试参数：
 | `--parallel-mode` | 大模型加载方式；单卡默认 `none`，27B OOM 时可试 `device_map`。 |
 | `--device-map` / `--tensor-parallel-plan` | 配合 `--parallel-mode device_map|tensor_parallel` 使用。 |
 
+推理输出 JSON 使用新 schema。`target_bbox_xyxy` 是可选 debug 字段，模型看到目标时可以输出当前帧像素坐标 `[x1, y1, x2, y2]`。开启 `--debug-dir` 时 debug panel 会把 bbox 画到 current frame 上；训练数据不需要提供 bbox GT。
+
 ## Data Formats
 
 ### HL Annotation JSONL
@@ -405,6 +466,10 @@ rollout 和调试参数：
   "episode_index": 0,
   "frame_index": 276,
   "current_subtask": "place the motor into the box",
+  "current_objective": "place the motor into the box",
+  "task_progress": "The motor has been picked up.",
+  "relevant_objects": ["motor", "box"],
+  "notes": "none",
   "instruction": "put the motor into the box",
   "phase": "place the motor into the box",
   "target_query": "motor",
@@ -414,7 +479,9 @@ rollout 和调试参数：
 }
 ```
 
-`event_type` 支持 `none`、`subtask_boundary`、`success`、`failure`、`progress`、`discovery`。它会影响导出的 target `updated_language_memory`。
+`event_type` 支持 `none`、`subtask_boundary`、`success`、`failure`、`progress`、`discovery`。它会影响 rule-based fallback 的 `task_progress` / rendered language memory；如果 annotation row 已经提供 LLM-normalized `task_progress`，则优先使用该字段。
+
+如果同时存在 `current_objective` 和 `current_subtask`，新训练 target 使用 `current_objective`。`current_subtask` 只作为 legacy alias 保留。
 
 HL prediction 还支持可选 SAM grounding 字段：
 
@@ -429,7 +496,7 @@ HL prediction 还支持可选 SAM grounding 字段：
 
 ### Language Memory
 
-`updated_language_memory` 是给下游低层 VLM/action policy 读的 compact context，不是 debug log。Rollout fallback 会规整成四行：
+language memory 是给下游低层 VLM/action policy 读的 compact context，不是 debug log。新协议固定规整成四行：
 
 ```text
 Task progress: <one short sentence>
@@ -439,6 +506,8 @@ Notes: <one short caution/spatial fact, or none>
 ```
 
 不要写逐帧时间戳、frame id、长日志或 raw model output。调试看 `raw_model_output`、`model_prediction`、`rollout_pretty.json`。
+
+四行文本由结构化字段确定性渲染。不要让模型直接自由发挥一整段 `updated_language_memory`；训练目标和 rollout parser 都优先读结构化 JSON 字段。
 
 ### LL Mask/Subtask Guidance
 
