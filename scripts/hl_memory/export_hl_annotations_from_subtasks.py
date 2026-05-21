@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import random
 from typing import Any
 
 
@@ -83,10 +85,48 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--progress-sample-fractions",
+        default="",
+        help=(
+            "Comma-separated relative positions inside each segment, excluding endpoints, for example "
+            "'0.2,0.4,0.6,0.8'. When set, this takes precedence over --progress-sample-stride."
+        ),
+    )
+    parser.add_argument(
+        "--progress-sample-target-frames",
+        type=int,
+        default=0,
+        help=(
+            "If > 0 and --progress-sample-fractions is unset, dynamically choose the number of progress samples as "
+            "segment_length / N, then place them at evenly spaced internal fractions."
+        ),
+    )
+    parser.add_argument(
+        "--progress-sample-jitter",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional deterministic fraction jitter in [0, 0.5), applied to fraction-based/dynamic sampling. "
+            "Example: 0.05 perturbs each internal fraction by up to +/- 5%% of segment length."
+        ),
+    )
+    parser.add_argument(
+        "--progress-sample-seed",
+        type=int,
+        default=0,
+        help="Seed for deterministic progress sample jitter.",
+    )
+    parser.add_argument(
+        "--min-progress-samples-per-segment",
+        type=int,
+        default=0,
+        help="Minimum number of dynamic progress samples per segment when --progress-sample-target-frames > 0.",
+    )
+    parser.add_argument(
         "--max-progress-samples-per-segment",
         type=int,
         default=1,
-        help="Maximum number of progress annotations per segment, including the midpoint.",
+        help="Maximum number of progress annotations per segment.",
     )
     parser.add_argument(
         "--progress-min-gap",
@@ -335,9 +375,16 @@ def _segments_to_rows(
         for progress_frame in _progress_sample_frames(
             start,
             end,
+            episode_index=episode_index,
+            subtask=subtask,
             stride=args.progress_sample_stride,
+            fractions=_parse_progress_sample_fractions(args.progress_sample_fractions),
+            target_frames=args.progress_sample_target_frames,
+            min_samples=args.min_progress_samples_per_segment,
             max_samples=args.max_progress_samples_per_segment,
             min_gap=args.progress_min_gap,
+            jitter=args.progress_sample_jitter,
+            seed=args.progress_sample_seed,
         ):
             rows.append(
                 _make_row(
@@ -363,24 +410,127 @@ def _segments_to_rows(
     return rows
 
 
-def _progress_sample_frames(start: int, end: int, *, stride: int, max_samples: int, min_gap: int = 0) -> list[int]:
+def _parse_progress_sample_fractions(value: str) -> list[float]:
+    fractions: list[float] = []
+    for item in value.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        fraction = float(stripped)
+        if not 0.0 < fraction < 1.0:
+            raise ValueError(f"progress sample fraction must be in (0, 1), got {fraction}")
+        fractions.append(fraction)
+    return fractions
+
+
+def _progress_sample_frames(
+    start: int,
+    end: int,
+    *,
+    episode_index: int,
+    subtask: str,
+    stride: int,
+    fractions: list[float],
+    target_frames: int,
+    min_samples: int,
+    max_samples: int,
+    min_gap: int = 0,
+    jitter: float = 0.0,
+    seed: int = 0,
+) -> list[int]:
+    """Choose progress annotation frames inside one segment.
+
+    Recommended mode is dynamic fraction sampling:
+    1. `target_frames` controls the number of samples: longer segments get more samples.
+    2. sample locations are evenly spaced fractions inside the segment, not raw stride positions.
+    3. optional deterministic jitter perturbs those fractions per episode/subtask so labels are not always at fixed
+       0.25/0.5/0.75-style positions.
+
+    Endpoints are intentionally excluded: `subtask_boundary` covers the start and `--emit-success-events` can cover
+    `end - 1`.
+    """
+
     if end - start <= 1 or max_samples <= 0:
         return []
+    if not 0.0 <= jitter < 0.5:
+        raise ValueError(f"--progress-sample-jitter must be in [0, 0.5), got {jitter}")
 
+    length = end - start
     middle = start + (end - start) // 2
-    candidates: list[int] = [middle]
-    if stride > 0:
+    candidates: list[int] = []
+    anchor = middle
+    if fractions:
+        effective_fractions = _jitter_fractions(
+            fractions,
+            jitter=jitter,
+            seed=seed,
+            episode_index=episode_index,
+            subtask=subtask,
+            start=start,
+            end=end,
+        )
+        candidates.extend(_frames_from_fractions(start, end, effective_fractions))
+        anchor = candidates[len(candidates) // 2] if candidates else middle
+    elif target_frames > 0:
+        dynamic_count = max(length // target_frames, min_samples)
+        dynamic_count = max(1, min(dynamic_count, max_samples))
+        dynamic_fractions = [(index + 1) / (dynamic_count + 1) for index in range(dynamic_count)]
+        effective_fractions = _jitter_fractions(
+            dynamic_fractions,
+            jitter=jitter,
+            seed=seed,
+            episode_index=episode_index,
+            subtask=subtask,
+            start=start,
+            end=end,
+        )
+        candidates.extend(_frames_from_fractions(start, end, effective_fractions))
+        anchor = candidates[len(candidates) // 2] if candidates else middle
+    else:
+        candidates.append(middle)
+    if stride > 0 and not fractions and target_frames <= 0:
         candidates.extend(range(start + stride, end, stride))
 
-    unique = sorted({int(frame) for frame in candidates if start < int(frame) < end})
-    unique = _apply_progress_min_gap(unique, anchor=middle, min_gap=min_gap)
+    raw_unique = sorted({int(frame) for frame in candidates if start < int(frame) < end})
+    unique = _apply_progress_min_gap(raw_unique, anchor=anchor, min_gap=min_gap)
+    min_budget = min(max(min_samples, 0), max_samples)
+    if target_frames > 0 and len(unique) < min_budget:
+        for frame in _prioritize_coverage(raw_unique, anchor=anchor):
+            if frame not in unique:
+                unique.append(frame)
+            if len(unique) >= min_budget:
+                break
+        unique = sorted(unique)
     if len(unique) <= max_samples:
         return unique
-    if middle in unique:
-        remaining = [frame for frame in unique if frame != middle]
+    if anchor in unique:
+        remaining = [frame for frame in unique if frame != anchor]
         budget = max_samples - 1
-        return sorted([middle, *_evenly_spaced_subset(remaining, budget)])
+        return sorted([anchor, *_evenly_spaced_subset(remaining, budget)])
     return _evenly_spaced_subset(unique, max_samples)
+
+
+def _frames_from_fractions(start: int, end: int, fractions: list[float]) -> list[int]:
+    length = end - start
+    return [int(round(start + length * fraction)) for fraction in fractions]
+
+
+def _jitter_fractions(
+    fractions: list[float],
+    *,
+    jitter: float,
+    seed: int,
+    episode_index: int,
+    subtask: str,
+    start: int,
+    end: int,
+) -> list[float]:
+    if jitter <= 0.0 or len(fractions) == 0:
+        return list(fractions)
+    digest = hashlib.sha256(f"{seed}|{episode_index}|{subtask}|{start}|{end}".encode("utf-8")).hexdigest()
+    rng = random.Random(int(digest[:16], 16))
+    jittered = [min(max(fraction + rng.uniform(-jitter, jitter), 1e-6), 1.0 - 1e-6) for fraction in fractions]
+    return sorted(jittered)
 
 
 def _apply_progress_min_gap(values: list[int], *, anchor: int, min_gap: int) -> list[int]:

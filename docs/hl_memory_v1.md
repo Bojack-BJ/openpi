@@ -100,7 +100,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
   --workers 8 \
   --overwrite \
   --continue-on-error \
-  -- --progress-sample-stride 50 --max-progress-samples-per-segment 4 --progress-min-gap 10
+  -- --progress-sample-target-frames 40 --min-progress-samples-per-segment 2 --max-progress-samples-per-segment 10 --progress-sample-jitter 0.05 --progress-sample-seed 42 --progress-min-gap 10 --emit-success-events
 ```
 
 输出：
@@ -139,7 +139,7 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
 
 默认每个 segment 导出两条 annotation：`start_frame` 的 `subtask_boundary` 和 segment 中点的 `progress`。这样 HL 同时学习 subtask 切换点和 subtask 进行中的稳定状态。`--emit-success-events` 会额外在 `end_frame - 1` 导出 `success`，当前默认不启用。
 
-长 segment 可以按长度补充 progress 样本，但建议加上 cap，避免长时间段主导训练：
+旧的 stride 采样仍然可用，但不推荐作为主路径，因为它不保证覆盖固定 progress 位置：
 
 ```bash
 python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
@@ -151,6 +151,50 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --progress-min-gap 10 \
   --overwrite
 ```
+
+注意采样分布：如果只用默认两点，`subtask_progress` 基本只覆盖 `0.0` 和 `0.5`，模型很难学到 late-stage 状态和 `should_advance_objective=true` 的切换时机。推荐主路径是“动态数量 + 比例位置 + 可选 jitter”：
+
+```text
+num_samples = clamp(segment_length / target_frames, min_samples, max_samples)
+fractions = 1/(n+1), 2/(n+1), ..., n/(n+1)
+optional jitter: fraction += uniform(-jitter, +jitter)
+```
+
+也就是说，`--progress-sample-target-frames` 不是直接每 N 帧固定 stride 取点，而是用 N 决定这个 segment 应该采几个内部 progress 点；位置仍按 segment 内部比例均匀铺开。`subtask_boundary` 覆盖 start，`--emit-success-events` 覆盖 end，所以 progress samples 不包含两端。
+
+固定比例采样适合 segment 长度差异不大、希望分布稳定的任务：
+
+```bash
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
+  --repo-id fastumi/sponge_visual_guided_xarm \
+  --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --instruction "Put the target object into the target slot" \
+  --progress-sample-fractions 0.2,0.4,0.6,0.8 \
+  --progress-sample-jitter 0.03 \
+  --progress-sample-seed 42 \
+  --progress-min-gap 10 \
+  --emit-success-events \
+  --overwrite
+```
+
+动态采样适合 segment 长度差异较大的任务：短 segment 采 2–4 个，长 segment 最多采 5–10 个。
+
+```bash
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
+  --repo-id fastumi/sponge_visual_guided_xarm \
+  --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --instruction "Put the target object into the target slot" \
+  --progress-sample-target-frames 40 \
+  --min-progress-samples-per-segment 2 \
+  --max-progress-samples-per-segment 10 \
+  --progress-sample-jitter 0.05 \
+  --progress-sample-seed 42 \
+  --progress-min-gap 10 \
+  --emit-success-events \
+  --overwrite
+```
+
+`--progress-sample-fractions` 优先级高于 `--progress-sample-target-frames`，两者都不设置时才回退到 `--progress-sample-stride` / midpoint 旧逻辑。`--progress-sample-jitter` 是 deterministic 的：同一 seed、episode、segment 会生成相同采样点，重跑可复现；不同 episode/segment 的 progress 不会永远落在完全相同的比例位置。正式训练前建议抽查 `hl_annotations.jsonl` 的 progress 分布，确认每个常见 subtask 至少包含 early/mid/late/end 样本。
 
 ### 3. LLM GT Normalization Before Dataset Export
 
