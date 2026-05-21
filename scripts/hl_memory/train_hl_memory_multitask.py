@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import json
 import logging
 import math
@@ -102,6 +103,9 @@ class TrainArgs:
     seed: int = 0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ddp_backend: str = "nccl"
+    distributed_strategy: str = "ddp"
+    fsdp_min_num_params: int = 100_000_000
+    fsdp_cpu_offload: bool = False
     frame_cache_size: int = 4096
     use_grad_scaler: bool = True
     wandb_enabled: bool = False
@@ -138,7 +142,13 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         if not val_samples:
             raise ValueError(f"No exported HL validation samples found in: {val_dataset_dirs}.")
     if distributed and args.parallel_mode != "none":
-        raise ValueError("DDP training requires --parallel-mode none. Do not combine DDP with device_map/tensor_parallel.")
+        raise ValueError(
+            "Distributed training requires --parallel-mode none. Do not combine DDP/FSDP with device_map/tensor_parallel."
+        )
+    if args.distributed_strategy not in {"ddp", "fsdp"}:
+        raise ValueError(f"--distributed-strategy must be 'ddp' or 'fsdp', got {args.distributed_strategy!r}")
+    if args.distributed_strategy == "fsdp" and not distributed:
+        raise ValueError("--distributed-strategy fsdp requires launching with torchrun.")
 
     if is_main:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -183,21 +193,29 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         loaded = dataclasses.replace(loaded, model=_apply_lora(loaded.model, args=args, is_main=is_main))
     loaded.model.train()
     if distributed:
-        loaded = dataclasses.replace(
-            loaded,
-            model=torch.nn.parallel.DistributedDataParallel(
-                loaded.model,
-                device_ids=[device.index] if device.type == "cuda" else None,
-            ),
-        )
+        if args.distributed_strategy == "fsdp":
+            loaded = dataclasses.replace(loaded, model=_wrap_fsdp(loaded.model, args=args, device=device))
+        else:
+            loaded = dataclasses.replace(
+                loaded,
+                model=torch.nn.parallel.DistributedDataParallel(
+                    loaded.model,
+                    device_ids=[device.index] if device.type == "cuda" else None,
+                ),
+            )
     optimizer = torch.optim.AdamW(
         (parameter for parameter in loaded.model.parameters() if parameter.requires_grad),
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
-    scaler_enabled = args.use_grad_scaler and device.type == "cuda" and not _has_fp16_trainable_parameters(loaded.model)
+    scaler_enabled = (
+        args.use_grad_scaler
+        and args.precision == "float16"
+        and device.type == "cuda"
+        and not _has_fp16_trainable_parameters(loaded.model)
+    )
     if is_main and args.use_grad_scaler and not scaler_enabled:
-        logging.info("Disabling GradScaler because trainable parameters are already fp16/bf16.")
+        logging.info("Disabling GradScaler; it is only used for float16 training with fp32 trainable parameters.")
     grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     frame_cache = FrameCache(args.frame_cache_size)
     rng = random.Random(args.seed + rank)
@@ -225,7 +243,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                 sync_gradients = accum_index == args.grad_accum_steps - 1
                 sync_context = (
                     loaded.model.no_sync()
-                    if distributed and isinstance(loaded.model, torch.nn.parallel.DistributedDataParallel) and not sync_gradients
+                    if _should_use_no_sync(loaded.model, sync_gradients=sync_gradients)
                     else nullcontext()
                 )
                 with sync_context:
@@ -260,7 +278,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                 step_loss += micro_loss
 
             grad_scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(loaded.model.parameters(), args.max_grad_norm)
+            _clip_grad_norm(loaded.model, args.max_grad_norm)
             grad_scaler.step(optimizer)
             grad_scaler.update()
             step_elapsed = time.perf_counter() - step_start_time
@@ -340,12 +358,13 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                         step=step,
                     )
             save_due = step % args.save_interval == 0 or step == args.num_train_steps
-            if is_main and save_due:
+            if save_due and (is_main or _is_fsdp_model(loaded.model)):
                 _save_checkpoint(
                     output_dir=args.output_dir / f"checkpoint-step-{step:06d}",
                     loaded=loaded,
                     hl_config=hl_config,
                     train_args=args,
+                    is_main=is_main,
                 )
             if distributed and save_due:
                 dist.barrier()
@@ -453,6 +472,37 @@ def _apply_lora(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> to
     if is_main:
         model.print_trainable_parameters()
     return model
+
+
+def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device) -> torch.nn.Module:
+    try:
+        from torch.distributed.fsdp import CPUOffload
+        from torch.distributed.fsdp import FullyShardedDataParallel
+        from torch.distributed.fsdp import MixedPrecision
+        from torch.distributed.fsdp import ShardingStrategy
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    except ImportError as exc:
+        raise ImportError("FSDP requires a PyTorch build with torch.distributed.fsdp support.") from exc
+
+    mixed_precision = None
+    if args.precision == "bfloat16":
+        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
+    elif args.precision == "float16":
+        mixed_precision = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float16)
+    auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy,
+        min_num_params=args.fsdp_min_num_params,
+    )
+    cpu_offload = CPUOffload(offload_params=True) if args.fsdp_cpu_offload else None
+    return FullyShardedDataParallel(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        cpu_offload=cpu_offload,
+        device_id=device if device.type == "cuda" else None,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        use_orig_params=True,
+    )
 
 
 def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
@@ -572,6 +622,13 @@ def _has_fp16_trainable_parameters(model: torch.nn.Module) -> bool:
     return any(parameter.requires_grad and parameter.dtype in {torch.float16, torch.bfloat16} for parameter in model.parameters())
 
 
+def _clip_grad_norm(model: torch.nn.Module, max_norm: float) -> None:
+    if _is_fsdp_model(model):
+        model.clip_grad_norm_(max_norm)
+    else:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+
 def _sample_batch(samples: list[RuntimeSample], batch_size: int, rng: random.Random):
     if batch_size <= 0:
         raise ValueError("batch_size must be positive.")
@@ -580,10 +637,28 @@ def _sample_batch(samples: list[RuntimeSample], batch_size: int, rng: random.Ran
     return [rng.choice(samples) for _ in range(batch_size)]
 
 
-def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryConfig, train_args: TrainArgs) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    model = loaded.model.module if isinstance(loaded.model, torch.nn.parallel.DistributedDataParallel) else loaded.model
-    model.save_pretrained(output_dir)
+def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryConfig, train_args: TrainArgs, is_main: bool) -> None:
+    if _is_fsdp_model(loaded.model):
+        try:
+            from torch.distributed.fsdp import FullStateDictConfig
+            from torch.distributed.fsdp import FullyShardedDataParallel
+            from torch.distributed.fsdp import StateDictType
+        except ImportError as exc:
+            raise ImportError("Saving FSDP checkpoints requires torch.distributed.fsdp support.") from exc
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FullyShardedDataParallel.state_dict_type(loaded.model, StateDictType.FULL_STATE_DICT, save_policy):
+            state_dict = loaded.model.state_dict()
+        model = loaded.model.module
+        if not is_main:
+            return
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(output_dir, state_dict=state_dict)
+    else:
+        if not is_main:
+            return
+        output_dir.mkdir(parents=True, exist_ok=True)
+        model = loaded.model.module if isinstance(loaded.model, torch.nn.parallel.DistributedDataParallel) else loaded.model
+        model.save_pretrained(output_dir)
     loaded.processor.save_pretrained(output_dir)
     metadata = {
         "hl_memory_config": dataclasses.asdict(hl_config),
@@ -593,6 +668,22 @@ def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryCon
         },
     }
     (output_dir / "hl_memory_train_metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
+
+
+def _is_fsdp_model(model: torch.nn.Module) -> bool:
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel
+    except ImportError:
+        return False
+    return isinstance(model, FullyShardedDataParallel)
+
+
+def _should_use_no_sync(model: torch.nn.Module, *, sync_gradients: bool) -> bool:
+    if sync_gradients:
+        return False
+    # FSDP no_sync keeps accumulated gradients unsharded and can increase peak memory.
+    # For this script FSDP is mainly a memory-saving path, so only DDP uses no_sync.
+    return isinstance(model, torch.nn.parallel.DistributedDataParallel)
 
 
 if __name__ == "__main__":

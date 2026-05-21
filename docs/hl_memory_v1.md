@@ -502,8 +502,10 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --lora-alpha 32 \
   --lora-dropout 0.1 \
   --language-memory-dropout 0.3 \
-  --batch-size 4 \
-  --grad-accum-steps 8 \
+  --distributed-strategy fsdp \
+  --fsdp-min-num-params 100000000 \
+  --batch-size 1 \
+  --grad-accum-steps 32 \
   --frame-cache-size 4096 \
   --num-train-steps 2000 \
   --save-interval 200 \
@@ -521,9 +523,11 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
 - `--dataset-dir /path/to/task/train`：只训练单个导出目录，主要用于 smoke/debug。
 - `--dataset-dirs ...` 或 `--dataset-dirs-json /path/to/list.json`：显式指定多个导出目录，适合排除坏任务或只跑子集。
 
-`train_hl_memory_multitask.py` 支持 `torchrun` 多卡 DDP。每张卡启动一个 rank，每个 rank 独立采样不同 HL samples、各自 forward/backward，然后在 optimizer step 前同步梯度。`--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。
+`train_hl_memory_multitask.py` 支持 `torchrun` 多卡 DDP/FSDP。每张卡启动一个 rank，每个 rank 独立采样不同 HL samples、各自 forward/backward，然后在 optimizer step 前同步梯度。`--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。
 
 当前脚本会把每个 rank 内的 `--batch-size` 个 samples 合成一个 VLM batch，一次 processor encode 和一次 model forward/backward。因此它同时支持“多卡 batch 并行”和“单卡 batch 内并行”。把 `--batch-size` 调大通常会提高 GPU 吞吐，但也会增加 peak activation memory；如果 OOM，优先降低 `--batch-size`，再用 `--grad-accum-steps` 保持全局 batch。
+
+`--distributed-strategy ddp` 是默认值，每张卡各自保留一份完整模型，速度直接但显存压力最大。4B/27B 或 batch 内并行 OOM 时用 `--distributed-strategy fsdp`，FSDP 会 shard 参数、梯度和 optimizer states，显存更低，但通信和 checkpoint 保存更慢。FSDP 的参数 shard 数由 `torchrun --nproc_per_node` / world size 决定，不由 `--fsdp-min-num-params` 决定；`--fsdp-min-num-params` 只是 auto-wrap 阈值，控制多大的子模块会被单独包成一个 FSDP unit。阈值越小，wrap 越细，峰值显存通常越低但通信开销越高；阈值越大，wrap 越粗，速度可能更好但峰值显存更高。LoRA + FSDP 需要 `use_orig_params=True`，脚本内部已启用。FSDP 路径不会在 grad accumulation 期间使用 `no_sync()`，因为 FSDP `no_sync()` 会保留未 shard 梯度、增加峰值显存；如果仍然 OOM，优先用 `--batch-size 1` 并增大 `--grad-accum-steps`，再把 `--fsdp-min-num-params` 降到 `50000000` 或 `20000000`，最后再考虑 `--fsdp-cpu-offload`，CPU offload 会明显变慢。
 
 开启 `--val-interval` 后，脚本会每隔 N 个 optimizer steps 从 val split 随机抽 `--val-batches` 个 batch 做 forward-only loss，并在 rank0 记录 `val/loss`、`val/time_s`、`val/batches_per_rank` 和 `val/effective_samples` 到 wandb。默认不启用 validation；多任务 batch pipeline 推荐显式设置 `--val-dataset-root ... --val-dataset-glob '*/val'`。
 
