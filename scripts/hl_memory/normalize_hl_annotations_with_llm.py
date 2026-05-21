@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - lightweight local help/dry-run
         return iterable
 
 
-PROMPT_VERSION = "hl_gt_normalizer_v2_segment"
+PROMPT_VERSION = "hl_gt_normalizer_v3_task_sidecar"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--granularity", choices=["segment", "row"], default="segment")
+    parser.add_argument("--granularity", choices=["task", "segment", "row"], default="task")
+    parser.add_argument(
+        "--sidecar-json",
+        type=pathlib.Path,
+        default=None,
+        help="Task-level normalized segment sidecar. Default: <output-dir>/hl_segments_llm_sidecar.json.",
+    )
     parser.add_argument("--memory-summary-mode", choices=["llm", "code"], default="llm")
     parser.add_argument("--advance-threshold", type=float, default=0.85)
     return parser.parse_args()
@@ -86,6 +92,9 @@ def normalize_rows(
 ) -> None:
     if args.granularity == "row":
         _normalize_rows_per_row(rows, args=args, tokenizer=tokenizer, model=model, done=done, stream=stream)
+        return
+    if args.granularity == "task":
+        _normalize_rows_by_task_sidecar(rows, args=args, tokenizer=tokenizer, model=model, done=done, stream=stream)
         return
     _normalize_rows_by_segment(rows, args=args, tokenizer=tokenizer, model=model, done=done, stream=stream)
 
@@ -204,6 +213,204 @@ def _normalize_rows_by_segment(
             stream.flush()
 
 
+def _normalize_rows_by_task_sidecar(
+    rows: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    tokenizer: Any,
+    model: Any,
+    done: set[tuple[int, int, str]],
+    stream: Any,
+) -> None:
+    sidecar_path = _resolve_sidecar_path(args)
+    sidecar = None
+    if bool(args.resume and not getattr(args, "overwrite", False)) and sidecar_path.exists():
+        sidecar = _load_task_sidecar(sidecar_path)
+    if sidecar is None:
+        sidecar = _build_task_sidecar(rows, args=args, tokenizer=tokenizer, model=model)
+        sidecar_path.parent.mkdir(parents=True, exist_ok=True)
+        sidecar_path.write_text(json.dumps(sidecar, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    templates = _templates_from_sidecar(sidecar)
+    progress_summaries = _progress_summaries_from_sidecar(sidecar)
+    canonical_by_subtask = _canonical_index_by_subtask(sidecar)
+    grouped = _group_by_episode(rows)
+    for episode_index, episode_rows in tqdm(grouped.items(), desc="Expand task sidecar", unit="episode"):
+        sorted_rows = sorted(episode_rows, key=lambda row: (int(row["frame_index"]), str(row.get("event_type", ""))))
+        segments = _infer_segments(sorted_rows, episode_index=episode_index)
+        if not segments:
+            continue
+        row_to_segment = _assign_rows_to_segments(sorted_rows, segments)
+        for row in sorted_rows:
+            key = _row_key(row)
+            if key in done:
+                continue
+            segment = row_to_segment[id(row)]
+            canonical_index = _resolve_canonical_segment_index(
+                segment,
+                canonical_by_subtask=canonical_by_subtask,
+                template_count=len(templates),
+            )
+            template = templates[canonical_index]
+            normalized = _expand_row_from_segment(
+                row,
+                segment=segment,
+                template=template,
+                task_progress=progress_summaries.get(canonical_index, "No completed subtask yet."),
+                advance_threshold=float(args.advance_threshold),
+            )
+            output = dict(row)
+            output.update(normalized)
+            output["llm_gt"] = normalized
+            output["llm_model"] = str(args.model_path)
+            output["prompt_version"] = PROMPT_VERSION
+            output["llm_sidecar_json"] = str(sidecar_path)
+            output["raw_response"] = {
+                "segment": template.raw_response,
+                "task_progress": progress_summaries.get(f"{canonical_index}:raw_response", ""),
+            }
+            output["parse_error"] = template.parse_error
+            stream.write(json.dumps(output, ensure_ascii=False) + "\n")
+            stream.flush()
+
+
+def _resolve_sidecar_path(args: argparse.Namespace) -> pathlib.Path:
+    sidecar_json = getattr(args, "sidecar_json", None)
+    if sidecar_json is not None:
+        return pathlib.Path(sidecar_json).expanduser().resolve()
+    output_jsonl = pathlib.Path(args.output_jsonl).expanduser().resolve()
+    return output_jsonl.with_name("hl_segments_llm_sidecar.json")
+
+
+def _build_task_sidecar(
+    rows: list[dict[str, Any]],
+    *,
+    args: argparse.Namespace,
+    tokenizer: Any,
+    model: Any,
+) -> dict[str, Any]:
+    task_segments = _infer_task_segments(rows)
+    if not task_segments:
+        return {
+            "prompt_version": PROMPT_VERSION,
+            "segments": [],
+            "progress_summaries": {"0": "No completed subtask yet."},
+        }
+    templates = _normalize_segments(
+        task_segments,
+        episode_rows=rows,
+        args=args,
+        tokenizer=tokenizer,
+        model=model,
+    )
+    progress_summaries = _build_progress_summaries(
+        task_segments,
+        templates,
+        args=args,
+        tokenizer=tokenizer,
+        model=model,
+    )
+    return {
+        "prompt_version": PROMPT_VERSION,
+        "model_path": str(args.model_path),
+        "memory_summary_mode": str(args.memory_summary_mode),
+        "segments": [
+            {
+                "segment_index": segment.segment_index,
+                "raw_subtask": segment.raw_subtask,
+                "current_objective": templates[segment.segment_index].current_objective,
+                "relevant_objects": templates[segment.segment_index].relevant_objects,
+                "notes": templates[segment.segment_index].notes,
+                "target_query": templates[segment.segment_index].target_query,
+                "goal_query": templates[segment.segment_index].goal_query,
+                "active_hand": templates[segment.segment_index].active_hand,
+                "raw_response": templates[segment.segment_index].raw_response,
+                "parse_error": templates[segment.segment_index].parse_error,
+            }
+            for segment in task_segments
+        ],
+        "progress_summaries": {str(key): value for key, value in progress_summaries.items()},
+    }
+
+
+def _load_task_sidecar(path: pathlib.Path) -> dict[str, Any] | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
+        return None
+    return data
+
+
+def _templates_from_sidecar(sidecar: dict[str, Any]) -> dict[int, SegmentTemplate]:
+    templates: dict[int, SegmentTemplate] = {}
+    for item in sidecar.get("segments", []):
+        if not isinstance(item, dict):
+            continue
+        index = int(item.get("segment_index", len(templates)))
+        templates[index] = SegmentTemplate(
+            current_objective=str(item.get("current_objective", item.get("raw_subtask", ""))).strip(),
+            relevant_objects=_parse_objects(item.get("relevant_objects", [])),
+            notes=str(item.get("notes", "none")).strip() or "none",
+            target_query=str(item.get("target_query", "")).strip(),
+            goal_query=str(item.get("goal_query", "")).strip(),
+            active_hand=str(item.get("active_hand", "")).strip(),
+            raw_response=str(item.get("raw_response", "")),
+            parse_error=str(item.get("parse_error", "")).strip() or None,
+        )
+    if not templates:
+        templates[0] = SegmentTemplate(
+            current_objective="continue the observed manipulation step",
+            relevant_objects=[],
+            notes="none",
+            target_query="",
+            goal_query="",
+            active_hand="",
+            raw_response="",
+        )
+    return templates
+
+
+def _progress_summaries_from_sidecar(sidecar: dict[str, Any]) -> dict[int | str, str]:
+    raw = sidecar.get("progress_summaries", {})
+    summaries: dict[int | str, str] = {0: "No completed subtask yet."}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            text = str(value).strip() or "No completed subtask yet."
+            try:
+                summaries[int(str(key))] = text
+            except ValueError:
+                summaries[str(key)] = text
+    return summaries
+
+
+def _canonical_index_by_subtask(sidecar: dict[str, Any]) -> dict[str, int | None]:
+    seen: dict[str, int | None] = {}
+    for item in sidecar.get("segments", []):
+        if not isinstance(item, dict):
+            continue
+        raw_subtask = str(item.get("raw_subtask", "")).strip()
+        if not raw_subtask:
+            continue
+        normalized = raw_subtask.lower()
+        index = int(item.get("segment_index", 0))
+        seen[normalized] = None if normalized in seen else index
+    return seen
+
+
+def _resolve_canonical_segment_index(
+    segment: SegmentInfo,
+    *,
+    canonical_by_subtask: dict[str, int | None],
+    template_count: int,
+) -> int:
+    by_subtask = canonical_by_subtask.get(segment.raw_subtask.lower())
+    if by_subtask is not None:
+        return by_subtask
+    return min(segment.segment_index, max(template_count - 1, 0))
+
+
 def _infer_segments(rows: list[dict[str, Any]], *, episode_index: int) -> list[SegmentInfo]:
     segments: list[SegmentInfo] = []
     last_subtask = ""
@@ -232,6 +439,32 @@ def _infer_segments(rows: list[dict[str, Any]], *, episode_index: int) -> list[S
         end_frame = segments[index + 1].start_frame if index + 1 < len(segments) else max_frame + 1
         resolved.append(dataclasses.replace(segment, end_frame=max(end_frame, segment.start_frame + 1)))
     return resolved
+
+
+def _infer_task_segments(rows: list[dict[str, Any]]) -> list[SegmentInfo]:
+    grouped = _group_by_episode(rows)
+    candidate_sequences: list[list[str]] = []
+    for episode_index, episode_rows in grouped.items():
+        segments = _infer_segments(
+            sorted(episode_rows, key=lambda row: (int(row["frame_index"]), str(row.get("event_type", "")))),
+            episode_index=episode_index,
+        )
+        sequence = [segment.raw_subtask for segment in segments if segment.raw_subtask]
+        if sequence:
+            candidate_sequences.append(sequence)
+    if not candidate_sequences:
+        return []
+    canonical = max(candidate_sequences, key=lambda sequence: (len(sequence), -candidate_sequences.index(sequence)))
+    return [
+        SegmentInfo(
+            episode_index=-1,
+            segment_index=index,
+            raw_subtask=subtask,
+            start_frame=index,
+            end_frame=index + 1,
+        )
+        for index, subtask in enumerate(canonical)
+    ]
 
 
 def _assign_rows_to_segments(rows: list[dict[str, Any]], segments: list[SegmentInfo]) -> dict[int, SegmentInfo]:

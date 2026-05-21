@@ -158,32 +158,53 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
 
 如果 rule-based annotations 的 `current_subtask` 太像状态文本，或者你希望 `task_progress` 是更自然的累积历史，用离线 LLM 归一化 annotations。推荐用大模型只生成 GT sidecar，不要在训练或 rollout 时在线调用。
 
-多任务批量归一化推荐用 batch 脚本。它会加载一次 LLM，然后依次处理每个 task 的 `hl_annotations.jsonl`：
+多任务批量归一化推荐用 batch 脚本。默认 `--granularity task`，每个 task 先生成一个 task-level segment sidecar，再把 sidecar 展开到所有 episode 的 annotation rows。这样同一个任务的重复 episode 不会反复调用 LLM。
 
 ```bash
 PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py \
   --annotation-root /root/Users/dataset/lerobot_home/subtask \
   --model-path /root/Users/lixiaotong/Qwen3.5-27B \
   --device-map auto \
-  --granularity segment \
+  --granularity task \
   --memory-summary-mode llm \
+  --max-new-tokens 128 \
   --skip-existing \
   --continue-on-error
 ```
+
+如果模型能放进单张 GPU，可以用多进程按 task 并行。每个 worker 会绑定一个 `CUDA_VISIBLE_DEVICES` 分组、独立加载一次模型、处理一部分 task：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py \
+  --annotation-root /root/Users/dataset/lerobot_home/subtask \
+  --model-path /root/Users/lixiaotong/Qwen3.5-27B \
+  --device-map auto \
+  --parallel-workers 4 \
+  --granularity task \
+  --memory-summary-mode code \
+  --max-new-tokens 128 \
+  --skip-existing \
+  --continue-on-error
+```
+
+`--parallel-workers 4` 会自动把 4 个进程绑定到前 4 张可见 GPU。如果需要手动分组，可以用 `--worker-gpu-groups "0;1;2;3"` 表示 4 个进程各用一张卡，或 `"0,1;2,3"` 表示 2 个进程、每个进程内部用 `device_map auto` 切 2 张卡。27B 如果单卡放不下，就不要用一卡一进程，改用多卡分组。`--memory-summary-mode code --max-new-tokens 128` 是最快组合；如果希望 history summary 也由 LLM 精修，用 `--memory-summary-mode llm`，但它仍然只在 task sidecar 阶段执行一次。
 
 输出默认写在每个 task 目录：
 
 ```text
 /root/Users/dataset/lerobot_home/subtask/<task_id>/hl_annotations_llm_normalized.jsonl
+/root/Users/dataset/lerobot_home/subtask/<task_id>/hl_segments_llm_sidecar.json
 ```
 
-默认 `--granularity segment` 不再逐 row 调用 LLM。流程是：
+默认 `--granularity task` 的流程是：
 
 ```text
-unique ordered subtask segments
+all episode annotations in one task
+  -> infer one canonical ordered segment list for the task
   -> LLM normalize each segment once
-  -> LLM summarize completed segment prefixes
-  -> code expands every annotation row
+  -> LLM/code summarize completed segment prefixes once
+  -> save hl_segments_llm_sidecar.json
+  -> expand every episode row from the sidecar
 ```
 
 这样每个 row 会得到：
@@ -202,7 +223,7 @@ unique ordered subtask segments
 }
 ```
 
-`subtask_progress` 和 `should_advance_objective` 由代码根据 segment start/end 和当前 frame 生成；LLM 只负责语义归一化和历史摘要压缩。如果想完全不用 LLM 总结历史，可以加 `--memory-summary-mode code`。
+`subtask_progress` 和 `should_advance_objective` 由代码按每个 episode 的实际 segment 时间范围展开生成；LLM 不处理 episode。默认 `--memory-summary-mode llm` 只在 task sidecar 阶段为 completed segment prefixes 生成一次 `task_progress` 摘要；如果想让 `task_progress` 也完全由规则生成，可以用 `--memory-summary-mode code`。
 
 如果只处理部分任务，`--only-task-id` 支持一次给多个 id，也支持重复：
 
@@ -222,7 +243,7 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
   --model-path /root/Users/lixiaotong/Qwen3.5-27B \
   --device-map auto \
-  --granularity segment \
+  --granularity task \
   --memory-summary-mode llm \
   --resume
 ```

@@ -75,11 +75,11 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
   --output-jsonl /path/to/annotations_llm_normalized.jsonl \
   --model-path /root/Users/lixiaotong/Qwen3.5-27B \
   --device-map auto \
-  --granularity segment \
+  --granularity task \
   --memory-summary-mode llm
 ```
 
-Default `--granularity segment` normalizes each unique ordered segment once, summarizes completed segment prefixes, and expands rows with rule-generated `subtask_progress` / `should_advance_objective`. Then pass the normalized JSONL to the HL memory dataset export path in place of the rule-based annotations. The normalizer is offline-only: training and rollout should consume the cached JSONL, not call the LLM dynamically.
+Default `--granularity task` builds one task-level `hl_segments_llm_sidecar.json`: it infers one canonical ordered segment list for the task, normalizes each unique segment once, summarizes completed segment prefixes once, then expands all episode rows with rule-generated `subtask_progress` / `should_advance_objective`. Then pass the normalized JSONL to the HL memory dataset export path in place of the rule-based annotations. The normalizer is offline-only: training and rollout should consume the cached JSONL, not call the LLM dynamically.
 
 ```bash
 PYTHONPATH=src python scripts/hl_memory/export_hl_memory_dataset.py \
