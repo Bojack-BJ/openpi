@@ -196,7 +196,18 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     loaded.model.train()
     if distributed:
         if args.distributed_strategy == "fsdp":
-            loaded = dataclasses.replace(loaded, model=_wrap_fsdp(loaded.model, args=args, device=device))
+            fsdp_report = _build_fsdp_report(loaded.model, args=args, world_size=world_size)
+            if is_main:
+                _log_fsdp_report(fsdp_report)
+            loaded = dataclasses.replace(
+                loaded,
+                model=_wrap_fsdp(
+                    loaded.model,
+                    args=args,
+                    device=device,
+                    ignored_modules=fsdp_report.ignored_modules,
+                ),
+            )
         else:
             loaded = dataclasses.replace(
                 loaded,
@@ -379,6 +390,19 @@ class RuntimeSample(NamedTuple):
     sample: object
 
 
+class FSDPReport(NamedTuple):
+    total_params: int
+    trainable_params: int
+    ignored_params: int
+    estimated_sharded_params: int
+    world_size: int
+    min_num_params: int
+    ignored_module_names: tuple[str, ...]
+    ignored_modules: tuple[torch.nn.Module, ...]
+    candidate_wrap_count: int
+    candidate_wrap_params: int
+
+
 def _resolve_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
     dirs: list[pathlib.Path] = []
     if args.dataset_dir is not None:
@@ -503,7 +527,13 @@ def _training_torch_dtype(args: TrainArgs) -> torch.dtype | None:
     return None
 
 
-def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device) -> torch.nn.Module:
+def _wrap_fsdp(
+    model: torch.nn.Module,
+    *,
+    args: TrainArgs,
+    device: torch.device,
+    ignored_modules: tuple[torch.nn.Module, ...],
+) -> torch.nn.Module:
     try:
         from torch.distributed.fsdp import CPUOffload
         from torch.distributed.fsdp import FullyShardedDataParallel
@@ -522,7 +552,6 @@ def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device)
         min_num_params=args.fsdp_min_num_params,
     )
     cpu_offload = CPUOffload(offload_params=True) if args.fsdp_cpu_offload else None
-    ignored_modules = _fsdp_ignored_modules(model)
     return FullyShardedDataParallel(
         model,
         auto_wrap_policy=auto_wrap_policy,
@@ -535,12 +564,62 @@ def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device)
     )
 
 
-def _fsdp_ignored_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
+def _build_fsdp_report(model: torch.nn.Module, *, args: TrainArgs, world_size: int) -> FSDPReport:
+    ignored_named_modules = _fsdp_ignored_named_modules(model)
+    ignored_modules = tuple(module for _, module in ignored_named_modules)
+    total_params = _unique_param_count(model.parameters())
+    trainable_params = _unique_param_count(parameter for parameter in model.parameters() if parameter.requires_grad)
+    ignored_params = _unique_module_param_count(ignored_modules)
+    candidate_wrap_count = 0
+    candidate_wrap_params = 0
+    ignored_ids = {id(module) for module in ignored_modules}
+    for module in model.modules():
+        if id(module) in ignored_ids:
+            continue
+        module_params = _unique_param_count(module.parameters(recurse=False))
+        if module_params >= args.fsdp_min_num_params:
+            candidate_wrap_count += 1
+            candidate_wrap_params += module_params
+    return FSDPReport(
+        total_params=total_params,
+        trainable_params=trainable_params,
+        ignored_params=ignored_params,
+        estimated_sharded_params=max(total_params - ignored_params, 0),
+        world_size=world_size,
+        min_num_params=args.fsdp_min_num_params,
+        ignored_module_names=tuple(name for name, _ in ignored_named_modules),
+        ignored_modules=ignored_modules,
+        candidate_wrap_count=candidate_wrap_count,
+        candidate_wrap_params=candidate_wrap_params,
+    )
+
+
+def _log_fsdp_report(report: FSDPReport) -> None:
+    estimated_per_rank_params = report.ignored_params + math.ceil(report.estimated_sharded_params / max(report.world_size, 1))
+    logging.info(
+        "FSDP report: total_params=%s trainable_params=%s ignored_replicated_params=%s "
+        "estimated_sharded_params=%s estimated_params_per_rank=%s world_size=%d fsdp_min_num_params=%d "
+        "candidate_direct_wrap_modules=%d candidate_direct_wrap_params=%s",
+        _format_count(report.total_params),
+        _format_count(report.trainable_params),
+        _format_count(report.ignored_params),
+        _format_count(report.estimated_sharded_params),
+        _format_count(estimated_per_rank_params),
+        report.world_size,
+        report.min_num_params,
+        report.candidate_wrap_count,
+        _format_count(report.candidate_wrap_params),
+    )
+    logging.info("FSDP ignored replicated modules: %s", ", ".join(report.ignored_module_names) or "none")
+
+
+def _fsdp_ignored_named_modules(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
     # PEFT/LoRA freezes embeddings and lm_head by default. Keeping those
     # frozen modules out of root FSDP avoids tied/flat parameter shape issues
     # such as lm_head.weight becoming a 1D flat parameter at F.linear().
-    ignored: list[torch.nn.Module] = []
+    ignored: list[tuple[str, torch.nn.Module]] = []
     seen: set[int] = set()
+    module_names = {id(module): name for name, module in model.named_modules()}
     for accessor_name in ("get_input_embeddings", "get_output_embeddings"):
         accessor = getattr(model, accessor_name, None)
         if not callable(accessor):
@@ -550,16 +629,42 @@ def _fsdp_ignored_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
             continue
         parameters = list(module.parameters(recurse=True))
         if parameters and not any(parameter.requires_grad for parameter in parameters):
-            ignored.append(module)
+            ignored.append((module_names.get(id(module), accessor_name), module))
             seen.add(id(module))
     for name, module in model.named_modules():
         if not name.endswith(("lm_head", "embed_tokens")) or id(module) in seen:
             continue
         parameters = list(module.parameters(recurse=True))
         if parameters and not any(parameter.requires_grad for parameter in parameters):
-            ignored.append(module)
+            ignored.append((name, module))
             seen.add(id(module))
     return ignored
+
+
+def _unique_module_param_count(modules: tuple[torch.nn.Module, ...]) -> int:
+    return _unique_param_count(parameter for module in modules for parameter in module.parameters(recurse=True))
+
+
+def _unique_param_count(parameters) -> int:
+    total = 0
+    seen: set[int] = set()
+    for parameter in parameters:
+        parameter_id = id(parameter)
+        if parameter_id in seen:
+            continue
+        seen.add(parameter_id)
+        total += parameter.numel()
+    return total
+
+
+def _format_count(value: int) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.3f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.3f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.3f}K"
+    return str(value)
 
 
 def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
