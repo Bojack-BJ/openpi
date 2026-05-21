@@ -98,9 +98,15 @@ $HF_LEROBOT_HOME/fastumi/sponge_visual_guided/subtask_segments.json
 PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtasks.py \
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --workers 8 \
+  --progress-sample-target-frames 40 \
+  --min-progress-samples-per-segment 2 \
+  --max-progress-samples-per-segment 10 \
+  --progress-sample-jitter 0.05 \
+  --progress-sample-seed 42 \
+  --progress-min-gap 10 \
+  --emit-success-events \
   --overwrite \
-  --continue-on-error \
-  -- --progress-sample-target-frames 40 --min-progress-samples-per-segment 2 --max-progress-samples-per-segment 10 --progress-sample-jitter 0.05 --progress-sample-seed 42 --progress-min-gap 10 --emit-success-events
+  --continue-on-error
 ```
 
 输出：

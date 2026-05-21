@@ -83,6 +83,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-query", default="", help="Optional --target-query copied to every annotation row.")
     parser.add_argument("--goal-query", default="", help="Optional --goal-query copied to every annotation row.")
     parser.add_argument("--emit-success-events", action="store_true", help="Pass --emit-success-events to the exporter.")
+    parser.add_argument(
+        "--progress-sample-fractions",
+        default="",
+        help="Pass --progress-sample-fractions to the exporter.",
+    )
+    parser.add_argument(
+        "--progress-sample-target-frames",
+        type=int,
+        default=0,
+        help="Pass --progress-sample-target-frames to the exporter.",
+    )
+    parser.add_argument(
+        "--progress-sample-jitter",
+        type=float,
+        default=0.0,
+        help="Pass --progress-sample-jitter to the exporter.",
+    )
+    parser.add_argument(
+        "--progress-sample-seed",
+        type=int,
+        default=0,
+        help="Pass --progress-sample-seed to the exporter.",
+    )
+    parser.add_argument(
+        "--min-progress-samples-per-segment",
+        type=int,
+        default=0,
+        help="Pass --min-progress-samples-per-segment to the exporter.",
+    )
+    parser.add_argument(
+        "--max-progress-samples-per-segment",
+        type=int,
+        default=None,
+        help="Pass --max-progress-samples-per-segment to the exporter.",
+    )
+    parser.add_argument(
+        "--progress-min-gap",
+        type=int,
+        default=0,
+        help="Pass --progress-min-gap to the exporter.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Pass --overwrite to the exporter.")
     parser.add_argument(
         "--skip-existing",
@@ -182,6 +223,13 @@ def main() -> None:
             target_query=args.target_query,
             goal_query=args.goal_query,
             emit_success_events=args.emit_success_events,
+            progress_sample_fractions=args.progress_sample_fractions,
+            progress_sample_target_frames=args.progress_sample_target_frames,
+            progress_sample_jitter=args.progress_sample_jitter,
+            progress_sample_seed=args.progress_sample_seed,
+            min_progress_samples_per_segment=args.min_progress_samples_per_segment,
+            max_progress_samples_per_segment=args.max_progress_samples_per_segment,
+            progress_min_gap=args.progress_min_gap,
             overwrite=args.overwrite,
             passthrough=passthrough,
         )
@@ -326,6 +374,13 @@ def build_export_command(
     target_query: str,
     goal_query: str,
     emit_success_events: bool,
+    progress_sample_fractions: str,
+    progress_sample_target_frames: int,
+    progress_sample_jitter: float,
+    progress_sample_seed: int,
+    min_progress_samples_per_segment: int,
+    max_progress_samples_per_segment: int | None,
+    progress_min_gap: int,
     overwrite: bool,
     passthrough: list[str],
 ) -> list[str]:
@@ -345,6 +400,20 @@ def build_export_command(
         cmd.extend(["--goal-query", goal_query])
     if emit_success_events:
         cmd.append("--emit-success-events")
+    if progress_sample_fractions:
+        cmd.extend(["--progress-sample-fractions", progress_sample_fractions])
+    if progress_sample_target_frames > 0:
+        cmd.extend(["--progress-sample-target-frames", str(progress_sample_target_frames)])
+    if progress_sample_jitter > 0:
+        cmd.extend(["--progress-sample-jitter", str(progress_sample_jitter)])
+    if progress_sample_seed:
+        cmd.extend(["--progress-sample-seed", str(progress_sample_seed)])
+    if min_progress_samples_per_segment > 0:
+        cmd.extend(["--min-progress-samples-per-segment", str(min_progress_samples_per_segment)])
+    if max_progress_samples_per_segment is not None:
+        cmd.extend(["--max-progress-samples-per-segment", str(max_progress_samples_per_segment)])
+    if progress_min_gap > 0:
+        cmd.extend(["--progress-min-gap", str(progress_min_gap)])
     if overwrite:
         cmd.append("--overwrite")
     cmd.extend(passthrough)
