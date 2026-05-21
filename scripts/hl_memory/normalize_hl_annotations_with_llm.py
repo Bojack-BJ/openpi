@@ -306,12 +306,14 @@ def _load_model(args: argparse.Namespace):
         model_cls = getattr(transformers, "AutoModelForImageTextToText", None)
     if model_cls is None:
         raise RuntimeError("Could not find a compatible Hugging Face AutoModel class.")
-    model = model_cls.from_pretrained(
-        str(args.model_path),
-        torch_dtype=dtype,
-        device_map=args.device_map,
-        trust_remote_code=True,
-    )
+    model_kwargs = {
+        "device_map": args.device_map,
+        "trust_remote_code": True,
+    }
+    try:
+        model = model_cls.from_pretrained(str(args.model_path), dtype=dtype, **model_kwargs)
+    except TypeError:
+        model = model_cls.from_pretrained(str(args.model_path), torch_dtype=dtype, **model_kwargs)
     model.eval()
     return tokenizer, model
 
@@ -522,6 +524,8 @@ def _compact_segment_context(rows: list[dict[str, Any]]) -> str:
 
 
 def _generate(tokenizer, model, prompt: str, *, max_new_tokens: int) -> str:
+    import torch
+
     messages = [
         {"role": "system", "content": "You produce strict JSON for robot training labels."},
         {"role": "user", "content": prompt},

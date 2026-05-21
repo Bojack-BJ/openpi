@@ -162,6 +162,8 @@ def main() -> None:
         results.append(result)
         status = "OK" if result.returncode == 0 else f"FAIL:{result.returncode}"
         print(f"[{status}] task_id={job.task_id} rows={result.output_rows} -> {job.output_jsonl}")
+        if result.error:
+            print(f"[Error] {job.task_id}: {result.error}", file=sys.stderr)
         if result.returncode != 0 and not args.continue_on_error:
             break
 
