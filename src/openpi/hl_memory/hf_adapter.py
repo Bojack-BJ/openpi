@@ -109,6 +109,35 @@ class BaseHLVLMAdapter:
         tensors["labels"] = labels.to(input_device)
         return tensors
 
+    def prepare_training_batch_inputs(
+        self,
+        loaded: LoadedHLVLM,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+        *,
+        device: str | torch.device,
+    ) -> Mapping[str, torch.Tensor]:
+        if len(samples) != len(clips):
+            raise ValueError(f"Expected one clip set per sample, got {len(samples)} samples and {len(clips)} clips.")
+        if not samples:
+            raise ValueError("Cannot prepare an empty HL training batch.")
+        prompt_inputs = self._encode_batch_prompt_only(loaded.processor, samples, clips)
+        full_inputs = self._encode_batch_prompt_and_target(loaded.processor, samples, clips)
+        labels = _build_batched_labels(
+            prompt_input_ids=prompt_inputs["input_ids"],
+            prompt_attention_mask=prompt_inputs.get("attention_mask"),
+            full_input_ids=full_inputs["input_ids"],
+            full_attention_mask=full_inputs.get("attention_mask"),
+        )
+        input_device = self._resolve_input_device(loaded.model, device)
+        tensors = {
+            key: value.to(input_device)
+            for key, value in full_inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        tensors["labels"] = labels.to(input_device)
+        return tensors
+
     def predict(
         self,
         loaded: LoadedHLVLM,
@@ -481,6 +510,29 @@ class BaseHLVLMAdapter:
     ) -> Mapping[str, Any]:
         raise NotImplementedError
 
+    def _encode_batch_prompt_only(
+        self,
+        processor: Any,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+    ) -> Mapping[str, Any]:
+        return _collate_processor_outputs(
+            [self._encode_prompt_only(processor, sample, clip) for sample, clip in zip(samples, clips, strict=True)]
+        )
+
+    def _encode_batch_prompt_and_target(
+        self,
+        processor: Any,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+    ) -> Mapping[str, Any]:
+        return _collate_processor_outputs(
+            [
+                self._encode_prompt_and_target(processor, sample, clip)
+                for sample, clip in zip(samples, clips, strict=True)
+            ]
+        )
+
 
 class Qwen25HLAdapter(BaseHLVLMAdapter):
     def _load_model(self, transformers: Any, pretrained_path: str, *, torch_dtype: torch.dtype) -> Any:
@@ -545,6 +597,71 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                     raise
                 return processor(
                     text=[rendered],
+                    videos=videos,
+                    padding=True,
+                    return_tensors="pt",
+                )
+
+    def _encode_batch_prompt_only(
+        self,
+        processor: Any,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+    ) -> Mapping[str, Any]:
+        rendered = [
+            self._render_messages(processor, sample, clip, include_target=False)
+            for sample, clip in zip(samples, clips, strict=True)
+        ]
+        return self._encode_batch_processor_inputs(processor, rendered, clips)
+
+    def _encode_batch_prompt_and_target(
+        self,
+        processor: Any,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+    ) -> Mapping[str, Any]:
+        rendered = [
+            self._render_messages(processor, sample, clip, include_target=True)
+            for sample, clip in zip(samples, clips, strict=True)
+        ]
+        return self._encode_batch_processor_inputs(processor, rendered, clips)
+
+    def _encode_batch_processor_inputs(
+        self,
+        processor: Any,
+        rendered: list[str],
+        clips: list[LoadedVideoClips],
+    ) -> Mapping[str, Any]:
+        videos = [video for clip in clips for video in self._prepare_videos(clip)]
+        video_metadata = self._prepare_video_metadata(videos)
+        try:
+            return processor(
+                text=rendered,
+                videos=videos,
+                text_kwargs={"padding": True, "return_tensors": "pt"},
+                videos_kwargs={
+                    "do_sample_frames": False,
+                    "video_metadata": video_metadata,
+                    "return_tensors": "pt",
+                },
+            )
+        except TypeError as exc:
+            if not _is_structured_processor_kwargs_error(exc):
+                raise
+            try:
+                return processor(
+                    text=rendered,
+                    videos=videos,
+                    padding=True,
+                    return_tensors="pt",
+                    do_sample_frames=False,
+                    video_metadata=video_metadata,
+                )
+            except TypeError as fallback_exc:
+                if not _is_structured_processor_kwargs_error(fallback_exc):
+                    raise
+                return processor(
+                    text=rendered,
                     videos=videos,
                     padding=True,
                     return_tensors="pt",
@@ -688,6 +805,75 @@ def _is_structured_processor_kwargs_error(exc: TypeError) -> bool:
             "do_sample_frames",
         )
     )
+
+
+def _build_batched_labels(
+    *,
+    prompt_input_ids: torch.Tensor,
+    prompt_attention_mask: torch.Tensor | None,
+    full_input_ids: torch.Tensor,
+    full_attention_mask: torch.Tensor | None,
+) -> torch.Tensor:
+    labels = full_input_ids.clone()
+    if full_attention_mask is not None:
+        labels = labels.masked_fill(full_attention_mask == 0, -100)
+    for row_index in range(full_input_ids.shape[0]):
+        prompt_ids = _nonpad_token_ids(prompt_input_ids[row_index], None if prompt_attention_mask is None else prompt_attention_mask[row_index])
+        if not prompt_ids:
+            continue
+        full_mask = None if full_attention_mask is None else full_attention_mask[row_index]
+        full_positions = _nonpad_positions(full_input_ids[row_index], full_mask)
+        full_ids = [int(full_input_ids[row_index, position]) for position in full_positions]
+        prompt_length = len(prompt_ids)
+        if full_ids[:prompt_length] == prompt_ids:
+            mask_positions = full_positions[:prompt_length]
+        else:
+            start = _find_subsequence(full_ids, prompt_ids)
+            if start < 0:
+                start = 0
+                prompt_length = min(prompt_length, len(full_positions))
+            mask_positions = full_positions[start : start + prompt_length]
+        if mask_positions:
+            labels[row_index, torch.tensor(mask_positions, device=labels.device)] = -100
+    return labels
+
+
+def _nonpad_token_ids(input_ids: torch.Tensor, attention_mask: torch.Tensor | None) -> list[int]:
+    positions = _nonpad_positions(input_ids, attention_mask)
+    return [int(input_ids[position]) for position in positions]
+
+
+def _nonpad_positions(input_ids: torch.Tensor, attention_mask: torch.Tensor | None) -> list[int]:
+    if attention_mask is None:
+        return list(range(int(input_ids.shape[0])))
+    return [int(index) for index in torch.nonzero(attention_mask.detach().cpu(), as_tuple=False).flatten().tolist()]
+
+
+def _find_subsequence(values: list[int], subsequence: list[int]) -> int:
+    if not subsequence:
+        return 0
+    max_start = len(values) - len(subsequence)
+    for start in range(max_start + 1):
+        if values[start : start + len(subsequence)] == subsequence:
+            return start
+    return -1
+
+
+def _collate_processor_outputs(items: list[Mapping[str, Any]]) -> Mapping[str, Any]:
+    if not items:
+        raise ValueError("Cannot collate an empty processor output list.")
+    collated: dict[str, Any] = {}
+    keys = set().union(*(item.keys() for item in items))
+    for key in keys:
+        values = [item[key] for item in items if key in item]
+        if len(values) != len(items):
+            continue
+        first = values[0]
+        if isinstance(first, torch.Tensor):
+            collated[key] = torch.cat(values, dim=0)
+        else:
+            collated[key] = values
+    return collated
 
 
 def _parse_ll_memory_fields(memory: str) -> dict[str, str]:

@@ -20,6 +20,7 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 - `scripts/hl_memory/export_hl_memory_dataset.py`
 - `scripts/hl_memory/batch_export_hl_memory_dataset_from_subtasks.py`
 - `scripts/hl_memory/train_hl_memory.py`
+- `scripts/hl_memory/train_hl_memory_multitask.py`
 - `scripts/hl_memory/eval_hl_memory_rollout.py`
 - `scripts/hl_memory/run_hl_memory_zero_shot.py`
 
@@ -413,6 +414,51 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
 如果报 `Episode ... was not found in dataset`，说明 `annotations.jsonl` 的 episode index 和当前 LeRobot dataset 不匹配；优先用上一步的 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 重新生成 annotations。只有确认要导出交集时才加 `--missing-episode-policy skip`。
 
 ### 5. Train
+
+多任务 / batch pipeline 推荐直接用 `train_hl_memory_multitask.py`。它可以从 batch export 的 root 下自动发现多个 task 的 `train/` 目录，把所有 task 的 samples 合并成一个训练池：
+
+```bash
+export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src
+export WANDB_MODE=online
+
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
+  --dataset-root /root/Users/dataset/hl_memory/subtask \
+  --dataset-glob '*/train' \
+  --output-dir /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_2b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
+  --precision bfloat16 \
+  --learning-rate 5e-6 \
+  --lora-enabled \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --language-memory-dropout 0.3 \
+  --batch-size 1 \
+  --grad-accum-steps 4 \
+  --frame-cache-size 4096 \
+  --num-train-steps 100000 \
+  --save-interval 15000 \
+  --log-interval 10 \
+  --wandb-enabled \
+  --wandb-project openpi-hl-memory \
+  --wandb-run-name subtask-multitask-qwen35-2b-lora
+```
+
+数据选择方式：
+
+- `--dataset-root /path/to/root --dataset-glob '*/train'`：推荐 batch 训练入口，自动加载每个 task 的 train split。
+- `--dataset-dir /path/to/task/train`：只训练单个导出目录，主要用于 smoke/debug。
+- `--dataset-dirs ...` 或 `--dataset-dirs-json /path/to/list.json`：显式指定多个导出目录，适合排除坏任务或只跑子集。
+
+`train_hl_memory_multitask.py` 支持 `torchrun` 多卡 DDP。每张卡启动一个 rank，每个 rank 独立采样不同 HL samples、各自 forward/backward，然后在 optimizer step 前同步梯度。`--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。
+
+当前脚本会把每个 rank 内的 `--batch-size` 个 samples 合成一个 VLM batch，一次 processor encode 和一次 model forward/backward。因此它同时支持“多卡 batch 并行”和“单卡 batch 内并行”。把 `--batch-size` 调大通常会提高 GPU 吞吐，但也会增加 peak activation memory；如果 OOM，优先降低 `--batch-size`，再用 `--grad-accum-steps` 保持全局 batch。
+
+多任务训练建议优先用 LoRA + `--language-memory-dropout`。原因是不同 task 的语言目标差异大，full finetune 更容易记住任务模板或破坏原 VLM 的通用视觉能力。`--num-train-steps` 是 optimizer steps，不是 epoch；实际见过的样本数约等于 `num_train_steps * global_batch_size`，需要按总 sample 数和任务数量估算。
+
+单任务训练仍然保留，适合先确认某一个 dataset export 没有格式问题：
 
 ```bash
 python scripts/hl_memory/train_hl_memory.py \

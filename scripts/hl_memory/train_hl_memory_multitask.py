@@ -203,29 +203,34 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     else nullcontext()
                 )
                 with sync_context:
-                    for item in batch:
-                        sample = _maybe_drop_language_memory(item.sample, args=args, rng=rng)
-                        data_start_time = time.perf_counter()
-                        clips = load_video_clips_for_sample(sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
-                        inputs = adapter.prepare_training_inputs(loaded, sample, clips, device=device)
-                        supervised_tokens = int((inputs["labels"] != -100).sum().detach().cpu().item())
-                        if supervised_tokens <= 0:
-                            raise ValueError(
-                                f"HL sample {sample.sample_id} produced zero supervised target tokens after label masking. "
-                                "This would make the language-model loss NaN."
-                            )
-                        step_data_time += time.perf_counter() - data_start_time
-                        outputs = loaded.model(**inputs)
-                        loss = outputs.loss / max(len(batch), 1)
-                        loss_value = float(loss.detach().cpu())
-                        if not math.isfinite(loss_value):
-                            raise FloatingPointError(
-                                f"Non-finite HL loss for sample_id={sample.sample_id}: loss={loss_value} "
-                                f"supervised_tokens={supervised_tokens} input_shape={tuple(inputs['input_ids'].shape)}. "
-                                "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
-                            )
-                        micro_loss += loss_value
-                        grad_scaler.scale(loss / args.grad_accum_steps).backward()
+                    batch_samples = [_maybe_drop_language_memory(item.sample, args=args, rng=rng) for item in batch]
+                    data_start_time = time.perf_counter()
+                    batch_clips = [
+                        load_video_clips_for_sample(sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
+                        for item, sample in zip(batch, batch_samples, strict=True)
+                    ]
+                    inputs = adapter.prepare_training_batch_inputs(loaded, batch_samples, batch_clips, device=device)
+                    supervised_tokens = (inputs["labels"] != -100).sum(dim=1).detach().cpu().tolist()
+                    bad_indices = [index for index, count in enumerate(supervised_tokens) if int(count) <= 0]
+                    if bad_indices:
+                        bad_sample = batch_samples[bad_indices[0]]
+                        raise ValueError(
+                            f"HL sample {bad_sample.sample_id} produced zero supervised target tokens after label masking. "
+                            "This would make the language-model loss NaN."
+                        )
+                    step_data_time += time.perf_counter() - data_start_time
+                    outputs = loaded.model(**inputs)
+                    loss = outputs.loss
+                    loss_value = float(loss.detach().cpu())
+                    if not math.isfinite(loss_value):
+                        sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
+                        raise FloatingPointError(
+                            f"Non-finite HL loss for batch sample_ids={sample_ids}: loss={loss_value} "
+                            f"input_shape={tuple(inputs['input_ids'].shape)}. "
+                            "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
+                        )
+                    micro_loss += loss_value
+                    grad_scaler.scale(loss / args.grad_accum_steps).backward()
                 step_loss += micro_loss
 
             grad_scaler.unscale_(optimizer)
