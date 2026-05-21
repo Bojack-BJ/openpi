@@ -191,6 +191,8 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     )
     if args.lora_enabled:
         loaded = dataclasses.replace(loaded, model=_apply_lora(loaded.model, args=args, is_main=is_main))
+    if distributed and args.distributed_strategy == "fsdp":
+        _align_fsdp_parameter_dtypes(loaded.model, args=args, is_main=is_main)
     loaded.model.train()
     if distributed:
         if args.distributed_strategy == "fsdp":
@@ -474,6 +476,34 @@ def _apply_lora(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> to
     return model
 
 
+def _align_fsdp_parameter_dtypes(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> None:
+    target_dtype = _training_torch_dtype(args)
+    if target_dtype is None:
+        return
+    converted = 0
+    seen: set[int] = set()
+    for parameter in model.parameters():
+        parameter_id = id(parameter)
+        if parameter_id in seen:
+            continue
+        seen.add(parameter_id)
+        if parameter.is_floating_point() and parameter.dtype != target_dtype:
+            parameter.data = parameter.data.to(dtype=target_dtype)
+            converted += 1
+    if is_main and converted:
+        logging.info("Converted %d floating parameters to %s before FSDP wrapping.", converted, target_dtype)
+
+
+def _training_torch_dtype(args: TrainArgs) -> torch.dtype | None:
+    if args.precision == "bfloat16":
+        return torch.bfloat16
+    if args.precision == "float16":
+        return torch.float16
+    if args.precision == "float32":
+        return torch.float32
+    return None
+
+
 def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device) -> torch.nn.Module:
     try:
         from torch.distributed.fsdp import CPUOffload
@@ -485,10 +515,9 @@ def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device)
         raise ImportError("FSDP requires a PyTorch build with torch.distributed.fsdp support.") from exc
 
     mixed_precision = None
-    if args.precision == "bfloat16":
-        mixed_precision = MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16)
-    elif args.precision == "float16":
-        mixed_precision = MixedPrecision(param_dtype=torch.float16, reduce_dtype=torch.float16, buffer_dtype=torch.float16)
+    target_dtype = _training_torch_dtype(args)
+    if target_dtype in {torch.bfloat16, torch.float16}:
+        mixed_precision = MixedPrecision(param_dtype=target_dtype, reduce_dtype=target_dtype, buffer_dtype=target_dtype)
     auto_wrap_policy = functools.partial(
         size_based_auto_wrap_policy,
         min_num_params=args.fsdp_min_num_params,
