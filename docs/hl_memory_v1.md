@@ -503,7 +503,7 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --lora-dropout 0.1 \
   --language-memory-dropout 0.3 \
   --distributed-strategy fsdp \
-  --fsdp-min-num-params 100000000 \
+  --fsdp-min-num-params 20000000 \
   --batch-size 1 \
   --grad-accum-steps 32 \
   --frame-cache-size 4096 \

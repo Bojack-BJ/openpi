@@ -104,7 +104,7 @@ class TrainArgs:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ddp_backend: str = "nccl"
     distributed_strategy: str = "ddp"
-    fsdp_min_num_params: int = 100_000_000
+    fsdp_min_num_params: int = 20_000_000
     fsdp_cpu_offload: bool = False
     frame_cache_size: int = 4096
     use_grad_scaler: bool = True
@@ -265,8 +265,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                             "This would make the language-model loss NaN."
                         )
                     step_data_time += time.perf_counter() - data_start_time
-                    outputs = loaded.model(**inputs)
-                    loss = outputs.loss
+                    loss = _compute_target_loss(loaded.model, inputs)
                     loss_value = float(loss.detach().cpu())
                     if not math.isfinite(loss_value):
                         sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
@@ -523,15 +522,44 @@ def _wrap_fsdp(model: torch.nn.Module, *, args: TrainArgs, device: torch.device)
         min_num_params=args.fsdp_min_num_params,
     )
     cpu_offload = CPUOffload(offload_params=True) if args.fsdp_cpu_offload else None
+    ignored_modules = _fsdp_ignored_modules(model)
     return FullyShardedDataParallel(
         model,
         auto_wrap_policy=auto_wrap_policy,
         cpu_offload=cpu_offload,
         device_id=device if device.type == "cuda" else None,
+        ignored_modules=ignored_modules or None,
         mixed_precision=mixed_precision,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         use_orig_params=True,
     )
+
+
+def _fsdp_ignored_modules(model: torch.nn.Module) -> list[torch.nn.Module]:
+    # PEFT/LoRA freezes embeddings and lm_head by default. Keeping those
+    # frozen modules out of root FSDP avoids tied/flat parameter shape issues
+    # such as lm_head.weight becoming a 1D flat parameter at F.linear().
+    ignored: list[torch.nn.Module] = []
+    seen: set[int] = set()
+    for accessor_name in ("get_input_embeddings", "get_output_embeddings"):
+        accessor = getattr(model, accessor_name, None)
+        if not callable(accessor):
+            continue
+        module = accessor()
+        if module is None or id(module) in seen:
+            continue
+        parameters = list(module.parameters(recurse=True))
+        if parameters and not any(parameter.requires_grad for parameter in parameters):
+            ignored.append(module)
+            seen.add(id(module))
+    for name, module in model.named_modules():
+        if not name.endswith(("lm_head", "embed_tokens")) or id(module) in seen:
+            continue
+        parameters = list(module.parameters(recurse=True))
+        if parameters and not any(parameter.requires_grad for parameter in parameters):
+            ignored.append(module)
+            seen.add(id(module))
+    return ignored
 
 
 def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
@@ -542,6 +570,40 @@ def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
     if rng.random() >= args.language_memory_dropout:
         return sample
     return dataclasses.replace(sample, language_memory=args.language_memory_dropout_value)
+
+
+def _compute_target_loss(model: torch.nn.Module, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    labels = inputs["labels"]
+    logits_to_keep = _target_logit_positions(labels)
+    if logits_to_keep is None:
+        outputs = model(**inputs)
+        return outputs.loss
+    model_inputs = {key: value for key, value in inputs.items() if key != "labels"}
+    try:
+        outputs = model(**model_inputs, logits_to_keep=logits_to_keep)
+    except TypeError:
+        outputs = model(**inputs)
+        return outputs.loss
+    logits = outputs.logits
+    shifted_labels = torch.nn.functional.pad(labels, (0, 1), value=-100).index_select(1, logits_to_keep + 1)
+    return torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        shifted_labels.reshape(-1),
+        ignore_index=-100,
+    )
+
+
+def _target_logit_positions(labels: torch.Tensor) -> torch.Tensor | None:
+    # A logit at position i predicts the label at position i + 1. Since all
+    # prompt/padding labels are -100, only positions before supervised target
+    # tokens need vocab projection.
+    if labels.shape[1] < 2:
+        return None
+    supervised_next_token = labels[:, 1:] != -100
+    positions = torch.nonzero(supervised_next_token.any(dim=0), as_tuple=False).flatten()
+    if positions.numel() == 0:
+        return None
+    return positions.to(device=labels.device, dtype=torch.long)
 
 
 def _evaluate_loss(
@@ -579,8 +641,8 @@ def _evaluate_loss(
                         f"HL validation sample {bad_sample.sample_id} produced zero supervised target tokens "
                         "after label masking."
                     )
-                outputs = loaded.model(**inputs)
-                loss_value = float(outputs.loss.detach().cpu())
+                loss = _compute_target_loss(loaded.model, inputs)
+                loss_value = float(loss.detach().cpu())
                 if not math.isfinite(loss_value):
                     sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
                     raise FloatingPointError(
