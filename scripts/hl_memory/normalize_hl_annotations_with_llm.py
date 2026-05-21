@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import dataclasses
+import importlib.util
 import json
 import math
 import pathlib
@@ -306,10 +307,15 @@ def _load_model(args: argparse.Namespace):
         model_cls = getattr(transformers, "AutoModelForImageTextToText", None)
     if model_cls is None:
         raise RuntimeError("Could not find a compatible Hugging Face AutoModel class.")
-    model_kwargs = {
-        "device_map": args.device_map,
-        "trust_remote_code": True,
-    }
+    model_kwargs = {"trust_remote_code": True}
+    device_map = str(args.device_map).strip()
+    if device_map and device_map.lower() not in {"none", "null", "false"}:
+        if importlib.util.find_spec("accelerate") is None:
+            raise ModuleNotFoundError(
+                "`--device-map` requires accelerate. Install it with `python -m pip install accelerate`, "
+                "or rerun with `--device-map none` if the model fits on one device."
+            )
+        model_kwargs["device_map"] = device_map
     try:
         model = model_cls.from_pretrained(str(args.model_path), dtype=dtype, **model_kwargs)
     except TypeError:
