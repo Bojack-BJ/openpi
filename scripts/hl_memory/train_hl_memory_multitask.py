@@ -64,6 +64,14 @@ class TrainArgs:
     dataset_dirs_json: pathlib.Path | None = None
     dataset_root: pathlib.Path | None = None
     dataset_glob: str = "*/train"
+    val_dataset_dir: pathlib.Path | None = None
+    val_dataset_dirs: tuple[pathlib.Path, ...] = ()
+    val_dataset_dirs_json: pathlib.Path | None = None
+    val_dataset_root: pathlib.Path | None = None
+    val_dataset_glob: str = "*/val"
+    val_interval: int = 0
+    val_batches: int = 10
+    val_seed: int = 12345
     config_yaml: pathlib.Path | None = None
     vlm_backend: str = "qwen2_5_vl"
     vlm_variant: str | None = None
@@ -123,6 +131,12 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     samples = _load_multitask_samples(dataset_dirs)
     if not samples:
         raise ValueError(f"No exported HL memory samples found in: {dataset_dirs}.")
+    val_samples: list[RuntimeSample] = []
+    if args.val_interval > 0:
+        val_dataset_dirs = _resolve_val_dataset_dirs(args)
+        val_samples = _load_multitask_samples(val_dataset_dirs)
+        if not val_samples:
+            raise ValueError(f"No exported HL validation samples found in: {val_dataset_dirs}.")
     if distributed and args.parallel_mode != "none":
         raise ValueError("DDP training requires --parallel-mode none. Do not combine DDP with device_map/tensor_parallel.")
 
@@ -135,7 +149,18 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
             args.batch_size,
             args.grad_accum_steps,
         )
-    wandb_run = _init_wandb(args, sample_count=len(samples), world_size=world_size) if is_main else None
+        if val_samples:
+            logging.info(
+                "Loaded %d HL validation samples. val_interval=%d val_batches_per_rank=%d",
+                len(val_samples),
+                args.val_interval,
+                args.val_batches,
+            )
+    wandb_run = (
+        _init_wandb(args, sample_count=len(samples), val_sample_count=len(val_samples), world_size=world_size)
+        if is_main
+        else None
+    )
     hl_config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -176,6 +201,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
     frame_cache = FrameCache(args.frame_cache_size)
     rng = random.Random(args.seed + rank)
+    val_rng = random.Random(args.val_seed + rank)
     running_loss = 0.0
     running_data_time = 0.0
     running_step_time = 0.0
@@ -229,7 +255,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                             f"input_shape={tuple(inputs['input_ids'].shape)}. "
                             "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
                         )
-                    micro_loss += loss_value
+                    micro_loss += loss_value / args.grad_accum_steps
                     grad_scaler.scale(loss / args.grad_accum_steps).backward()
                 step_loss += micro_loss
 
@@ -278,6 +304,41 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                 running_loss = 0.0
                 running_data_time = 0.0
                 running_step_time = 0.0
+            if val_samples and step % args.val_interval == 0:
+                val_started_at = time.perf_counter()
+                val_loss = _evaluate_loss(
+                    loaded=loaded,
+                    adapter=adapter,
+                    samples=val_samples,
+                    batch_size=args.batch_size,
+                    num_batches=args.val_batches,
+                    rng=val_rng,
+                    hl_config=hl_config,
+                    frame_cache=frame_cache,
+                    device=device,
+                )
+                logged_val_loss = _mean_across_ranks(val_loss, device=device) if distributed else val_loss
+                val_elapsed = time.perf_counter() - val_started_at
+                logged_val_elapsed = _mean_across_ranks(val_elapsed, device=device) if distributed else val_elapsed
+                if is_main:
+                    logging.info(
+                        "step=%d/%d val_loss=%.6f val_batches_per_rank=%d val_time_s=%.1f",
+                        step,
+                        args.num_train_steps,
+                        logged_val_loss,
+                        args.val_batches,
+                        logged_val_elapsed,
+                    )
+                    _wandb_log(
+                        wandb_run,
+                        {
+                            "val/loss": logged_val_loss,
+                            "val/time_s": logged_val_elapsed,
+                            "val/batches_per_rank": args.val_batches,
+                            "val/effective_samples": args.val_batches * args.batch_size * world_size,
+                        },
+                        step=step,
+                    )
             save_due = step % args.save_interval == 0 or step == args.num_train_steps
             if is_main and save_due:
                 _save_checkpoint(
@@ -326,6 +387,40 @@ def _resolve_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
     return unique
 
 
+def _resolve_val_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
+    dirs: list[pathlib.Path] = []
+    if args.val_dataset_dir is not None:
+        dirs.append(args.val_dataset_dir)
+    dirs.extend(args.val_dataset_dirs)
+    if args.val_dataset_dirs_json is not None:
+        payload = json.loads(args.val_dataset_dirs_json.read_text())
+        if not isinstance(payload, list):
+            raise ValueError("--val-dataset-dirs-json must contain a JSON list of dataset directories.")
+        dirs.extend(pathlib.Path(str(item)) for item in payload)
+    val_root = args.val_dataset_root
+    if val_root is None and not dirs:
+        val_root = args.dataset_root
+    if val_root is not None:
+        dirs.extend(sorted(path for path in val_root.glob(args.val_dataset_glob) if (path / "samples.jsonl").is_file()))
+    unique: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for dataset_dir in dirs:
+        resolved = dataset_dir.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not (resolved / "samples.jsonl").is_file():
+            raise FileNotFoundError(f"Missing validation samples.jsonl under {resolved}")
+        unique.append(resolved)
+    if not unique:
+        raise ValueError(
+            "Set --val-dataset-dir, --val-dataset-dirs, --val-dataset-dirs-json, or "
+            "--val-dataset-root when --val-interval > 0."
+        )
+    return unique
+
+
 def _load_multitask_samples(dataset_dirs: list[pathlib.Path]) -> list[RuntimeSample]:
     items: list[RuntimeSample] = []
     for dataset_dir in dataset_dirs:
@@ -370,6 +465,56 @@ def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
     return dataclasses.replace(sample, language_memory=args.language_memory_dropout_value)
 
 
+def _evaluate_loss(
+    *,
+    loaded,
+    adapter,
+    samples: list[RuntimeSample],
+    batch_size: int,
+    num_batches: int,
+    rng: random.Random,
+    hl_config: HLMemoryConfig,
+    frame_cache: FrameCache,
+    device: torch.device,
+) -> float:
+    if num_batches <= 0:
+        raise ValueError("--val-batches must be positive when validation is enabled.")
+    was_training = loaded.model.training
+    loaded.model.eval()
+    total_loss = 0.0
+    try:
+        with torch.no_grad():
+            for _ in range(num_batches):
+                batch = _sample_batch(samples, batch_size, rng)
+                batch_samples = [item.sample for item in batch]
+                batch_clips = [
+                    load_video_clips_for_sample(sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
+                    for item, sample in zip(batch, batch_samples, strict=True)
+                ]
+                inputs = adapter.prepare_training_batch_inputs(loaded, batch_samples, batch_clips, device=device)
+                supervised_tokens = (inputs["labels"] != -100).sum(dim=1).detach().cpu().tolist()
+                bad_indices = [index for index, count in enumerate(supervised_tokens) if int(count) <= 0]
+                if bad_indices:
+                    bad_sample = batch_samples[bad_indices[0]]
+                    raise ValueError(
+                        f"HL validation sample {bad_sample.sample_id} produced zero supervised target tokens "
+                        "after label masking."
+                    )
+                outputs = loaded.model(**inputs)
+                loss_value = float(outputs.loss.detach().cpu())
+                if not math.isfinite(loss_value):
+                    sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
+                    raise FloatingPointError(
+                        f"Non-finite HL validation loss for batch sample_ids={sample_ids}: loss={loss_value} "
+                        f"input_shape={tuple(inputs['input_ids'].shape)}."
+                    )
+                total_loss += loss_value
+    finally:
+        if was_training:
+            loaded.model.train()
+    return total_loss / num_batches
+
+
 def _init_distributed(args: TrainArgs) -> bool:
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         return False
@@ -396,7 +541,7 @@ def _mean_across_ranks(value: float, *, device: torch.device) -> float:
     return float(tensor.detach().cpu())
 
 
-def _init_wandb(args: TrainArgs, *, sample_count: int, world_size: int):
+def _init_wandb(args: TrainArgs, *, sample_count: int, val_sample_count: int, world_size: int):
     if not args.wandb_enabled:
         return None
     import wandb
@@ -411,6 +556,7 @@ def _init_wandb(args: TrainArgs, *, sample_count: int, world_size: int):
                 for key, value in dataclasses.asdict(args).items()
             },
             "sample_count": sample_count,
+            "val_sample_count": val_sample_count,
             "world_size": world_size,
             "effective_global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
         },

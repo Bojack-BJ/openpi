@@ -192,7 +192,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                             f"input_shape={tuple(inputs['input_ids'].shape)}. "
                             "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
                         )
-                    micro_loss += loss_value
+                    micro_loss += loss_value / args.grad_accum_steps
                     grad_scaler.scale(loss / args.grad_accum_steps).backward()
                 step_loss += micro_loss
 

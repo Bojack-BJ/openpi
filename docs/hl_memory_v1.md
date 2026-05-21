@@ -317,7 +317,71 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
 
 `task_progress` 只能描述历史和已完成状态，不能把未来完整流程提前写进去。`current_objective` 必须是当前帧对应的低层可执行目标，不能写成 `motor is picked up` 这种被动状态。
 
-### 4. HL Annotation JSONL To HL Dataset
+### 4. HL Sidecar To LL Objective Segments
+
+LL VLA 训练不会直接读取 `hl_segments_llm_sidecar.json`。现有 LL dataloader 只认识 episode-level `subtask_segments_path`，再把当前帧的 `subtask` 拼进 prompt。因此需要把 HL normalized `current_objective` 映射回每个 episode 的 frame ranges，生成同目录下的 `ll_current_objective_segments.json`：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_export_ll_objective_segments_from_hl_sidecars.py \
+  --subtask-root /root/Users/dataset/lerobot_home/subtask \
+  --workers 8 \
+  --overwrite \
+  --continue-on-error
+```
+
+单任务也可以直接跑：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/export_ll_objective_segments_from_hl_sidecar.py \
+  --task-dir /root/Users/dataset/lerobot_home/subtask/20260323O058A \
+  --overwrite
+```
+
+输出：
+
+```text
+/root/Users/dataset/lerobot_home/subtask/<task_id>/ll_current_objective_segments.json
+```
+
+文件格式仍然是 dataloader 已支持的 `episodes -> segments`，字段名仍叫 `subtask`，但语义是 HL normalized `current_objective`：
+
+```json
+{
+  "field_semantics": {"subtask": "current_objective"},
+  "episodes": {
+    "0": {
+      "segments": [
+        {
+          "start_frame": 0,
+          "end_frame": 276,
+          "subtask": "grasp the sponge with the right hand",
+          "source_subtask": "pick up the sponge"
+        }
+      ]
+    }
+  }
+}
+```
+
+LL config 里用这个文件替代 raw `subtask_segments.json`：
+
+```python
+DataConfig(
+    prompt_from_task=True,
+    subtask_segments_path="ll_current_objective_segments.json",
+)
+```
+
+这样训练时 LL 看到的 prompt 会变成：
+
+```text
+Overall instruction: <task prompt>
+Current subtask: <HL current_objective>
+```
+
+这和 rollout 时 HL server 低频输出 `current_objective`、LL server 高频消费当前 objective 的接口保持一致。
+
+### 5. HL Annotation JSONL To HL Dataset
 
 批量导出 train/val 时，推荐显式读取 LLM-normalized annotations：
 
@@ -413,37 +477,42 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
 
 如果报 `Episode ... was not found in dataset`，说明 `annotations.jsonl` 的 episode index 和当前 LeRobot dataset 不匹配；优先用上一步的 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 重新生成 annotations。只有确认要导出交集时才加 `--missing-episode-policy skip`。
 
-### 5. Train
+### 6. Train
 
 多任务 / batch pipeline 推荐直接用 `train_hl_memory_multitask.py`。它可以从 batch export 的 root 下自动发现多个 task 的 `train/` 目录，把所有 task 的 samples 合并成一个训练池：
 
 ```bash
-export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src
+export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi/src
+export WANDB_API_KEY="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"
 export WANDB_MODE=online
 
 torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
   --dataset-root /root/Users/dataset/hl_memory/subtask \
   --dataset-glob '*/train' \
+  --val-dataset-root /root/Users/dataset/hl_memory/subtask \
+  --val-dataset-glob '*/val' \
   --output-dir /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora \
   --vlm-backend qwen3_5_vl \
-  --vlm-variant qwen3_5_2b \
-  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
   --precision bfloat16 \
   --learning-rate 5e-6 \
   --lora-enabled \
   --lora-r 16 \
   --lora-alpha 32 \
-  --lora-dropout 0.05 \
+  --lora-dropout 0.1 \
   --language-memory-dropout 0.3 \
-  --batch-size 1 \
-  --grad-accum-steps 4 \
+  --batch-size 4 \
+  --grad-accum-steps 8 \
   --frame-cache-size 4096 \
-  --num-train-steps 100000 \
-  --save-interval 15000 \
+  --num-train-steps 2000 \
+  --save-interval 200 \
   --log-interval 10 \
+  --val-interval 100 \
+  --val-batches 10 \
   --wandb-enabled \
   --wandb-project openpi-hl-memory \
-  --wandb-run-name subtask-multitask-qwen35-2b-lora
+  --wandb-run-name subtask-multitask-qwen35-4b-lora
 ```
 
 数据选择方式：
@@ -455,6 +524,10 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
 `train_hl_memory_multitask.py` 支持 `torchrun` 多卡 DDP。每张卡启动一个 rank，每个 rank 独立采样不同 HL samples、各自 forward/backward，然后在 optimizer step 前同步梯度。`--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。
 
 当前脚本会把每个 rank 内的 `--batch-size` 个 samples 合成一个 VLM batch，一次 processor encode 和一次 model forward/backward。因此它同时支持“多卡 batch 并行”和“单卡 batch 内并行”。把 `--batch-size` 调大通常会提高 GPU 吞吐，但也会增加 peak activation memory；如果 OOM，优先降低 `--batch-size`，再用 `--grad-accum-steps` 保持全局 batch。
+
+开启 `--val-interval` 后，脚本会每隔 N 个 optimizer steps 从 val split 随机抽 `--val-batches` 个 batch 做 forward-only loss，并在 rank0 记录 `val/loss`、`val/time_s`、`val/batches_per_rank` 和 `val/effective_samples` 到 wandb。默认不启用 validation；多任务 batch pipeline 推荐显式设置 `--val-dataset-root ... --val-dataset-glob '*/val'`。
+
+Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 prompt tokens 和 padding tokens 置为 `-100`，只监督 target JSON token。Hugging Face causal LM loss 是所有未 mask target tokens 的平均 cross entropy。`grad_accum_steps` 内每个 micro batch 的 loss 会除以 accum steps 再 backward；日志里的 `train/loss` 也按 accum steps 做平均，因此不同 accum 配置下数值可比。DDP 下每个 rank 算本地 loss，日志再跨 rank 求平均。
 
 多任务训练建议优先用 LoRA + `--language-memory-dropout`。原因是不同 task 的语言目标差异大，full finetune 更容易记住任务模板或破坏原 VLM 的通用视觉能力。`--num-train-steps` 是 optimizer steps，不是 epoch；实际见过的样本数约等于 `num_train_steps * global_batch_size`，需要按总 sample 数和任务数量估算。
 
@@ -478,7 +551,7 @@ python scripts/hl_memory/train_hl_memory.py \
 多卡数据并行训练用 `torchrun`。每个 rank 独立采样 HL sample，同步梯度；只有 rank0 打印 tqdm/loss 和保存 checkpoint：
 
 ```bash
-export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi_second_branch/src
+export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi/src
 export WANDB_API_KEY="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"
 export WANDB_MODE=online
 
@@ -548,7 +621,7 @@ Qwen3.5 建议：
 python scripts/hl_memory/train_hl_memory.py --config-yaml src/openpi/hl_memory/train_hl_memory.yaml
 ```
 
-### 6. Eval
+### 7. Eval
 
 ```bash
 python scripts/hl_memory/eval_hl_memory_rollout.py \
@@ -586,7 +659,7 @@ Eval 会打印阶段日志并显示每种 ablation 的 tqdm 进度条：
 - `HL eval <mode>`：已经进入逐 sample rollout；如果停在某个 sample，通常是该 sample 的视频 processor encode 或 `generate()` 慢。
 - `--frame-cache-size` 控制 resized frame LRU cache，默认 `512`；如果 eval 反复读取同一批帧且 CPU 内存足够，可以适当增大。
 
-### 7. Video Inference
+### 8. Video Inference
 
 单视角：
 
