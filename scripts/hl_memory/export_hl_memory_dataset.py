@@ -503,6 +503,9 @@ def _export_episode(
             current_objective=str(next_memory_fields["current_objective"]),
             relevant_objects=tuple(next_memory_fields["relevant_objects"]),  # type: ignore[arg-type]
             notes=str(next_memory_fields["notes"]),
+            subtask_progress=annotation.subtask_progress,
+            should_advance_objective=annotation.should_advance_objective,
+            active_hand=annotation.active_hand,
         )
         samples.append(sample)
 

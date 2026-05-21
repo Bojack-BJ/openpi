@@ -38,6 +38,7 @@ DEFAULT_SUBTASK_ROOT = Path("/root/Users/dataset/lerobot_home/subtask")
 DEFAULT_OUTPUT_ROOT = Path("/root/Users/dataset/hl_memory/subtask")
 DEFAULT_EXPORT_SCRIPT = Path(__file__).with_name("export_hl_memory_dataset.py")
 DEFAULT_ANNOTATION_SCRIPT = Path(__file__).with_name("export_hl_annotations_from_subtasks.py")
+DEFAULT_ANNOTATIONS_NAME = "hl_annotations.jsonl"
 SUMMARY_NAME = "batch_hl_memory_export_summary.json"
 
 
@@ -87,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--status-interval-s", type=float, default=60.0, help="Print batch heartbeat while jobs are still running.")
     parser.add_argument("--stream-output", action="store_true", help="Also stream child process output to the terminal with task prefixes.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--annotations-name",
+        default=DEFAULT_ANNOTATIONS_NAME,
+        help=(
+            f"Annotation JSONL filename under each task directory. Default: {DEFAULT_ANNOTATIONS_NAME}. "
+            "Use hl_annotations_llm_normalized.jsonl after running batch_normalize_hl_annotations_with_llm.py."
+        ),
+    )
     parser.add_argument("--auto-export-annotations", action="store_true", help="Create hl_annotations.jsonl when missing.")
     parser.add_argument("--emit-success-events", action="store_true", help="Forward to annotation exporter when auto-exporting.")
     parser.add_argument("--progress-sample-stride", type=int, default=0, help="Forward to annotation exporter.")
@@ -170,9 +179,10 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
     for task_dir in task_dirs:
         task_id = task_dir.name
         repo_id = f"{args.repo_prefix}{task_id}"
-        annotations_jsonl = task_dir / "hl_annotations.jsonl"
+        annotations_jsonl = task_dir / args.annotations_name
+        raw_annotations_jsonl = task_dir / DEFAULT_ANNOTATIONS_NAME
         if not annotations_jsonl.exists() and not args.auto_export_annotations:
-            print(f"[Skip] {task_id}: missing {annotations_jsonl}; pass --auto-export-annotations to create it")
+            print(f"[Skip] {task_id}: missing {annotations_jsonl}; pass --auto-export-annotations to create raw annotations")
             continue
         train_dir = args.output_root / task_id / "train"
         val_dir = args.output_root / task_id / "val"
@@ -181,14 +191,24 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             print(f"[Skip] {task_id}: train/val samples already exist")
             continue
         annotation_cmd = None
-        if args.auto_export_annotations and (args.overwrite or not annotations_jsonl.exists()):
+        if args.auto_export_annotations and args.annotations_name != DEFAULT_ANNOTATIONS_NAME and not annotations_jsonl.exists():
+            print(
+                f"[Skip] {task_id}: missing normalized annotations {annotations_jsonl}; "
+                f"run batch_normalize_hl_annotations_with_llm.py first"
+            )
+            continue
+        if (
+            args.auto_export_annotations
+            and args.annotations_name == DEFAULT_ANNOTATIONS_NAME
+            and (args.overwrite or not raw_annotations_jsonl.exists())
+        ):
             annotation_cmd = [
                 sys.executable,
                 str(args.annotation_script.resolve()),
                 "--subtask-segments-json",
                 str(task_dir / "subtask_segments.json"),
                 "--output-jsonl",
-                str(annotations_jsonl),
+                str(raw_annotations_jsonl),
                 "--overwrite",
             ]
             if args.emit_success_events:

@@ -72,6 +72,9 @@ class ExportedHLMemorySample:
     current_objective: str = ""
     relevant_objects: tuple[str, ...] = ()
     notes: str = ""
+    subtask_progress: float | None = None
+    should_advance_objective: bool | None = None
+    active_hand: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ExportedHLMemorySample":
@@ -102,6 +105,9 @@ class ExportedHLMemorySample:
             current_objective=str(data.get("current_objective", data.get("current_subtask", ""))).strip(),
             relevant_objects=_parse_relevant_objects(data.get("relevant_objects", ())),
             notes=str(data.get("notes", "")).strip(),
+            subtask_progress=_parse_optional_float(data.get("subtask_progress")),
+            should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
+            active_hand=str(data.get("active_hand", "")).strip(),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -130,6 +136,9 @@ class ExportedHLMemorySample:
             "current_objective": self.current_objective,
             "relevant_objects": list(self.relevant_objects),
             "notes": self.notes,
+            "subtask_progress": self.subtask_progress,
+            "should_advance_objective": self.should_advance_objective,
+            "active_hand": self.active_hand,
         }
 
     def target_prediction(self) -> HLMemoryPrediction:
@@ -144,6 +153,9 @@ class ExportedHLMemorySample:
             current_objective=self.current_objective or self.current_subtask,
             relevant_objects=self.relevant_objects,
             notes=self.notes,
+            subtask_progress=self.subtask_progress,
+            should_advance_objective=self.should_advance_objective,
+            active_hand=self.active_hand,
         )
 
     def with_runtime_context(
@@ -285,6 +297,28 @@ def _parse_relevant_objects(value: object) -> tuple[str, ...]:
         if text.lower() not in {existing.lower() for existing in objects}:
             objects.append(text)
     return tuple(objects)
+
+
+def _parse_optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_optional_bool(value: object) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return None
 
 
 def build_loaded_video_clips_from_frames(

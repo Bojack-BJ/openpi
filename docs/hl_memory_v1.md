@@ -4,6 +4,8 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 
 - `task_progress`：历史状态，累积已经完成或稳定成立的任务进展
 - `current_objective`：给低层 policy 的当前可执行目标
+- `subtask_progress` / `should_advance_objective`：当前目标完成度和是否建议切换目标
+- `active_hand`：当前主要执行手，取 `left` / `right` / `both` / 空字符串
 - `relevant_objects` / `notes`：当前目标相关的物体、位置和动作约束
 - `keyframe_candidate_positions`：recent clip 内值得进入 historical memory 的候选帧，1-indexed
 - `phase` / `target_query` / `goal_query`
@@ -13,7 +15,10 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 
 - `src/openpi/hl_memory/`
 - `scripts/hl_memory/export_hl_annotations_from_subtasks.py`
+- `scripts/hl_memory/batch_export_hl_annotations_from_subtasks.py`
+- `scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py`
 - `scripts/hl_memory/export_hl_memory_dataset.py`
+- `scripts/hl_memory/batch_export_hl_memory_dataset_from_subtasks.py`
 - `scripts/hl_memory/train_hl_memory.py`
 - `scripts/hl_memory/eval_hl_memory_rollout.py`
 - `scripts/hl_memory/run_hl_memory_zero_shot.py`
@@ -24,7 +29,17 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 
 ## FastUMI Pipeline
 
-生产路径必须以 LeRobot episode index 为准：先转 LeRobot，再从 `subtask_segments.json` 生成 HL annotations。不要直接用 raw session 排序做训练 annotations，因为 raw session 可能被过滤、跳过或合并，顺序不一定等于最终 `episode_index`。
+生产路径必须以 LeRobot episode index 为准：先转 LeRobot，再从 `subtask_segments.json` 生成 raw HL annotations，然后用 LLM normalize，最后从 normalized annotations 导出 train/val samples。不要直接用 raw session 排序做训练 annotations，因为 raw session 可能被过滤、跳过或合并，顺序不一定等于最终 `episode_index`。
+
+推荐顺序：
+
+```text
+raw sessions
+  -> LeRobot repo + subtask_segments.json
+  -> hl_annotations.jsonl
+  -> hl_annotations_llm_normalized.jsonl
+  -> HL train/val samples.jsonl
+```
 
 ### 1. Raw To LeRobot
 
@@ -75,9 +90,26 @@ $HF_LEROBOT_HOME/fastumi/sponge_visual_guided/subtask_segments.json
 
 这个文件里的 episode key 就是后续 HL/LL 训练使用的真实 `episode_index`。
 
-### 2. Subtasks To HL Annotation JSONL
+### 2. Subtasks To Raw HL Annotation JSONL
 
-推荐从 LeRobot root 或 repo id 生成：
+多任务批量路径推荐先在每个 LeRobot task repo 旁边生成 raw `hl_annotations.jsonl`：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtasks.py \
+  --subtask-root /root/Users/dataset/lerobot_home/subtask \
+  --workers 8 \
+  --overwrite \
+  --continue-on-error \
+  -- --progress-sample-stride 50 --max-progress-samples-per-segment 4 --progress-min-gap 10
+```
+
+输出：
+
+```text
+/root/Users/dataset/lerobot_home/subtask/<task_id>/hl_annotations.jsonl
+```
+
+单任务也可以从 LeRobot root 或 repo id 生成：
 
 ```bash
 python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
@@ -120,9 +152,11 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
-### 3. Optional LLM GT Normalization
+### 3. LLM GT Normalization Before Dataset Export
 
-如果 rule-based annotations 的 `current_subtask` 太像状态文本，或者你希望 `task_progress` 是更自然的累积历史，可以先用离线 LLM 归一化 annotations。推荐用大模型只生成 GT sidecar，不要在训练或 rollout 时在线调用。
+这一步在导出 train/val samples 之前执行。它是第 3 步，因为它依赖第 2 步生成的 raw `hl_annotations.jsonl`；不要先 export train/val 再 normalize，否则旧 `samples.jsonl` 不会自动带上新字段。
+
+如果 rule-based annotations 的 `current_subtask` 太像状态文本，或者你希望 `task_progress` 是更自然的累积历史，用离线 LLM 归一化 annotations。推荐用大模型只生成 GT sidecar，不要在训练或 rollout 时在线调用。
 
 多任务批量归一化推荐用 batch 脚本。它会加载一次 LLM，然后依次处理每个 task 的 `hl_annotations.jsonl`：
 
@@ -131,6 +165,8 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
   --annotation-root /root/Users/dataset/lerobot_home/subtask \
   --model-path /root/Users/lixiaotong/Qwen3.5-27B \
   --device-map auto \
+  --granularity segment \
+  --memory-summary-mode llm \
   --skip-existing \
   --continue-on-error
 ```
@@ -140,6 +176,33 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
 ```text
 /root/Users/dataset/lerobot_home/subtask/<task_id>/hl_annotations_llm_normalized.jsonl
 ```
+
+默认 `--granularity segment` 不再逐 row 调用 LLM。流程是：
+
+```text
+unique ordered subtask segments
+  -> LLM normalize each segment once
+  -> LLM summarize completed segment prefixes
+  -> code expands every annotation row
+```
+
+这样每个 row 会得到：
+
+```json
+{
+  "task_progress": "The pen holder has been placed on the table.",
+  "current_objective": "grasp the glue stick with the right hand and place it into the pen holder",
+  "subtask_progress": 0.42,
+  "should_advance_objective": false,
+  "active_hand": "right",
+  "relevant_objects": ["glue stick", "pen holder"],
+  "target_query": "glue stick",
+  "goal_query": "pen holder",
+  "notes": "left hand keeps the pen holder stable"
+}
+```
+
+`subtask_progress` 和 `should_advance_objective` 由代码根据 segment start/end 和当前 frame 生成；LLM 只负责语义归一化和历史摘要压缩。如果想完全不用 LLM 总结历史，可以加 `--memory-summary-mode code`。
 
 如果只处理部分任务，`--only-task-id` 支持一次给多个 id，也支持重复：
 
@@ -159,6 +222,8 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
   --model-path /root/Users/lixiaotong/Qwen3.5-27B \
   --device-map auto \
+  --granularity segment \
+  --memory-summary-mode llm \
   --resume
 ```
 
@@ -168,6 +233,9 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
 {
   "task_progress": "The motor has been picked up.",
   "current_objective": "place the motor into the box",
+  "subtask_progress": 0.42,
+  "should_advance_objective": false,
+  "active_hand": "right",
   "relevant_objects": ["motor", "box"],
   "notes": "keep the motor aligned with the box opening",
   "target_query": "motor",
@@ -178,6 +246,26 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
 `task_progress` 只能描述历史和已完成状态，不能把未来完整流程提前写进去。`current_objective` 必须是当前帧对应的低层可执行目标，不能写成 `motor is picked up` 这种被动状态。
 
 ### 4. HL Annotation JSONL To HL Dataset
+
+批量导出 train/val 时，推荐显式读取 LLM-normalized annotations：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subtasks.py \
+  --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
+  --subtask-root /root/Users/dataset/lerobot_home/subtask \
+  --output-root /root/Users/dataset/hl_memory/subtask \
+  --repo-prefix subtask/ \
+  --annotations-name hl_annotations_llm_normalized.jsonl \
+  --visual-mode raw \
+  --workers 4 \
+  --overwrite \
+  --continue-on-error \
+  -- --recent-frames-length 8 --frame-subsample 5 --memory-length 8 --merge-distance 5
+```
+
+不要在这一步同时依赖 `--auto-export-annotations` 生成 raw annotations 再导出 train/val；正确顺序是先生成 `hl_annotations.jsonl`，再 normalize 成 `hl_annotations_llm_normalized.jsonl`，最后从 normalized 文件导出 samples。
+
+如果之前已经用旧 annotations 导出过 `samples.jsonl`，新增的 `task_progress` 修正、`subtask_progress`、`should_advance_objective` 和 `active_hand` 不会自动写进旧 samples；需要从 normalized annotations 重新跑这一节的 HL dataset export。Raw -> LeRobot 不需要重跑。
 
 ```bash
 python scripts/hl_memory/export_hl_memory_dataset.py \
@@ -209,26 +297,31 @@ exported/
 
 ```json
 {
-  "sample_id": "episode_000000_frame_000276",
+  "sample_id": "episode_000000_step_000003",
   "episode_index": 0,
+  "step_index": 3,
   "frame_index": 276,
   "instruction": "put the motor into the box",
   "language_memory": "Task progress: ...\nCurrent objective: ...\nRelevant objects: ...\nNotes: ...",
   "updated_language_memory": "Task progress: ...\nCurrent objective: ...\nRelevant objects: ...\nNotes: ...",
   "task_progress": "The motor has been picked up.",
   "current_objective": "place the motor into the box",
+  "subtask_progress": 0.42,
+  "should_advance_objective": false,
+  "active_hand": "right",
   "relevant_objects": ["motor", "box"],
   "notes": "none",
   "current_subtask": "place the motor into the box",
   "phase": "place the motor into the box",
   "target_query": "motor",
   "goal_query": "box",
-  "recent_frames": ["frames/frame_....png"],
-  "memory_frames": ["frames/frame_....png"]
+  "keyframe_candidate_positions": [1, 8],
+  "recent_frame_paths": ["frames/frame_....png"],
+  "memory_frame_paths": ["frames/frame_....png"]
 }
 ```
 
-训练 target JSON 来自 `task_progress/current_objective/relevant_objects/notes/...`。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。
+训练 target JSON 来自 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/...`。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。
 
 推荐按 episode 做 held-out split，而不是直接用同一个 `exported/` 同时训练和评估。下面这条命令会在一次运行里计算一次 split，并同时生成互斥的 train / val episode，避免两次运行时误填不同 ratio/seed：
 
@@ -497,6 +590,9 @@ rollout 和调试参数：
   "current_subtask": "place the motor into the box",
   "current_objective": "place the motor into the box",
   "task_progress": "The motor has been picked up.",
+  "subtask_progress": 0.42,
+  "should_advance_objective": false,
+  "active_hand": "right",
   "relevant_objects": ["motor", "box"],
   "notes": "none",
   "instruction": "put the motor into the box",

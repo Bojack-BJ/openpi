@@ -27,6 +27,9 @@ class SubtaskAnnotation:
     current_objective: str = ""
     relevant_objects: tuple[str, ...] = ()
     notes: str = ""
+    subtask_progress: float | None = None
+    should_advance_objective: bool | None = None
+    active_hand: str = ""
     event_type: str = "none"
     event_text: str = ""
 
@@ -52,6 +55,9 @@ class SubtaskAnnotation:
             current_objective=str(data.get("current_objective", data.get("objective", ""))).strip(),
             relevant_objects=_parse_relevant_objects(data.get("relevant_objects", ())),
             notes=str(data.get("notes", "")).strip(),
+            subtask_progress=_parse_optional_float(data.get("subtask_progress")),
+            should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
+            active_hand=str(data.get("active_hand", "")).strip(),
             event_type=str(data.get("event_type", "none")).strip(),
             event_text=str(data.get("event_text", "")).strip(),
         )
@@ -199,3 +205,25 @@ def _parse_relevant_objects(value: object) -> tuple[str, ...]:
         if text.lower() not in {existing.lower() for existing in objects}:
             objects.append(text)
     return tuple(objects)
+
+
+def _parse_optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_optional_bool(value: object) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return None

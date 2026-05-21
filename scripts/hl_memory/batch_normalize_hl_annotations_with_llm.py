@@ -86,6 +86,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--torch-dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--limit-per-task", type=int, default=None)
+    parser.add_argument("--granularity", choices=["segment", "row"], default="segment")
+    parser.add_argument("--memory-summary-mode", choices=["llm", "code"], default="llm")
+    parser.add_argument("--advance-threshold", type=float, default=0.85)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--overwrite",
@@ -228,38 +231,18 @@ def run_one_job(
         rows = rows[: args.limit_per_task]
     resume = bool(args.resume and not args.overwrite)
     done = normalizer_module._read_done(job.output_jsonl) if resume else set()  # pylint: disable=protected-access
-    grouped = normalizer_module._group_by_episode(rows)  # pylint: disable=protected-access
     job.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if resume else "w"
 
     with job.output_jsonl.open(mode, encoding="utf-8") as stream:
-        for row in tqdm(rows, desc=f"Normalize {job.task_id}", unit="row"):
-            key = normalizer_module._row_key(row)  # pylint: disable=protected-access
-            if key in done:
-                continue
-            prompt = normalizer_module._build_prompt(  # pylint: disable=protected-access
-                row,
-                grouped.get(int(row["episode_index"]), []),
-            )
-            raw_response = normalizer_module._generate(  # pylint: disable=protected-access
-                tokenizer,
-                model,
-                prompt,
-                max_new_tokens=args.max_new_tokens,
-            )
-            normalized, parse_error = normalizer_module._parse_normalized_response(  # pylint: disable=protected-access
-                raw_response
-            )
-            output = dict(row)
-            if normalized is not None:
-                output.update(normalized)
-            output["llm_gt"] = normalized
-            output["llm_model"] = str(args.model_path)
-            output["prompt_version"] = normalizer_module.PROMPT_VERSION
-            output["raw_response"] = raw_response
-            output["parse_error"] = parse_error
-            stream.write(json.dumps(output, ensure_ascii=False) + "\n")
-            stream.flush()
+        normalizer_module.normalize_rows(  # pylint: disable=protected-access
+            rows,
+            args=args,
+            tokenizer=tokenizer,
+            model=model,
+            done=done,
+            stream=stream,
+        )
 
     return NormalizeResult(
         task_id=job.task_id,

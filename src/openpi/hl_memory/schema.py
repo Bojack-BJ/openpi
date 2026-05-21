@@ -28,6 +28,9 @@ class HLMemoryPrediction:
     current_objective: str = ""
     relevant_objects: tuple[str, ...] = ()
     notes: str = ""
+    subtask_progress: float | None = None
+    should_advance_objective: bool | None = None
+    active_hand: str = ""
     sam_text_prompt: str = ""
     sam_point_xy: tuple[int, int] | None = None
     target_bbox_xyxy: tuple[int, int, int, int] | None = None
@@ -79,6 +82,12 @@ class HLMemoryPrediction:
         if include_legacy:
             result["updated_language_memory"] = self.updated_language_memory
             result["current_subtask"] = self.current_subtask
+        if self.subtask_progress is not None:
+            result["subtask_progress"] = float(self.subtask_progress)
+        if self.should_advance_objective is not None:
+            result["should_advance_objective"] = bool(self.should_advance_objective)
+        if self.active_hand:
+            result["active_hand"] = self.active_hand
         if self.sam_text_prompt:
             result["sam_text_prompt"] = self.sam_text_prompt
         if self.sam_point_xy is not None:
@@ -143,6 +152,9 @@ class HLMemoryPrediction:
             current_objective=current_objective,
             relevant_objects=relevant_objects,
             notes=notes,
+            subtask_progress=_parse_optional_float(data.get("subtask_progress")),
+            should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
+            active_hand=str(data.get("active_hand", "")).strip(),
             sam_text_prompt=str(data.get("sam_text_prompt", data.get("sam_prompt", ""))).strip(),
             sam_point_xy=_parse_optional_point(
                 data.get("sam_point_xy")
@@ -243,6 +255,28 @@ def _parse_optional_bbox(value: object) -> tuple[int, int, int, int] | None:
             )
     if isinstance(value, list | tuple) and len(value) >= 4:
         return tuple(int(round(float(item))) for item in value[:4])  # type: ignore[return-value]
+    return None
+
+
+def _parse_optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_optional_bool(value: object) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
     return None
 
 
