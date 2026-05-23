@@ -685,24 +685,6 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
 双视角 rollout：
 
 ```bash
-python scripts/hl_memory/run_hl_memory_zero_shot.py \
-  --left-video-path /path/to/left.mp4 \
-  --right-video-path /path/to/right.mp4 \
-  --instruction "Put the target object into the target slot" \
-  --language-memory "Task started." \
-  --rollout-interval-sec 2 \
-  --rollout-start-sec 0 \
-  --rollout-end-sec 40 \
-  --recent-step-sec 1 \
-  --vlm-backend qwen3_5_vl \
-  --vlm-variant qwen3_5_2b \
-  --local-vlm-ckpt-path /path/to/Qwen3.5-2B-or-hl-checkpoint \
-  --precision float16 \
-  --device cuda \
-  --debug-dir /tmp/hl_rollout_debug \
-  --embedding-debug-dir /tmp/hl_rollout_embedding_debug \
-  --output-json /tmp/hl_rollout_debug/summary.json
-
 python scripts/hl_memory/run_hl_memory_zero_shot.py \                             
   --left-video-path /root/Users/segmentation_data_dtw/20260116W001/20260414/task_20260116W001_Light_bulb_packing/background/multi_session_20260414/session_095153/left_hand_250801DR48FB25002358/RGB_Images/video.mp4 \
   --right-video-path /root/Users/segmentation_data_dtw/20260116W001/20260414/task_20260116W001_Light_bulb_packing/background/multi_session_20260414/session_095153/right_hand_250801DR48FP25002672/RGB_Images/video.mp4 \
@@ -719,7 +701,7 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --device cuda \
   --debug-dir /tmp/hl_rollout_debug_new \
   --embedding-debug-dir /tmp/hl_rollout_embedding_debug \
-  --output-json /tmp/hl_rollout_debug/summary.json
+  --output-json /tmp/hl_rollout_debug_new/summary.json
 ```
 
 Input rules：
