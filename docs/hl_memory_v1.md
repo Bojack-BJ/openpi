@@ -702,6 +702,24 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --debug-dir /tmp/hl_rollout_debug \
   --embedding-debug-dir /tmp/hl_rollout_embedding_debug \
   --output-json /tmp/hl_rollout_debug/summary.json
+
+python scripts/hl_memory/run_hl_memory_zero_shot.py \                             
+  --left-video-path /root/Users/segmentation_data_dtw/20260116W001/20260414/task_20260116W001_Light_bulb_packing/background/multi_session_20260414/session_095153/left_hand_250801DR48FB25002358/RGB_Images/video.mp4 \
+  --right-video-path /root/Users/segmentation_data_dtw/20260116W001/20260414/task_20260116W001_Light_bulb_packing/background/multi_session_20260414/session_095153/right_hand_250801DR48FP25002672/RGB_Images/video.mp4 \
+  --instruction "Pack the light bulb into the box" \
+  --language-memory "" \
+  --rollout-interval-sec 2 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 40 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-000200 \
+  --precision float16 \
+  --device cuda \
+  --debug-dir /tmp/hl_rollout_debug_new \
+  --embedding-debug-dir /tmp/hl_rollout_embedding_debug \
+  --output-json /tmp/hl_rollout_debug/summary.json
 ```
 
 Input rules：
