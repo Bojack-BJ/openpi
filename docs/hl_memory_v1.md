@@ -654,6 +654,26 @@ python scripts/hl_memory/eval_hl_memory_rollout.py \
   --output-json /root/Users/dataset/hl_memory/sponge_visual_guided/eval_metrics_smoke.json
 ```
 
+多任务 batch eval 推荐对每个 task 的 `val/` split 单独跑一次，再汇总 per-task 和 overall metrics：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_eval_hl_memory_rollout.py \
+  --dataset-root /root/Users/dataset/hl_memory/subtask \
+  --dataset-glob '*/val' \
+  --output-root /root/Users/eval/hl_memory/subtask_multitask_qwen35_lora_step200 \
+  --workers 1 \
+  --continue-on-error \
+  -- \
+  --local-vlm-ckpt-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-000200 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --precision bfloat16 \
+  --device cuda \
+  --frame-cache-size 512
+```
+
+输出包括每个 task 的 `eval_metrics.json` / `eval.log`，以及 `batch_hl_memory_eval_summary.json`。默认 `--workers 1` 是因为每个 eval 子进程都会加载一份 VLM；同一张 GPU 上并行通常只会更慢或 OOM。
+
 `--max-samples` 也可用于快速调试，但它可能截断 episode 中间序列；正式 rollout metrics 更推荐用 `--max-episodes`。
 
 Eval 会打印阶段日志并显示每种 ablation 的 tqdm 进度条：

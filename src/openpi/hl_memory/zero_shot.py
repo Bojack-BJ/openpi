@@ -334,9 +334,13 @@ def update_rollout_memory_seconds(
 ) -> tuple[float, ...]:
     if memory_length <= 0:
         raise ValueError("memory_length must be positive.")
-    seconds = _sorted_unique_seconds([*memory_seconds, *candidate_seconds])
     if merge_distance_sec is not None and merge_distance_sec > 0.0:
-        seconds = _cluster_keyframe_seconds(seconds, merge_distance_sec=merge_distance_sec)
+        seconds = _vote_keyframe_seconds(
+            [*memory_seconds, *candidate_seconds],
+            merge_distance_sec=merge_distance_sec,
+        )
+    else:
+        seconds = _sorted_unique_seconds([*memory_seconds, *candidate_seconds])
     return tuple(seconds[-memory_length:])
 
 
@@ -455,6 +459,7 @@ def save_prediction_debug_panel(
     memory_seconds_before: Iterable[float] = (),
     memory_seconds_after: Iterable[float] = (),
     keyframe_candidate_seconds: Iterable[float] = (),
+    ground_truth_subtask: str | None = None,
     parse_error: str | None = None,
     title: str = "HL memory debug",
 ) -> pathlib.Path:
@@ -476,14 +481,15 @@ def save_prediction_debug_panel(
         else recent_end_sec
     )
 
-    width = 1400
-    height = 820
+    width = 1500
+    height = 900
     margin = 24
     title_height = 48
-    text_width = 560
+    text_width = 610
     image_width = width - text_width - margin * 3
-    image_height = 520
-    strip_height = 150
+    image_height = 320
+    memory_strip_height = 120
+    recent_strip_height = 150
 
     panel = Image.new("RGB", (width, height), (18, 20, 24))
     draw = ImageDraw.Draw(panel)
@@ -506,16 +512,35 @@ def save_prediction_debug_panel(
         fill=(116, 227, 255),
     )
 
-    strip_box = (
+    memory_strip_box = (
         margin,
         image_box[3] + margin,
         margin + image_width,
-        image_box[3] + margin + strip_height,
+        image_box[3] + margin + memory_strip_height,
+    )
+    _draw_frame_strip(
+        panel,
+        draw,
+        memory_strip_box,
+        frames=clips.memory_frames,
+        seconds=selection.memory_seconds,
+        valid_length=clips.memory_valid_length,
+        highlighted_positions=set(),
+        current_position=None,
+        title="memory keyframes carried into this step",
+        font=small_font,
+    )
+
+    recent_strip_box = (
+        margin,
+        memory_strip_box[3] + margin,
+        margin + image_width,
+        memory_strip_box[3] + margin + recent_strip_height,
     )
     _draw_recent_strip(
         panel,
         draw,
-        strip_box,
+        recent_strip_box,
         clips=clips,
         selection=selection,
         valid_recent_length=valid_recent_length,
@@ -535,6 +560,7 @@ def save_prediction_debug_panel(
         memory_seconds_before=memory_seconds_before,
         memory_seconds_after=memory_seconds_after,
         keyframe_candidate_seconds=keyframe_candidate_seconds,
+        ground_truth_subtask=ground_truth_subtask,
         parse_error=parse_error,
     )
     _draw_debug_text_lines(
@@ -605,6 +631,7 @@ def _build_debug_text_lines(
     memory_seconds_before: Iterable[float],
     memory_seconds_after: Iterable[float],
     keyframe_candidate_seconds: Iterable[float],
+    ground_truth_subtask: str | None,
     parse_error: str | None,
 ) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = []
@@ -613,10 +640,16 @@ def _build_debug_text_lines(
     _append_wrapped_debug_line(lines, "Recent end", _format_optional_second(recent_end_sec), style="muted")
     _append_wrapped_debug_line(lines, "Current frame", _format_optional_second(current_second), style="accent")
     lines.append(("", ""))
+    if ground_truth_subtask:
+        _append_wrapped_debug_line(lines, "GT subtask", ground_truth_subtask, style="accent", max_lines=2)
     _append_wrapped_debug_line(lines, "Current objective", prediction.current_objective, style="accent", max_lines=3)
     _append_wrapped_debug_line(lines, "Phase", prediction.phase, max_lines=2)
     _append_wrapped_debug_line(lines, "Target", prediction.target_query or "none", max_lines=2)
     _append_wrapped_debug_line(lines, "Goal", prediction.goal_query or "none", max_lines=2)
+    if prediction.sam_text_prompt:
+        _append_wrapped_debug_line(lines, "SAM prompt", prediction.sam_text_prompt, max_lines=2)
+    if prediction.sam_point_xy is not None:
+        _append_wrapped_debug_line(lines, "SAM point", list(prediction.sam_point_xy), max_lines=1)
     if prediction.target_bbox_xyxy is not None:
         _append_wrapped_debug_line(lines, "Target bbox", str(list(prediction.target_bbox_xyxy)), max_lines=1)
     _append_wrapped_debug_line(
@@ -625,14 +658,16 @@ def _build_debug_text_lines(
         f"positions={list(prediction.keyframe_candidate_positions)} seconds={_format_seconds(keyframe_candidate_seconds)}",
         max_lines=3,
     )
-    _append_wrapped_debug_line(lines, "Memory secs before", _format_seconds(memory_seconds_before), style="muted")
-    _append_wrapped_debug_line(lines, "Memory secs after", _format_seconds(memory_seconds_after), style="muted")
+    _append_wrapped_debug_line(lines, "Memory keyframe secs before", _format_seconds(memory_seconds_before), style="muted")
+    _append_wrapped_debug_line(lines, "Memory keyframe secs after", _format_seconds(memory_seconds_after), style="muted")
     if parse_error:
         _append_wrapped_debug_line(lines, "Parse error", parse_error, max_lines=3)
     lines.append(("", ""))
-    _append_wrapped_debug_line(lines, "Memory before", language_memory_before or "none", max_lines=6)
+    lines.append(("Memory before", "section"))
+    _append_wrapped_debug_block(lines, language_memory_before or "none", max_lines=5)
     lines.append(("", ""))
-    _append_wrapped_debug_line(lines, "Memory after", language_memory_after or "none", max_lines=8, style="accent")
+    lines.append(("Memory after", "section"))
+    _append_wrapped_debug_block(lines, language_memory_after or "none", max_lines=6, style="accent")
     return lines
 
 
@@ -648,6 +683,22 @@ def _append_wrapped_debug_line(
     text = f"{label}: {value}".strip()
     wrapped: list[str] = []
     for raw_line in text.splitlines() or [""]:
+        wrapped.extend(textwrap.wrap(raw_line, width=width) or [""])
+    if max_lines is not None and len(wrapped) > max_lines:
+        wrapped = wrapped[: max_lines - 1] + ["..."]
+    lines.extend((line, style) for line in wrapped)
+
+
+def _append_wrapped_debug_block(
+    lines: list[tuple[str, str]],
+    value: object,
+    *,
+    style: str = "normal",
+    width: int = 64,
+    max_lines: int | None = None,
+) -> None:
+    wrapped: list[str] = []
+    for raw_line in str(value).splitlines() or [""]:
         wrapped.extend(textwrap.wrap(raw_line, width=width) or [""])
     if max_lines is not None and len(wrapped) > max_lines:
         wrapped = wrapped[: max_lines - 1] + ["..."]
@@ -674,7 +725,15 @@ def _draw_debug_text_lines(
         if not line:
             y += line_height // 2
             continue
-        resolved_fill = accent_fill if style == "accent" else muted_fill if style == "muted" else fill
+        resolved_fill = (
+            (116, 227, 255)
+            if style == "section"
+            else accent_fill
+            if style == "accent"
+            else muted_fill
+            if style == "muted"
+            else fill
+        )
         _safe_draw_text(draw, (x, y), line, font=font, fill=resolved_fill)
         y += line_height
 
@@ -690,31 +749,61 @@ def _draw_recent_strip(
     keyframe_positions: set[int],
     font: ImageFont.ImageFont,
 ) -> None:
+    _draw_frame_strip(
+        panel,
+        draw,
+        box,
+        frames=clips.recent_frames,
+        seconds=selection.recent_seconds,
+        valid_length=valid_recent_length,
+        highlighted_positions=keyframe_positions,
+        current_position=valid_recent_length,
+        title="recent observation window",
+        font=font,
+    )
+
+
+def _draw_frame_strip(
+    panel: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    box: tuple[int, int, int, int],
+    *,
+    frames: Sequence[Image.Image],
+    seconds: Sequence[float],
+    valid_length: int,
+    highlighted_positions: set[int],
+    current_position: int | None,
+    title: str,
+    font: ImageFont.ImageFont,
+) -> None:
     x0, y0, x1, y1 = box
     _draw_rect(draw, box, fill=(64, 70, 82), width=1)
-    if valid_recent_length <= 0:
-        _safe_draw_text(draw, (x0 + 12, y0 + 12), "No recent frames", font=font, fill=(164, 174, 190))
+    _safe_draw_text(draw, (x0 + 10, y0 + 6), title, font=font, fill=(164, 174, 190))
+    valid_length = max(0, min(valid_length, len(frames)))
+    if valid_length <= 0:
+        _safe_draw_text(draw, (x0 + 12, y0 + 30), "none", font=font, fill=(164, 174, 190))
         return
 
     gap = 8
     label_height = 22
-    thumb_width = max(1, (x1 - x0 - gap * (valid_recent_length - 1)) // valid_recent_length)
-    thumb_height = max(1, y1 - y0 - label_height - 10)
-    for index, frame in enumerate(clips.recent_frames[:valid_recent_length]):
+    title_height = 24
+    thumb_width = max(1, (x1 - x0 - gap * (valid_length - 1)) // valid_length)
+    thumb_height = max(1, y1 - y0 - title_height - label_height - 10)
+    for index, frame in enumerate(frames[:valid_length]):
         thumb_x0 = x0 + index * (thumb_width + gap)
-        thumb_box = (thumb_x0, y0 + 6, thumb_x0 + thumb_width, y0 + 6 + thumb_height)
+        thumb_box = (thumb_x0, y0 + title_height + 4, thumb_x0 + thumb_width, y0 + title_height + 4 + thumb_height)
         _paste_debug_image(panel, frame.convert("RGB"), thumb_box)
         position = index + 1
-        if position == valid_recent_length:
+        if current_position is not None and position == current_position:
             border = (116, 227, 255)
-        elif position in keyframe_positions:
+        elif position in highlighted_positions:
             border = (255, 215, 106)
         else:
             border = (86, 95, 110)
-        _draw_rect(draw, thumb_box, fill=border, width=3 if position == valid_recent_length else 2)
-        second = selection.recent_seconds[index] if index < len(selection.recent_seconds) else None
+        _draw_rect(draw, thumb_box, fill=border, width=3 if position == current_position else 2)
+        second = seconds[index] if index < len(seconds) else None
         label = f"{position} | {_format_optional_second(second)}"
-        if position in keyframe_positions:
+        if position in highlighted_positions:
             label += " key"
         _safe_draw_text(draw, (thumb_x0 + 3, y1 - label_height), label, font=font, fill=border)
 
@@ -913,16 +1002,24 @@ def _filter_visible_memory_seconds(memory_seconds: Iterable[float], recent_secon
     ]
 
 
-def _cluster_keyframe_seconds(seconds: list[float], *, merge_distance_sec: float) -> list[float]:
-    if not seconds:
-        return []
-    clusters: list[list[float]] = [[seconds[0]]]
-    for second in seconds[1:]:
-        if second - clusters[-1][-1] <= merge_distance_sec:
-            clusters[-1].append(second)
-        else:
-            clusters.append([second])
-    return [cluster[(len(cluster) - 1) // 2] for cluster in clusters]
+def _vote_keyframe_seconds(seconds: Iterable[float], *, merge_distance_sec: float) -> list[float]:
+    """Buckets all keyframe votes on a fixed time axis and keeps one winner per bucket."""
+
+    if merge_distance_sec <= 0.0:
+        return _sorted_unique_seconds(seconds)
+    buckets: dict[int, dict[float, int]] = {}
+    for second in seconds:
+        rounded = round(float(second), 6)
+        bucket_index = int(rounded // merge_distance_sec)
+        bucket = buckets.setdefault(bucket_index, {})
+        bucket[rounded] = bucket.get(rounded, 0) + 1
+    winners: list[float] = []
+    for bucket_index in sorted(buckets):
+        bucket = buckets[bucket_index]
+        # Highest vote wins; ties keep the latest frame in the bucket.
+        winner = max(bucket.items(), key=lambda item: (item[1], item[0]))[0]
+        winners.append(winner)
+    return winners
 
 
 def _format_second(second: float) -> str:

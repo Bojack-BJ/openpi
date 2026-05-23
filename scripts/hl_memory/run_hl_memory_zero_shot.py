@@ -182,6 +182,7 @@ def _run_single_prediction(
         previous_memory=args.language_memory,
         recent_end_sec=recent_end_sec,
     )
+    ground_truth_subtask = _task_config_subtask_at(args.task_config_path, recent_end_sec)
     candidate_seconds = keyframe_candidate_seconds(
         prediction,
         selection,
@@ -205,6 +206,7 @@ def _run_single_prediction(
         "parse_error": generation.parse_error,
         "model_prediction": generation.prediction.to_dict(),
         "prediction": prediction.to_dict(),
+        "ground_truth_subtask": ground_truth_subtask,
         "language_memory_rule_applied": memory_rule_applied,
         "keyframe_candidate_seconds": list(candidate_seconds),
     }
@@ -229,6 +231,7 @@ def _run_single_prediction(
             memory_seconds_before=selection.memory_seconds,
             memory_seconds_after=selection.memory_seconds,
             keyframe_candidate_seconds=candidate_seconds,
+            ground_truth_subtask=ground_truth_subtask,
             parse_error=generation.parse_error,
         )
         payload["debug_dir"] = str(args.debug_dir)
@@ -272,6 +275,7 @@ def _run_rollout(
     )
     language_memory = args.language_memory
     memory_seconds = tuple(parse_seconds_argument(args.memory_seconds))
+    keyframe_vote_seconds = list(memory_seconds)
     steps: list[dict[str, object]] = []
     debug_dir = pathlib.Path(args.debug_dir) if args.debug_dir is not None else None
     debug_panel_paths: list[pathlib.Path] = []
@@ -300,14 +304,16 @@ def _run_rollout(
             previous_memory=language_memory_before,
             recent_end_sec=end_sec,
         )
+        ground_truth_subtask = _task_config_subtask_at(args.task_config_path, end_sec)
         candidate_seconds = keyframe_candidate_seconds(
             prediction,
             selection,
             recent_valid_length=clips.recent_valid_length,
         )
+        keyframe_vote_seconds.extend(candidate_seconds)
         memory_seconds = update_rollout_memory_seconds(
-            memory_before,
-            candidate_seconds,
+            keyframe_vote_seconds,
+            (),
             memory_length=config.memory_length,
             merge_distance_sec=args.keyframe_merge_distance_sec,
         )
@@ -340,6 +346,7 @@ def _run_rollout(
                 memory_seconds_before=memory_before,
                 memory_seconds_after=memory_seconds,
                 keyframe_candidate_seconds=candidate_seconds,
+                ground_truth_subtask=ground_truth_subtask,
                 parse_error=generation.parse_error,
             )
             debug_panel_paths.append(debug_panel_path)
@@ -364,6 +371,7 @@ def _run_rollout(
                 "language_memory_after": language_memory,
                 "memory_seconds_before": list(memory_before),
                 "memory_seconds_after": list(memory_seconds),
+                "keyframe_vote_seconds": list(keyframe_vote_seconds),
                 "recent_seconds": list(selection.recent_seconds),
                 "memory_valid_length": clips.memory_valid_length,
                 "recent_valid_length": clips.recent_valid_length,
@@ -371,6 +379,7 @@ def _run_rollout(
                 "parse_error": generation.parse_error,
                 "model_prediction": generation.prediction.to_dict(),
                 "prediction": prediction.to_dict(),
+                "ground_truth_subtask": ground_truth_subtask,
                 "language_memory_rule_applied": memory_rule_applied,
                 "keyframe_candidate_seconds": list(candidate_seconds),
                 "debug_dir": None if step_debug_dir is None else str(step_debug_dir),
@@ -499,15 +508,9 @@ def _instruction_with_task_plan(args: ZeroShotArgs) -> str:
         return instruction
 
     task_config = _load_task_config(args.task_config_path)
-    description = str(task_config.get("task_description", "")).strip()
-    steps = task_config.get("steps", [])
-    if not isinstance(steps, list):
-        raise ValueError(f"`steps` must be a list in task config: {args.task_config_path}")
-    rendered_steps = [
-        f"{index}. {str(step).strip()}"
-        for index, step in enumerate(steps, start=1)
-        if str(step).strip()
-    ]
+    description = _task_config_description(task_config)
+    subtasks = _task_config_subtasks(task_config, path=args.task_config_path)
+    rendered_steps = [f"{index}. {subtask}" for index, subtask in enumerate(subtasks, start=1)]
     plan_lines = [
         instruction,
         "",
@@ -534,6 +537,81 @@ def _load_task_config(path: pathlib.Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError(f"Task config must be a JSON object: {path}")
     return data
+
+
+def _task_config_description(task_config: dict[str, object]) -> str:
+    return str(task_config.get("task_description", task_config.get("description", ""))).strip()
+
+
+def _task_config_subtasks(task_config: dict[str, object], *, path: pathlib.Path) -> list[str]:
+    """Returns only subtask text for model input; segment timestamps stay debug-only."""
+
+    steps = task_config.get("steps")
+    if steps is not None:
+        if not isinstance(steps, list):
+            raise ValueError(f"`steps` must be a list in task config: {path}")
+        return _dedupe_consecutive_strings(str(step).strip() for step in steps)
+
+    segments = task_config.get("segments")
+    if segments is None:
+        return []
+    if not isinstance(segments, list):
+        raise ValueError(f"`segments` must be a list in task config: {path}")
+
+    subtasks: list[str] = []
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError(f"`segments[{index}]` must be an object in task config: {path}")
+        subtasks.append(str(segment.get("subtask", "")).strip())
+    return _dedupe_consecutive_strings(subtasks)
+
+
+def _dedupe_consecutive_strings(values) -> list[str]:
+    result: list[str] = []
+    previous_normalized = ""
+    for value in values:
+        if not value:
+            continue
+        normalized = " ".join(value.lower().split())
+        if normalized == previous_normalized:
+            continue
+        result.append(value)
+        previous_normalized = normalized
+    return result
+
+
+def _task_config_subtask_at(path: pathlib.Path | None, second: float | None) -> str | None:
+    if path is None or second is None:
+        return None
+    task_config = _load_task_config(path)
+    segments = task_config.get("segments")
+    if not isinstance(segments, list):
+        return None
+
+    fallback: str | None = None
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        subtask = str(segment.get("subtask", "")).strip()
+        if not subtask:
+            continue
+        start_time = _optional_float(segment.get("start_time"))
+        end_time = _optional_float(segment.get("end_time"))
+        if start_time is None or second < start_time:
+            continue
+        fallback = subtask
+        if end_time is None or second < end_time:
+            return subtask
+    return fallback
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _save_embedding_debug(

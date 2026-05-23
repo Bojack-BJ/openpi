@@ -49,13 +49,31 @@ def test_update_rollout_memory_seconds_keeps_latest_unique_seconds():
     assert update_rollout_memory_seconds([1.0, 2.0], [2.0, 5.0, 7.0], memory_length=3) == (2.0, 5.0, 7.0)
 
 
-def test_update_rollout_memory_seconds_clusters_temporally_close_keyframes():
+def test_update_rollout_memory_seconds_votes_in_fixed_time_buckets():
     assert update_rollout_memory_seconds(
         [5.0],
         [7.0, 9.0, 13.0],
         memory_length=8,
         merge_distance_sec=2.0,
-    ) == (7.0, 13.0)
+    ) == (5.0, 7.0, 9.0, 13.0)
+
+
+def test_update_rollout_memory_seconds_does_not_roll_clusters_across_buckets():
+    assert update_rollout_memory_seconds(
+        [],
+        [0.0, 2.0, 4.0, 6.0],
+        memory_length=8,
+        merge_distance_sec=2.0,
+    ) == (0.0, 2.0, 4.0, 6.0)
+
+
+def test_update_rollout_memory_seconds_uses_votes_within_bucket():
+    assert update_rollout_memory_seconds(
+        [0.1, 0.2, 0.2, 2.1],
+        [0.1, 0.2, 2.4, 2.4],
+        memory_length=8,
+        merge_distance_sec=2.0,
+    ) == (0.2, 2.4)
 
 
 def test_rollout_language_memory_rule_advances_generic_memory():
