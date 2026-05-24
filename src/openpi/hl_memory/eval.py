@@ -19,6 +19,10 @@ from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 
 
 AblationMode = Literal["no_memory", "language_memory_only", "keyframe_memory_only", "full"]
+PredictionCallback = Callable[
+    [AblationMode, ExportedHLMemorySample, ExportedHLMemorySample, HLMemoryPrediction, dict[str, float]],
+    None,
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,6 +109,7 @@ def run_offline_rollout(
     *,
     mode: AblationMode,
     rollout_options: EvalRolloutOptions | None = None,
+    on_prediction: PredictionCallback | None = None,
 ) -> dict[str, float]:
     totals: dict[str, float] = defaultdict(float)
     total_steps = 0
@@ -120,6 +125,8 @@ def run_offline_rollout(
             metrics = compute_prediction_metrics(prediction, sample)
             for key, value in metrics.items():
                 totals[key] += value
+            if on_prediction is not None:
+                on_prediction(mode, runtime_sample, sample, prediction, metrics)
             state.advance(prediction, mode=mode)
             total_steps += 1
         exact_sequence_episodes += int(state.sequence_ok)
@@ -144,6 +151,7 @@ def run_offline_rollout_batched(
     on_sample_done: Callable[[ExportedHLMemorySample], None] | None = None,
     on_batch_start: Callable[[int], None] | None = None,
     rollout_options: EvalRolloutOptions | None = None,
+    on_prediction: PredictionCallback | None = None,
 ) -> dict[str, float]:
     if batch_size <= 1:
         sample_count = sum(len(episode_samples) for episode_samples in samples_by_episode.values())
@@ -162,6 +170,7 @@ def run_offline_rollout_batched(
             predict_one,
             mode=mode,
             rollout_options=rollout_options,
+            on_prediction=on_prediction,
         )
         if metrics:
             metrics["eval_batch_size_requested"] = float(batch_size)
@@ -210,6 +219,8 @@ def run_offline_rollout_batched(
             metrics = compute_prediction_metrics(prediction, source_sample)
             for key, value in metrics.items():
                 totals[key] += value
+            if on_prediction is not None:
+                on_prediction(mode, runtime_sample, source_sample, prediction, metrics)
             state.advance(prediction, mode=mode)
             total_steps += 1
             if on_sample_done is not None:

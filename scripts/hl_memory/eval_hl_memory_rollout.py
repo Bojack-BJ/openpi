@@ -39,6 +39,7 @@ class EvalArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     output_json: pathlib.Path | None = None
+    prediction_jsonl: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     frame_cache_size: int = 512
     progress: bool = True
@@ -116,17 +117,22 @@ def main(args: EvalArgs) -> None:
         known_prior_match_threshold=args.known_prior_match_threshold,
         known_prior_max_advance_steps=args.known_prior_max_advance_steps,
     )
-    metrics = _evaluate_with_progress(
-        grouped,
-        hl_config,
-        predict_batch,
-        modes=modes,
-        batch_size=args.eval_batch_size,
-        batch_log_interval=args.eval_batch_log_interval,
-        rollout_options=rollout_options,
-        show_progress=args.progress,
-        total_samples=len(samples),
-    )
+    prediction_writer = _PredictionJsonlWriter(args.prediction_jsonl)
+    try:
+        metrics = _evaluate_with_progress(
+            grouped,
+            hl_config,
+            predict_batch,
+            modes=modes,
+            batch_size=args.eval_batch_size,
+            batch_log_interval=args.eval_batch_log_interval,
+            rollout_options=rollout_options,
+            prediction_writer=prediction_writer,
+            show_progress=args.progress,
+            total_samples=len(samples),
+        )
+    finally:
+        prediction_writer.close()
     rendered = json.dumps(metrics, indent=2, ensure_ascii=True)
     print(rendered)
     if args.output_json is not None:
@@ -144,6 +150,7 @@ def _evaluate_with_progress(
     batch_size: int,
     batch_log_interval: int,
     rollout_options: EvalRolloutOptions,
+    prediction_writer: "_PredictionJsonlWriter",
     show_progress: bool,
     total_samples: int,
 ):
@@ -203,6 +210,15 @@ def _evaluate_with_progress(
         def on_sample_done(sample):
             progress_bar.update(1)
 
+        def on_prediction(mode, runtime_sample, source_sample, prediction, sample_metrics):
+            prediction_writer.write(
+                mode=mode,
+                runtime_sample=runtime_sample,
+                source_sample=source_sample,
+                prediction=prediction,
+                metrics=sample_metrics,
+            )
+
         mode_started_at = time.perf_counter()
         try:
             metrics[mode] = run_offline_rollout_batched(
@@ -214,6 +230,7 @@ def _evaluate_with_progress(
                 on_sample_done=on_sample_done,
                 on_batch_start=on_batch_start,
                 rollout_options=rollout_options,
+                on_prediction=on_prediction,
             )
         finally:
             progress_bar.close()
@@ -266,6 +283,40 @@ def _filter_samples(
             "--max-samples can cut episodes mid-sequence; use --max-episodes for cleaner rollout metrics."
         )
     return filtered
+
+
+class _PredictionJsonlWriter:
+    def __init__(self, path: pathlib.Path | None):
+        self._handle = None
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = path.open("w", encoding="utf-8")
+
+    def write(self, *, mode, runtime_sample, source_sample, prediction, metrics) -> None:
+        if self._handle is None:
+            return
+        expected = source_sample.target_prediction()
+        payload = {
+            "mode": mode,
+            "sample_id": source_sample.sample_id,
+            "episode_index": source_sample.episode_index,
+            "step_index": source_sample.step_index,
+            "frame_index": source_sample.frame_index,
+            "instruction": source_sample.instruction,
+            "step_prior": list(source_sample.step_prior),
+            "runtime_language_memory": runtime_sample.language_memory,
+            "runtime_memory_frame_indices": list(runtime_sample.memory_frame_indices),
+            "recent_frame_indices": list(source_sample.recent_frame_indices),
+            "expected": expected.to_dict(),
+            "prediction": prediction.to_dict(),
+            "metrics": metrics,
+        }
+        self._handle.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
 
 
 def _parse_eval_modes(value: str) -> tuple[AblationMode, ...]:
