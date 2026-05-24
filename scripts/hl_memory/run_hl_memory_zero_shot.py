@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import difflib
 import json
 import logging
 import os
@@ -61,7 +62,9 @@ class ZeroShotArgs:
     memory_seconds: str | None = None
     recent_seconds: str | None = None
     recent_end_sec: float | None = None
-    recent_step_sec: float = 1.0
+    recent_step_sec: float | None = None
+    training_fps: float = 20.0
+    frame_subsample: int = 5
 
     # If rollout_interval_sec is set, run recurrent HL memory rollout over the whole video range.
     rollout_interval_sec: float | None = None
@@ -71,7 +74,9 @@ class ZeroShotArgs:
     auto_memory: bool = True
     known_prior_mode: bool = False
     known_prior_start_index: int = 0
-    known_prior_advance_threshold: float = 0.95
+    known_prior_advance_threshold: float = 0.65
+    known_prior_match_threshold: float = 0.62
+    known_prior_max_advance_steps: int = 3
 
     # VLM backend and generation settings.
     vlm_backend: str = "qwen2_5_vl"
@@ -168,7 +173,7 @@ def _run_single_prediction(
         args,
         config=config,
         recent_end_sec=args.recent_end_sec,
-        recent_step_sec=args.recent_step_sec,
+        recent_step_sec=_resolved_recent_step_sec(args),
         recent_seconds=parse_seconds_argument(args.recent_seconds) or None,
         memory_seconds=parse_seconds_argument(args.memory_seconds) or None,
         auto_memory=args.auto_memory,
@@ -203,6 +208,9 @@ def _run_single_prediction(
         "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
         "language_memory": args.language_memory,
         "duration_sec": selection.duration_sec,
+        "recent_step_sec": _resolved_recent_step_sec(args),
+        "training_fps": args.training_fps,
+        "frame_subsample": args.frame_subsample,
         "memory_seconds": list(selection.memory_seconds),
         "recent_seconds": list(selection.recent_seconds),
         "memory_valid_length": clips.memory_valid_length,
@@ -279,6 +287,7 @@ def _run_rollout(
         end_sec=args.rollout_end_sec,
     )
     language_memory = args.language_memory
+    recent_step_sec = _resolved_recent_step_sec(args)
     memory_seconds = tuple(parse_seconds_argument(args.memory_seconds))
     keyframe_vote_seconds = list(memory_seconds)
     known_prior_steps = _known_prior_steps(args)
@@ -297,12 +306,13 @@ def _run_rollout(
     for step_index, end_sec in enumerate(rollout_seconds):
         memory_before = memory_seconds
         known_prior_index_before = known_prior_index
+        known_prior_match: dict[str, object] | None = None
         language_memory_before = language_memory
         clips, selection = _build_clips_from_args(
             args,
             config=config,
             recent_end_sec=end_sec,
-            recent_step_sec=args.recent_step_sec,
+            recent_step_sec=recent_step_sec,
             memory_seconds=memory_before,
             auto_memory=False,
         )
@@ -324,11 +334,13 @@ def _run_rollout(
             recent_end_sec=end_sec,
         )
         if known_prior_steps:
-            prediction, known_prior_index = _apply_known_prior_rollout_state(
+            prediction, known_prior_index, known_prior_match = _apply_known_prior_rollout_state(
                 prediction,
                 known_prior_steps=known_prior_steps,
                 current_index=known_prior_index,
                 advance_threshold=args.known_prior_advance_threshold,
+                match_threshold=args.known_prior_match_threshold,
+                max_advance_steps=args.known_prior_max_advance_steps,
             )
         ground_truth_subtask = _task_config_subtask_at(args.task_config_path, end_sec)
         candidate_seconds = keyframe_candidate_seconds(
@@ -400,6 +412,7 @@ def _run_rollout(
                 "known_prior_index_before": known_prior_index_before if known_prior_steps else None,
                 "known_prior_index_after": known_prior_index if known_prior_steps else None,
                 "known_prior_current_step": known_prior_steps[known_prior_index] if known_prior_steps else None,
+                "known_prior_match": known_prior_match,
                 "memory_seconds_before": list(memory_before),
                 "memory_seconds_after": list(memory_seconds),
                 "keyframe_vote_seconds": list(keyframe_vote_seconds),
@@ -451,10 +464,15 @@ def _run_rollout(
         "rollout_interval_sec": args.rollout_interval_sec,
         "rollout_start_sec": args.rollout_start_sec,
         "rollout_end_sec": args.rollout_end_sec,
+        "recent_step_sec": recent_step_sec,
+        "training_fps": args.training_fps,
+        "frame_subsample": args.frame_subsample,
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
         "known_prior_mode": bool(known_prior_steps),
         "known_prior_steps": list(known_prior_steps),
         "known_prior_advance_threshold": args.known_prior_advance_threshold,
+        "known_prior_match_threshold": args.known_prior_match_threshold,
+        "known_prior_max_advance_steps": args.known_prior_max_advance_steps,
         "final_known_prior_index": known_prior_index if known_prior_steps else None,
         "final_language_memory": language_memory,
         "final_memory_seconds": list(memory_seconds),
@@ -494,6 +512,18 @@ def _build_clips_from_args(
         memory_seconds=memory_seconds,
         auto_memory=auto_memory,
     )
+
+
+def _resolved_recent_step_sec(args: ZeroShotArgs) -> float:
+    if args.recent_step_sec is not None:
+        if args.recent_step_sec <= 0.0:
+            raise ValueError("--recent-step-sec must be positive.")
+        return float(args.recent_step_sec)
+    if args.training_fps <= 0.0:
+        raise ValueError("--training-fps must be positive when --recent-step-sec is omitted.")
+    if args.frame_subsample <= 0:
+        raise ValueError("--frame-subsample must be positive when --recent-step-sec is omitted.")
+    return float(args.frame_subsample) / float(args.training_fps)
 
 
 def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
@@ -577,8 +607,9 @@ def _instruction_with_task_plan(
                     "The rollout controller will advance to the next listed step when completion is high."
                 ),
                 (
-                    "Do not freely choose a different current objective; use visual evidence only to estimate "
-                    "subtask_progress and should_advance_objective for the current known-prior step."
+                    "If the recent video is already clearly at a later listed primitive step, set "
+                    "current_objective/current_subtask/phase to the closest matching step text from the list. "
+                    "Do not invent a step outside the list."
                 ),
             ]
         )
@@ -626,14 +657,27 @@ def _apply_known_prior_rollout_state(
     known_prior_steps: tuple[str, ...],
     current_index: int,
     advance_threshold: float,
-) -> tuple[HLMemoryPrediction, int]:
+    match_threshold: float,
+    max_advance_steps: int,
+) -> tuple[HLMemoryPrediction, int, dict[str, object]]:
     if not known_prior_steps:
-        return prediction, current_index
+        return prediction, current_index, {}
     current_index = max(0, min(current_index, len(known_prior_steps) - 1))
+    match = _match_prediction_to_prior_step(
+        prediction,
+        known_prior_steps=known_prior_steps,
+        current_index=current_index,
+        max_advance_steps=max_advance_steps,
+    )
     should_advance = _known_prior_should_advance(prediction, threshold=advance_threshold)
     next_index = current_index
-    if should_advance and current_index + 1 < len(known_prior_steps):
+    advance_reason = "hold"
+    if match["index"] > current_index and match["score"] >= match_threshold:
+        next_index = int(match["index"])
+        advance_reason = "matched_later_prior_step"
+    elif should_advance and current_index + 1 < len(known_prior_steps):
         next_index = current_index + 1
+        advance_reason = "progress_or_advance_flag"
 
     current_objective = known_prior_steps[next_index]
     progress = 0.0 if next_index != current_index else prediction.subtask_progress
@@ -660,6 +704,14 @@ def _apply_known_prior_rollout_state(
             should_advance_objective=advance_flag,
         ),
         next_index,
+        {
+            **match,
+            "advance_reason": advance_reason,
+            "advance_threshold": advance_threshold,
+            "match_threshold": match_threshold,
+            "max_advance_steps": max_advance_steps,
+            "should_advance_by_progress": should_advance,
+        },
     )
 
 
@@ -669,6 +721,62 @@ def _known_prior_should_advance(prediction: HLMemoryPrediction, *, threshold: fl
     if prediction.subtask_progress is None:
         return False
     return float(prediction.subtask_progress) >= threshold
+
+
+def _match_prediction_to_prior_step(
+    prediction: HLMemoryPrediction,
+    *,
+    known_prior_steps: tuple[str, ...],
+    current_index: int,
+    max_advance_steps: int,
+) -> dict[str, object]:
+    max_advance_steps = max(0, int(max_advance_steps))
+    last_index = min(len(known_prior_steps) - 1, current_index + max_advance_steps)
+    candidate_texts = [
+        prediction.current_objective,
+        prediction.current_subtask,
+        prediction.phase,
+    ]
+    best: dict[str, object] = {
+        "index": current_index,
+        "score": 0.0,
+        "source": "",
+        "matched_step": known_prior_steps[current_index],
+    }
+    for source in candidate_texts:
+        source_text = str(source or "").strip()
+        if not source_text:
+            continue
+        for index in range(current_index, last_index + 1):
+            score = _prior_step_similarity(source_text, known_prior_steps[index])
+            if score > float(best["score"]):
+                best = {
+                    "index": index,
+                    "score": score,
+                    "source": source_text,
+                    "matched_step": known_prior_steps[index],
+                }
+    return best
+
+
+def _prior_step_similarity(left: str, right: str) -> float:
+    left_norm = _normalize_prior_step_text(left)
+    right_norm = _normalize_prior_step_text(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    sequence_score = difflib.SequenceMatcher(None, left_norm, right_norm).ratio()
+    left_tokens = set(left_norm.split())
+    right_tokens = set(right_norm.split())
+    if not left_tokens or not right_tokens:
+        return sequence_score
+    token_score = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    return max(sequence_score, token_score)
+
+
+def _normalize_prior_step_text(text: str) -> str:
+    lowered = text.lower()
+    normalized_chars = [char if char.isalnum() else " " for char in lowered]
+    return " ".join("".join(normalized_chars).split())
 
 
 def _known_prior_task_progress(steps: tuple[str, ...], current_index: int) -> str:

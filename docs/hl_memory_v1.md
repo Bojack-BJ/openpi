@@ -693,7 +693,6 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --instruction "Put the target object into the target slot" \
   --language-memory "Task started." \
   --recent-end-sec 42 \
-  --recent-step-sec 1 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_2b \
   --local-vlm-ckpt-path /path/to/Qwen3.5-2B-or-hl-checkpoint \
@@ -710,10 +709,9 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --right-video-path /root/Users/segmentation_data_dtw/20260116W001/20260414/task_20260116W001_Light_bulb_packing/background/multi_session_20260414/session_095153/right_hand_250801DR48FP25002672/RGB_Images/video.mp4 \
   --instruction "Pack the light bulb into the box" \
   --language-memory "" \
-  --rollout-interval-sec 2 \
+  --rollout-interval-sec 1 \
   --rollout-start-sec 0 \
   --rollout-end-sec 40 \
-  --recent-step-sec 1 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-000200 \
@@ -733,11 +731,12 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --instruction "Pack the light bulb into the box" \
   --task-config-path /path/to/subtask.json \
   --known-prior-mode \
-  --known-prior-advance-threshold 0.95 \
+  --known-prior-advance-threshold 0.65 \
+  --known-prior-match-threshold 0.62 \
+  --known-prior-max-advance-steps 3 \
   --rollout-interval-sec 1 \
   --rollout-start-sec 0 \
   --rollout-end-sec 40 \
-  --recent-step-sec 1 \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-001000 \
@@ -753,8 +752,9 @@ Input rules：
 - 双视角 `--left-video-path` / `--right-video-path` 映射为 `robot_0` / `robot_1`，同一时间抽帧后横向拼接。
 - memory clip 和 recent clip 都按时间从旧到新排列。
 - recent clip 最后一张有效帧定义当前状态，`current_objective` 必须描述最后有效帧对应的当前低层目标。
+- 不传 `--recent-step-sec` 时，rollout 会按训练导出节奏自动取 `--frame-subsample / --training-fps` 秒；默认 `5 / 20 = 0.25s`，对应 LeRobot 20Hz 上每 5 帧取一帧。原始输入视频即使是 60Hz，也应按秒抽 `0.25s` 间隔来匹配训练时域。
 - rollout 会把上一轮四字段 language memory 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
-- `known-prior` 会把 `task-config-path` 里的 `steps` 或 `segments[*].subtask` 当成固定 prior plan。模型只判断当前 prior step 的进度/是否完成；rollout 侧维护 step pointer，并把最终 `current_objective` 重写成 pointer 对应的 prior step。每次推理最多推进一个 prior step，所以 `--rollout-interval-sec` 不宜大于常见 subtask 时长。
+- `known-prior` 会把 `task-config-path` 里的 `steps` 或 `segments[*].subtask` 当成固定 prior plan。模型判断当前 prior step 的进度/是否完成，也可以报告当前画面最接近的后续 prior step；rollout 侧维护单调 step pointer，并把最终 `current_objective` 重写成 pointer 对应的 prior step。
 
 常用参数说明：
 
@@ -766,7 +766,9 @@ Input rules：
 | `--task-config-path` | JSON task plan，可提供 `task_description` 和 `steps`，作为分段先验；视觉证据优先级仍高于 plan。 |
 | `--known-prior-mode` | 将 `task-config-path` 的 step/subtask 序列作为显式状态机，不让模型自由决定下一步 objective；适合已知流程或先由 thinking 大模型离线拆解出 steps 的任务。 |
 | `--known-prior-start-index` | known-prior 初始 step index，0-based，默认 `0`。 |
-| `--known-prior-advance-threshold` | 如果模型没有显式输出 `should_advance_objective=true`，则用 `subtask_progress >= threshold` 推进到下一 prior step，默认 `0.95`。 |
+| `--known-prior-advance-threshold` | 如果模型没有显式输出 `should_advance_objective=true`，则用 `subtask_progress >= threshold` 推进到下一 prior step，默认 `0.65`；当前模型常输出粗粒度 `0.33/0.66`，用 `0.95` 很容易永远不切。 |
+| `--known-prior-match-threshold` | 如果模型输出的 `current_objective/current_subtask/phase` 与后续 prior step 的文本相似度超过该阈值，则直接推进到该 step，默认 `0.62`。 |
+| `--known-prior-max-advance-steps` | 每轮 rollout 最多向后匹配/跳过多少个 prior steps，默认 `3`；如果 `--rollout-interval-sec` 大、subtask 很短，需要调大，否则 pointer 会追不上。 |
 | `--model-path` | 已训练 HL checkpoint 或 Hugging Face/local model 路径。 |
 | `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
 | `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |
@@ -779,7 +781,9 @@ clip 和 memory 参数：
 | 参数 | 作用 |
 | --- | --- |
 | `--recent-end-sec` | 单次预测时 recent clip 的结束时间；不填时默认取视频末尾。 |
-| `--recent-step-sec` | recent clip 抽帧间隔，默认每 1 秒取一帧。 |
+| `--recent-step-sec` | recent clip 抽帧间隔；不传时由 `--frame-subsample / --training-fps` 推导，默认 `0.25s`。 |
+| `--training-fps` | HL 训练导出所基于的 LeRobot fps，默认 `20.0`。 |
+| `--frame-subsample` | HL 训练导出 recent clip 的帧间隔，默认 `5`。 |
 | `--recent-seconds` | 手动指定 recent clip 秒数列表，例如 `10,12,14`；不能和 rollout interval 模式一起用。 |
 | `--memory-seconds` | 手动指定历史 memory keyframe 秒数列表，例如 `2,8,15`。 |
 | `--auto-memory` | 单次预测时自动从 recent 前面的时间段取 memory frames；rollout 模式会关闭它并使用上一步 keyframes。 |
