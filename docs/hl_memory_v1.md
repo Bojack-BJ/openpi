@@ -724,6 +724,29 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --output-json /tmp/hl_rollout_debug_new/summary.json
 ```
 
+known-prior rollout：
+
+```bash
+python scripts/hl_memory/run_hl_memory_zero_shot.py \
+  --left-video-path /path/to/left.mp4 \
+  --right-video-path /path/to/right.mp4 \
+  --instruction "Pack the light bulb into the box" \
+  --task-config-path /path/to/subtask.json \
+  --known-prior-mode \
+  --known-prior-advance-threshold 0.95 \
+  --rollout-interval-sec 1 \
+  --rollout-start-sec 0 \
+  --rollout-end-sec 40 \
+  --recent-step-sec 1 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-001000 \
+  --precision bfloat16 \
+  --device cuda \
+  --debug-dir /tmp/hl_rollout_known_prior \
+  --output-json /tmp/hl_rollout_known_prior/summary.json
+```
+
 Input rules：
 
 - 单视角 `--video-path` 映射为 `front`。
@@ -731,6 +754,7 @@ Input rules：
 - memory clip 和 recent clip 都按时间从旧到新排列。
 - recent clip 最后一张有效帧定义当前状态，`current_objective` 必须描述最后有效帧对应的当前低层目标。
 - rollout 会把上一轮四字段 language memory 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
+- `known-prior` 会把 `task-config-path` 里的 `steps` 或 `segments[*].subtask` 当成固定 prior plan。模型只判断当前 prior step 的进度/是否完成；rollout 侧维护 step pointer，并把最终 `current_objective` 重写成 pointer 对应的 prior step。每次推理最多推进一个 prior step，所以 `--rollout-interval-sec` 不宜大于常见 subtask 时长。
 
 常用参数说明：
 
@@ -740,6 +764,9 @@ Input rules：
 | `--video-path` | 单视角输入视频，内部视角名为 `front`。 |
 | `--left-video-path` / `--right-video-path` | 双视角输入视频，内部视角名为 `robot_0` / `robot_1`，同一时间抽帧后横向拼接成一张 HL frame。 |
 | `--task-config-path` | JSON task plan，可提供 `task_description` 和 `steps`，作为分段先验；视觉证据优先级仍高于 plan。 |
+| `--known-prior-mode` | 将 `task-config-path` 的 step/subtask 序列作为显式状态机，不让模型自由决定下一步 objective；适合已知流程或先由 thinking 大模型离线拆解出 steps 的任务。 |
+| `--known-prior-start-index` | known-prior 初始 step index，0-based，默认 `0`。 |
+| `--known-prior-advance-threshold` | 如果模型没有显式输出 `should_advance_objective=true`，则用 `subtask_progress >= threshold` 推进到下一 prior step，默认 `0.95`。 |
 | `--model-path` | 已训练 HL checkpoint 或 Hugging Face/local model 路径。 |
 | `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
 | `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |

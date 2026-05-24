@@ -14,6 +14,8 @@ import tyro
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.schema import HLMemoryPrediction
+from openpi.hl_memory.schema import render_language_memory_fields
 from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 from openpi.hl_memory.zero_shot import build_rollout_end_seconds
 from openpi.hl_memory.zero_shot import build_zero_shot_clips_from_video
@@ -67,6 +69,9 @@ class ZeroShotArgs:
     rollout_end_sec: float | None = None
     keyframe_merge_distance_sec: float = 2.0
     auto_memory: bool = True
+    known_prior_mode: bool = False
+    known_prior_start_index: int = 0
+    known_prior_advance_threshold: float = 0.95
 
     # VLM backend and generation settings.
     vlm_backend: str = "qwen2_5_vl"
@@ -276,12 +281,22 @@ def _run_rollout(
     language_memory = args.language_memory
     memory_seconds = tuple(parse_seconds_argument(args.memory_seconds))
     keyframe_vote_seconds = list(memory_seconds)
+    known_prior_steps = _known_prior_steps(args)
+    known_prior_index = _initial_known_prior_index(args, known_prior_steps)
+    if known_prior_steps and not language_memory.strip():
+        language_memory = _known_prior_language_memory(
+            known_prior_steps,
+            known_prior_index,
+            task_progress="No completed subtask yet.",
+            notes="Known-prior rollout initialized.",
+        )
     steps: list[dict[str, object]] = []
     debug_dir = pathlib.Path(args.debug_dir) if args.debug_dir is not None else None
     debug_panel_paths: list[pathlib.Path] = []
 
     for step_index, end_sec in enumerate(rollout_seconds):
         memory_before = memory_seconds
+        known_prior_index_before = known_prior_index
         language_memory_before = language_memory
         clips, selection = _build_clips_from_args(
             args,
@@ -293,7 +308,11 @@ def _run_rollout(
         )
         sample = build_zero_shot_sample(
             video_path=_sample_video_path(args),
-            instruction=_instruction_with_task_plan(args),
+            instruction=_instruction_with_task_plan(
+                args,
+                known_prior_steps=known_prior_steps,
+                known_prior_index=known_prior_index if known_prior_steps else None,
+            ),
             language_memory=language_memory_before,
             memory_seconds=selection.memory_seconds,
             recent_seconds=selection.recent_seconds,
@@ -304,6 +323,13 @@ def _run_rollout(
             previous_memory=language_memory_before,
             recent_end_sec=end_sec,
         )
+        if known_prior_steps:
+            prediction, known_prior_index = _apply_known_prior_rollout_state(
+                prediction,
+                known_prior_steps=known_prior_steps,
+                current_index=known_prior_index,
+                advance_threshold=args.known_prior_advance_threshold,
+            )
         ground_truth_subtask = _task_config_subtask_at(args.task_config_path, end_sec)
         candidate_seconds = keyframe_candidate_seconds(
             prediction,
@@ -369,6 +395,11 @@ def _run_rollout(
                 "recent_end_sec": end_sec,
                 "language_memory_before": language_memory_before,
                 "language_memory_after": language_memory,
+                "known_prior_mode": bool(known_prior_steps),
+                "known_prior_steps": list(known_prior_steps),
+                "known_prior_index_before": known_prior_index_before if known_prior_steps else None,
+                "known_prior_index_after": known_prior_index if known_prior_steps else None,
+                "known_prior_current_step": known_prior_steps[known_prior_index] if known_prior_steps else None,
                 "memory_seconds_before": list(memory_before),
                 "memory_seconds_after": list(memory_seconds),
                 "keyframe_vote_seconds": list(keyframe_vote_seconds),
@@ -421,6 +452,10 @@ def _run_rollout(
         "rollout_start_sec": args.rollout_start_sec,
         "rollout_end_sec": args.rollout_end_sec,
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
+        "known_prior_mode": bool(known_prior_steps),
+        "known_prior_steps": list(known_prior_steps),
+        "known_prior_advance_threshold": args.known_prior_advance_threshold,
+        "final_known_prior_index": known_prior_index if known_prior_steps else None,
         "final_language_memory": language_memory,
         "final_memory_seconds": list(memory_seconds),
         "debug_dir": None if debug_dir is None else str(debug_dir),
@@ -502,14 +537,19 @@ def _sample_video_path(args: ZeroShotArgs) -> pathlib.Path:
     return pathlib.Path(f"{args.left_video_path.stem}__{args.right_video_path.stem}")
 
 
-def _instruction_with_task_plan(args: ZeroShotArgs) -> str:
+def _instruction_with_task_plan(
+    args: ZeroShotArgs,
+    *,
+    known_prior_steps: tuple[str, ...] = (),
+    known_prior_index: int | None = None,
+) -> str:
     instruction = args.instruction.strip()
     if args.task_config_path is None:
         return instruction
 
     task_config = _load_task_config(args.task_config_path)
     description = _task_config_description(task_config)
-    subtasks = _task_config_subtasks(task_config, path=args.task_config_path)
+    subtasks = list(known_prior_steps) or _task_config_subtasks(task_config, path=args.task_config_path)
     rendered_steps = [f"{index}. {subtask}" for index, subtask in enumerate(subtasks, start=1)]
     plan_lines = [
         instruction,
@@ -524,10 +564,29 @@ def _instruction_with_task_plan(args: ZeroShotArgs) -> str:
     if rendered_steps:
         plan_lines.append("Expected primitive sequence:")
         plan_lines.extend(rendered_steps)
-    plan_lines.append(
-        "If the recent video shows a different active hand/object/phase than this nominal plan, "
-        "report the observed step."
-    )
+    if known_prior_index is not None and 0 <= known_prior_index < len(subtasks):
+        plan_lines.extend(
+            [
+                "",
+                (
+                    "Known-prior tracker state: the controller is currently evaluating this primitive "
+                    f"step index {known_prior_index + 1}/{len(subtasks)}: {subtasks[known_prior_index]}"
+                ),
+                (
+                    "Estimate progress and completion for this current known-prior step from the recent video. "
+                    "The rollout controller will advance to the next listed step when completion is high."
+                ),
+                (
+                    "Do not freely choose a different current objective; use visual evidence only to estimate "
+                    "subtask_progress and should_advance_objective for the current known-prior step."
+                ),
+            ]
+        )
+    else:
+        plan_lines.append(
+            "If the recent video shows a different active hand/object/phase than this nominal plan, "
+            "report the observed step."
+        )
     return "\n".join(plan_lines)
 
 
@@ -537,6 +596,106 @@ def _load_task_config(path: pathlib.Path) -> dict[str, object]:
     if not isinstance(data, dict):
         raise ValueError(f"Task config must be a JSON object: {path}")
     return data
+
+
+def _known_prior_steps(args: ZeroShotArgs) -> tuple[str, ...]:
+    if not args.known_prior_mode:
+        return ()
+    if args.task_config_path is None:
+        raise ValueError("--known-prior-mode requires --task-config-path with `steps` or `segments[*].subtask`.")
+    task_config = _load_task_config(args.task_config_path)
+    steps = tuple(_task_config_subtasks(task_config, path=args.task_config_path))
+    if not steps:
+        raise ValueError(f"--known-prior-mode found no steps/subtasks in {args.task_config_path}.")
+    return steps
+
+
+def _initial_known_prior_index(args: ZeroShotArgs, steps: tuple[str, ...]) -> int:
+    if not steps:
+        return 0
+    if args.known_prior_start_index < 0 or args.known_prior_start_index >= len(steps):
+        raise ValueError(
+            f"--known-prior-start-index must be in [0, {len(steps) - 1}], got {args.known_prior_start_index}."
+        )
+    return int(args.known_prior_start_index)
+
+
+def _apply_known_prior_rollout_state(
+    prediction: HLMemoryPrediction,
+    *,
+    known_prior_steps: tuple[str, ...],
+    current_index: int,
+    advance_threshold: float,
+) -> tuple[HLMemoryPrediction, int]:
+    if not known_prior_steps:
+        return prediction, current_index
+    current_index = max(0, min(current_index, len(known_prior_steps) - 1))
+    should_advance = _known_prior_should_advance(prediction, threshold=advance_threshold)
+    next_index = current_index
+    if should_advance and current_index + 1 < len(known_prior_steps):
+        next_index = current_index + 1
+
+    current_objective = known_prior_steps[next_index]
+    progress = 0.0 if next_index != current_index else prediction.subtask_progress
+    advance_flag = False if next_index != current_index else prediction.should_advance_objective
+    task_progress = _known_prior_task_progress(known_prior_steps, next_index)
+    relevant_objects = prediction.relevant_objects or tuple(
+        item for item in (prediction.target_query, prediction.goal_query) if item and item.lower() != "none"
+    )
+    updated_language_memory = render_language_memory_fields(
+        task_progress=task_progress,
+        current_objective=current_objective,
+        relevant_objects=relevant_objects,
+        notes=prediction.notes or "Known-prior tracker output.",
+    )
+    return (
+        dataclasses.replace(
+            prediction,
+            task_progress=task_progress,
+            current_objective=current_objective,
+            current_subtask=current_objective,
+            phase=current_objective,
+            updated_language_memory=updated_language_memory,
+            subtask_progress=progress,
+            should_advance_objective=advance_flag,
+        ),
+        next_index,
+    )
+
+
+def _known_prior_should_advance(prediction: HLMemoryPrediction, *, threshold: float) -> bool:
+    if prediction.should_advance_objective:
+        return True
+    if prediction.subtask_progress is None:
+        return False
+    return float(prediction.subtask_progress) >= threshold
+
+
+def _known_prior_task_progress(steps: tuple[str, ...], current_index: int) -> str:
+    completed = [step for step in steps[:current_index] if step.strip()]
+    if not completed:
+        return "No completed subtask yet."
+    rendered = "; ".join(completed[-4:])
+    prefix = "Completed known-prior subtasks"
+    if len(completed) > 4:
+        return f"{prefix}: ...; {rendered}."
+    return f"{prefix}: {rendered}."
+
+
+def _known_prior_language_memory(
+    steps: tuple[str, ...],
+    current_index: int,
+    *,
+    task_progress: str,
+    notes: str,
+) -> str:
+    current_index = max(0, min(current_index, len(steps) - 1))
+    return render_language_memory_fields(
+        task_progress=task_progress,
+        current_objective=steps[current_index],
+        relevant_objects=(),
+        notes=notes,
+    )
 
 
 def _task_config_description(task_config: dict[str, object]) -> str:
