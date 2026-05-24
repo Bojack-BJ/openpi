@@ -143,11 +143,14 @@ def run_offline_rollout_batched(
     mode: AblationMode,
     batch_size: int,
     on_sample_done: Callable[[ExportedHLMemorySample], None] | None = None,
+    on_batch_start: Callable[[int], None] | None = None,
 ) -> dict[str, float]:
     if batch_size <= 1:
         sample_count = sum(len(episode_samples) for episode_samples in samples_by_episode.values())
 
         def predict_one(sample: ExportedHLMemorySample) -> HLMemoryPrediction:
+            if on_batch_start is not None:
+                on_batch_start(1)
             prediction = predict_batch_fn([sample])[0]
             if on_sample_done is not None:
                 on_sample_done(sample)
@@ -188,6 +191,8 @@ def run_offline_rollout_batched(
             for episode_index in batch_episode_indices
         ]
         actual_batch_sizes.append(len(batch_samples))
+        if on_batch_start is not None:
+            on_batch_start(len(batch_samples))
         predictions = list(predict_batch_fn(batch_samples))
         if len(predictions) != len(batch_samples):
             raise ValueError(f"Expected {len(batch_samples)} predictions, got {len(predictions)}.")

@@ -42,6 +42,7 @@ class EvalArgs:
     frame_cache_size: int = 512
     progress: bool = True
     eval_batch_size: int = 1
+    eval_batch_log_interval: int = 10
     eval_modes: str = "no_memory,language_memory_only,keyframe_memory_only,full"
     episode_indices: str | None = None
     exclude_episode_indices: str | None = None
@@ -108,6 +109,7 @@ def main(args: EvalArgs) -> None:
         predict_batch,
         modes=modes,
         batch_size=args.eval_batch_size,
+        batch_log_interval=args.eval_batch_log_interval,
         show_progress=args.progress,
         total_samples=len(samples),
     )
@@ -126,11 +128,14 @@ def _evaluate_with_progress(
     *,
     modes: tuple[AblationMode, ...],
     batch_size: int,
+    batch_log_interval: int,
     show_progress: bool,
     total_samples: int,
 ):
     if batch_size <= 0:
         raise ValueError(f"--eval-batch-size must be positive, got {batch_size}")
+    if batch_log_interval < 0:
+        raise ValueError(f"--eval-batch-log-interval must be >= 0, got {batch_log_interval}")
     metrics = {}
     for mode in modes:
         logging.info(
@@ -147,13 +152,40 @@ def _evaluate_with_progress(
             dynamic_ncols=True,
             disable=not show_progress,
         )
+        batch_stats = {
+            "generate_batches": 0,
+            "samples": 0,
+            "batch_sum": 0,
+            "batch_max": 0,
+        }
 
-        def on_sample_done(sample):
+        def on_batch_start(actual_batch_size: int) -> None:
+            batch_stats["generate_batches"] += 1
+            batch_stats["samples"] += actual_batch_size
+            batch_stats["batch_sum"] += actual_batch_size
+            batch_stats["batch_max"] = max(batch_stats["batch_max"], actual_batch_size)
+            batch_mean = batch_stats["batch_sum"] / max(batch_stats["generate_batches"], 1)
             progress_bar.set_postfix(
-                episode=sample.episode_index,
-                step=sample.step_index,
+                batch=actual_batch_size,
+                batch_mean=f"{batch_mean:.2f}",
+                batch_max=batch_stats["batch_max"],
+                gen=batch_stats["generate_batches"],
                 refresh=False,
             )
+            if batch_log_interval and batch_stats["generate_batches"] % batch_log_interval == 0:
+                logging.info(
+                    "[stage] mode=%s generate_batches=%d samples=%d requested_batch=%d "
+                    "last_batch=%d actual_batch_mean=%.2f actual_batch_max=%d",
+                    mode,
+                    batch_stats["generate_batches"],
+                    batch_stats["samples"],
+                    batch_size,
+                    actual_batch_size,
+                    batch_mean,
+                    batch_stats["batch_max"],
+                )
+
+        def on_sample_done(sample):
             progress_bar.update(1)
 
         mode_started_at = time.perf_counter()
@@ -165,6 +197,7 @@ def _evaluate_with_progress(
                 mode=mode,
                 batch_size=batch_size,
                 on_sample_done=on_sample_done,
+                on_batch_start=on_batch_start,
             )
         finally:
             progress_bar.close()
