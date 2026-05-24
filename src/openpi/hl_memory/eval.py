@@ -4,6 +4,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from collections.abc import Mapping
 from collections.abc import Sequence
+import dataclasses
 import difflib
 from typing import Literal
 
@@ -13,9 +14,20 @@ from openpi.hl_memory.labels import DEFAULT_LANGUAGE_MEMORY
 from openpi.hl_memory.memory import EpisodicKeyframeMemory
 from openpi.hl_memory.memory import map_relative_positions_to_absolute
 from openpi.hl_memory.schema import HLMemoryPrediction
+from openpi.hl_memory.schema import render_language_memory_fields
+from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
 
 
 AblationMode = Literal["no_memory", "language_memory_only", "keyframe_memory_only", "full"]
+
+
+@dataclasses.dataclass(frozen=True)
+class EvalRolloutOptions:
+    apply_rollout_memory_rule: bool = False
+    known_prior_eval: bool = False
+    known_prior_advance_threshold: float = 0.65
+    known_prior_match_threshold: float = 0.62
+    known_prior_max_advance_steps: int = 3
 
 
 def group_samples_by_episode(
@@ -48,18 +60,29 @@ def compute_prediction_metrics(
         "objective_normalized_match": float(
             _normalize_text(prediction.current_objective) == _normalize_text(expected.current_objective)
         ),
-        "subtask_exact_match": float(prediction.current_subtask == expected.current_subtask),
-        "subtask_normalized_match": float(
-            _normalize_text(prediction.current_subtask) == _normalize_text(expected.current_subtask)
+        "subtask_progress_mae": _optional_float_mae(prediction.subtask_progress, expected.subtask_progress),
+        "subtask_progress_accuracy_0_1": _optional_float_within(
+            prediction.subtask_progress,
+            expected.subtask_progress,
+            tolerance=0.1,
         ),
-        "phase_accuracy": float(_normalize_text(prediction.phase) == _normalize_text(expected.phase)),
+        "should_advance_accuracy": _optional_bool_accuracy(
+            prediction.should_advance_objective,
+            expected.should_advance_objective,
+        ),
+        "active_hand_accuracy": _optional_text_accuracy(prediction.active_hand, expected.active_hand),
         "target_query_accuracy": float(_normalize_text(prediction.target_query) == _normalize_text(expected.target_query)),
         "goal_query_accuracy": float(_normalize_text(prediction.goal_query) == _normalize_text(expected.goal_query)),
         "keyframe_precision": precision,
         "keyframe_recall": recall,
         "language_memory_similarity": memory_similarity,
         "memory_drift": 1.0 - memory_similarity,
-        "event_accuracy": _event_accuracy(prediction, sample),
+        "legacy_subtask_exact_match": float(prediction.current_subtask == expected.current_subtask),
+        "legacy_subtask_normalized_match": float(
+            _normalize_text(prediction.current_subtask) == _normalize_text(expected.current_subtask)
+        ),
+        "legacy_phase_accuracy": float(_normalize_text(prediction.phase) == _normalize_text(expected.phase)),
+        "legacy_event_accuracy": _event_accuracy(prediction, sample),
     }
 
 
@@ -81,49 +104,25 @@ def run_offline_rollout(
     predict_fn: Callable[[ExportedHLMemorySample], HLMemoryPrediction],
     *,
     mode: AblationMode,
+    rollout_options: EvalRolloutOptions | None = None,
 ) -> dict[str, float]:
     totals: dict[str, float] = defaultdict(float)
     total_steps = 0
     exact_sequence_episodes = 0
 
     for episode_samples in samples_by_episode.values():
-        memory = EpisodicKeyframeMemory(
-            memory_length=hl_config.memory_length,
-            merge_distance=hl_config.merge_distance,
-        )
-        frame_lookup = {
-            frame_index: frame_path
-            for sample in episode_samples
-            for frame_index, frame_path in zip(sample.recent_frame_indices, sample.recent_frame_paths)
-        }
-        language_memory = DEFAULT_LANGUAGE_MEMORY
-        sequence_ok = True
+        state = _EpisodeRolloutState(episode_samples, hl_config, rollout_options=rollout_options)
 
         for sample in episode_samples:
-            runtime_sample = _with_ablation_context(
-                sample,
-                mode=mode,
-                memory=memory,
-                frame_lookup=frame_lookup,
-                language_memory=language_memory,
-            )
+            runtime_sample = state.runtime_sample(mode=mode)
             prediction = predict_fn(runtime_sample)
+            prediction = state.postprocess_prediction(prediction, mode=mode)
             metrics = compute_prediction_metrics(prediction, sample)
             for key, value in metrics.items():
                 totals[key] += value
-            sequence_ok &= _normalize_text(prediction.current_objective) == _normalize_text(sample.target_prediction().current_objective)
+            state.advance(prediction, mode=mode)
             total_steps += 1
-
-            if mode in ("language_memory_only", "full"):
-                language_memory = prediction.updated_language_memory
-            if mode in ("keyframe_memory_only", "full"):
-                absolute_positions, _ = map_relative_positions_to_absolute(
-                    prediction.keyframe_candidate_positions,
-                    sample.recent_frame_indices,
-                )
-                memory.add_candidates(absolute_positions)
-
-        exact_sequence_episodes += int(sequence_ok)
+        exact_sequence_episodes += int(state.sequence_ok)
 
     if total_steps == 0:
         return {}
@@ -144,6 +143,7 @@ def run_offline_rollout_batched(
     batch_size: int,
     on_sample_done: Callable[[ExportedHLMemorySample], None] | None = None,
     on_batch_start: Callable[[int], None] | None = None,
+    rollout_options: EvalRolloutOptions | None = None,
 ) -> dict[str, float]:
     if batch_size <= 1:
         sample_count = sum(len(episode_samples) for episode_samples in samples_by_episode.values())
@@ -161,6 +161,7 @@ def run_offline_rollout_batched(
             hl_config,
             predict_one,
             mode=mode,
+            rollout_options=rollout_options,
         )
         if metrics:
             metrics["eval_batch_size_requested"] = float(batch_size)
@@ -173,7 +174,7 @@ def run_offline_rollout_batched(
     total_steps = 0
     actual_batch_sizes: list[int] = []
     states = {
-        episode_index: _EpisodeRolloutState(episode_samples, hl_config)
+        episode_index: _EpisodeRolloutState(episode_samples, hl_config, rollout_options=rollout_options)
         for episode_index, episode_samples in samples_by_episode.items()
         if episode_samples
     }
@@ -205,6 +206,7 @@ def run_offline_rollout_batched(
         ):
             state = states[episode_index]
             source_sample = state.current_sample
+            prediction = state.postprocess_prediction(prediction, mode=mode)
             metrics = compute_prediction_metrics(prediction, source_sample)
             for key, value in metrics.items():
                 totals[key] += value
@@ -232,8 +234,15 @@ def run_offline_rollout_batched(
 
 
 class _EpisodeRolloutState:
-    def __init__(self, episode_samples: Sequence[ExportedHLMemorySample], hl_config: HLMemoryConfig):
+    def __init__(
+        self,
+        episode_samples: Sequence[ExportedHLMemorySample],
+        hl_config: HLMemoryConfig,
+        *,
+        rollout_options: EvalRolloutOptions | None = None,
+    ):
         self.samples = list(episode_samples)
+        self.rollout_options = rollout_options or EvalRolloutOptions()
         self.memory = EpisodicKeyframeMemory(
             memory_length=hl_config.memory_length,
             merge_distance=hl_config.merge_distance,
@@ -243,9 +252,21 @@ class _EpisodeRolloutState:
             for sample in self.samples
             for frame_index, frame_path in zip(sample.recent_frame_indices, sample.recent_frame_paths)
         }
-        self.language_memory = DEFAULT_LANGUAGE_MEMORY
+        self.known_prior_steps = self.samples[0].step_prior if self.samples else ()
+        self.known_prior_index = 0
+        self.language_memory = self._initial_language_memory()
         self.sample_index = 0
         self.sequence_ok = True
+
+    def _initial_language_memory(self) -> str:
+        if self.rollout_options.known_prior_eval and self.known_prior_steps:
+            return _known_prior_language_memory(
+                self.known_prior_steps,
+                self.known_prior_index,
+                task_progress="No completed subtask yet.",
+                notes="Known-prior eval initialized.",
+            )
+        return DEFAULT_LANGUAGE_MEMORY
 
     @property
     def current_sample(self) -> ExportedHLMemorySample:
@@ -262,6 +283,24 @@ class _EpisodeRolloutState:
             frame_lookup=self.frame_lookup,
             language_memory=self.language_memory,
         )
+
+    def postprocess_prediction(self, prediction: HLMemoryPrediction, *, mode: AblationMode) -> HLMemoryPrediction:
+        if self.rollout_options.apply_rollout_memory_rule and mode in ("language_memory_only", "full"):
+            prediction, _ = apply_rollout_language_memory_rule(
+                prediction,
+                previous_memory=self.language_memory,
+                recent_end_sec=float(self.current_sample.frame_index),
+            )
+        if self.rollout_options.known_prior_eval and self.known_prior_steps:
+            prediction, self.known_prior_index = _apply_known_prior_eval_state(
+                prediction,
+                known_prior_steps=self.known_prior_steps,
+                current_index=self.known_prior_index,
+                advance_threshold=self.rollout_options.known_prior_advance_threshold,
+                match_threshold=self.rollout_options.known_prior_match_threshold,
+                max_advance_steps=self.rollout_options.known_prior_max_advance_steps,
+            )
+        return prediction
 
     def advance(self, prediction: HLMemoryPrediction, *, mode: AblationMode) -> None:
         source_sample = self.current_sample
@@ -302,8 +341,170 @@ def _with_ablation_context(
     )
 
 
+def _apply_known_prior_eval_state(
+    prediction: HLMemoryPrediction,
+    *,
+    known_prior_steps: tuple[str, ...],
+    current_index: int,
+    advance_threshold: float,
+    match_threshold: float,
+    max_advance_steps: int,
+) -> tuple[HLMemoryPrediction, int]:
+    current_index = max(0, min(current_index, len(known_prior_steps) - 1))
+    match = _match_prediction_to_prior_step(
+        prediction,
+        known_prior_steps=known_prior_steps,
+        current_index=current_index,
+        max_advance_steps=max_advance_steps,
+    )
+    should_advance = _known_prior_should_advance(prediction, threshold=advance_threshold)
+    next_index = current_index
+    if int(match["index"]) > current_index and float(match["score"]) >= match_threshold:
+        next_index = int(match["index"])
+    elif should_advance and current_index + 1 < len(known_prior_steps):
+        next_index = current_index + 1
+
+    current_objective = known_prior_steps[next_index]
+    progress = 0.0 if next_index != current_index else prediction.subtask_progress
+    advance_flag = False if next_index != current_index else prediction.should_advance_objective
+    task_progress = _known_prior_task_progress(known_prior_steps, next_index)
+    relevant_objects = prediction.relevant_objects or tuple(
+        item for item in (prediction.target_query, prediction.goal_query) if item and item.lower() != "none"
+    )
+    updated_language_memory = render_language_memory_fields(
+        task_progress=task_progress,
+        current_objective=current_objective,
+        relevant_objects=relevant_objects,
+        notes=prediction.notes or "Known-prior eval output.",
+    )
+    return (
+        dataclasses.replace(
+            prediction,
+            task_progress=task_progress,
+            current_objective=current_objective,
+            current_subtask=current_objective,
+            phase=current_objective,
+            updated_language_memory=updated_language_memory,
+            subtask_progress=progress,
+            should_advance_objective=advance_flag,
+        ),
+        next_index,
+    )
+
+
+def _known_prior_should_advance(prediction: HLMemoryPrediction, *, threshold: float) -> bool:
+    if prediction.should_advance_objective:
+        return True
+    if prediction.subtask_progress is None:
+        return False
+    return float(prediction.subtask_progress) >= threshold
+
+
+def _match_prediction_to_prior_step(
+    prediction: HLMemoryPrediction,
+    *,
+    known_prior_steps: tuple[str, ...],
+    current_index: int,
+    max_advance_steps: int,
+) -> dict[str, object]:
+    max_advance_steps = max(0, int(max_advance_steps))
+    last_index = min(len(known_prior_steps) - 1, current_index + max_advance_steps)
+    candidate_texts = [
+        prediction.current_objective,
+        prediction.current_subtask,
+        prediction.phase,
+    ]
+    best: dict[str, object] = {
+        "index": current_index,
+        "score": 0.0,
+        "source": "",
+        "matched_step": known_prior_steps[current_index],
+    }
+    for source in candidate_texts:
+        source_text = str(source or "").strip()
+        if not source_text:
+            continue
+        for index in range(current_index, last_index + 1):
+            score = _prior_step_similarity(source_text, known_prior_steps[index])
+            if score > float(best["score"]):
+                best = {
+                    "index": index,
+                    "score": score,
+                    "source": source_text,
+                    "matched_step": known_prior_steps[index],
+                }
+    return best
+
+
+def _prior_step_similarity(left: str, right: str) -> float:
+    left_norm = _normalize_prior_step_text(left)
+    right_norm = _normalize_prior_step_text(right)
+    if not left_norm or not right_norm:
+        return 0.0
+    sequence_score = difflib.SequenceMatcher(None, left_norm, right_norm).ratio()
+    left_tokens = set(left_norm.split())
+    right_tokens = set(right_norm.split())
+    if not left_tokens or not right_tokens:
+        return sequence_score
+    token_score = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    return max(sequence_score, token_score)
+
+
+def _normalize_prior_step_text(text: str) -> str:
+    lowered = text.lower()
+    normalized_chars = [char if char.isalnum() else " " for char in lowered]
+    return " ".join("".join(normalized_chars).split())
+
+
+def _known_prior_task_progress(steps: tuple[str, ...], current_index: int) -> str:
+    completed = [step for step in steps[:current_index] if step.strip()]
+    if not completed:
+        return "No completed subtask yet."
+    rendered = "; ".join(completed[-4:])
+    prefix = "Completed known-prior subtasks"
+    if len(completed) > 4:
+        return f"{prefix}: ...; {rendered}."
+    return f"{prefix}: {rendered}."
+
+
+def _known_prior_language_memory(
+    steps: tuple[str, ...],
+    current_index: int,
+    *,
+    task_progress: str,
+    notes: str,
+) -> str:
+    current_index = max(0, min(current_index, len(steps) - 1))
+    return render_language_memory_fields(
+        task_progress=task_progress,
+        current_objective=steps[current_index],
+        relevant_objects=(),
+        notes=notes,
+    )
+
+
 def _normalize_text(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _optional_float_mae(predicted: float | None, expected: float | None) -> float:
+    if predicted is None and expected is None:
+        return 0.0
+    if predicted is None or expected is None:
+        return 1.0
+    return abs(float(predicted) - float(expected))
+
+
+def _optional_float_within(predicted: float | None, expected: float | None, *, tolerance: float) -> float:
+    return float(_optional_float_mae(predicted, expected) <= tolerance)
+
+
+def _optional_bool_accuracy(predicted: bool | None, expected: bool | None) -> float:
+    return float(predicted is expected)
+
+
+def _optional_text_accuracy(predicted: str, expected: str) -> float:
+    return float(_normalize_text(predicted) == _normalize_text(expected))
 
 
 def _event_accuracy(prediction: HLMemoryPrediction, sample: ExportedHLMemorySample) -> float:

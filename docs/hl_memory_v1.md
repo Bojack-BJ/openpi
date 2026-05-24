@@ -644,7 +644,9 @@ python scripts/hl_memory/eval_hl_memory_rollout.py \
   --output-json /root/Users/dataset/hl_memory/sponge_visual_guided/eval_metrics.json
 ```
 
-评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标包括 `objective_exact_match` / `objective_normalized_match`、legacy subtask match、phase/target/goal accuracy、keyframe precision/recall、memory similarity/drift、event accuracy。
+评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标包括 `objective_exact_match` / `objective_normalized_match`、progress/advance/active-hand accuracy、target/goal accuracy、keyframe precision/recall、memory similarity/drift。
+
+当前 HL V1 主协议以 `current_objective`、`subtask_progress`、`should_advance_objective` 为主。Eval 的主指标是 `objective_*`、`subtask_progress_mae`、`subtask_progress_accuracy_0_1`、`should_advance_accuracy`、`active_hand_accuracy`、`target_query_accuracy`、`goal_query_accuracy`。`legacy_subtask_*`、`legacy_phase_accuracy`、`legacy_event_accuracy` 只用于排查旧字段兼容问题，不建议作为是否训好的主判断。
 
 快速 smoke eval 可以先只跑少量未见 episode 或单个 ablation：
 
@@ -677,6 +679,8 @@ PYTHONPATH=src python scripts/hl_memory/batch_eval_hl_memory_rollout.py \
   --precision bfloat16 \
   --device cuda \
   --eval-batch-size 4 \
+  --apply-rollout-memory-rule \
+  --known-prior-eval \
   --frame-cache-size 512
 ```
 
@@ -685,6 +689,8 @@ PYTHONPATH=src python scripts/hl_memory/batch_eval_hl_memory_rollout.py \
 `batch_eval_hl_memory_rollout.py` 是 task 级并行，不是 DDP。`--workers` 控制同时跑多少个 eval 子进程；`--gpu-ids 0,1,...` 会把 task 按 round-robin 分配到不同物理 GPU，并给每个子进程设置 `CUDA_VISIBLE_DEVICES=<gpu_id>`。如果不传 `--gpu-ids`，所有子进程继承当前 shell 的 CUDA 环境，通常只会用默认可见 GPU。
 
 单个 eval 子进程内部可用 `--eval-batch-size N` 做 sample batch 并行。由于 `full` / `language_memory_only` rollout 有 episode 内状态依赖，batching 只会跨 episode frontier 合批：每个 episode 当前待评估 sample 进入同一个 VLM batch，预测返回后再推进各自 memory 状态。因此 `--eval-batch-size` 不能把单个 episode 的未来 samples 乱序并行；如果只评估 1 个 episode，它基本不会提速。显存不够时先降 `--eval-batch-size`，再降 `--workers`。
+
+如果要让 offline eval 更接近 `run_hl_memory_zero_shot.py --known-prior-mode` 的真实 rollout，打开 `--apply-rollout-memory-rule --known-prior-eval`。前者复用 rollout 端的 language memory 清理/压缩规则；后者用 sample 里的 `step_prior` 做 known-prior 状态机，按 `subtask_progress/should_advance_objective` 推进当前 step。若只想评估纯模型原始输出，不要打开这两个开关。
 
 `--max-samples` 也可用于快速调试，但它可能截断 episode 中间序列；正式 rollout metrics 更推荐用 `--max-episodes`。
 

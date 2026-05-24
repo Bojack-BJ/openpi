@@ -16,6 +16,7 @@ from openpi.hl_memory.data import FrameCache
 from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.eval import AblationMode
+from openpi.hl_memory.eval import EvalRolloutOptions
 from openpi.hl_memory.eval import group_samples_by_episode
 from openpi.hl_memory.eval import run_offline_rollout_batched
 from openpi.hl_memory.hf_adapter import create_hf_adapter
@@ -43,6 +44,11 @@ class EvalArgs:
     progress: bool = True
     eval_batch_size: int = 1
     eval_batch_log_interval: int = 10
+    apply_rollout_memory_rule: bool = False
+    known_prior_eval: bool = False
+    known_prior_advance_threshold: float = 0.65
+    known_prior_match_threshold: float = 0.62
+    known_prior_max_advance_steps: int = 3
     eval_modes: str = "no_memory,language_memory_only,keyframe_memory_only,full"
     episode_indices: str | None = None
     exclude_episode_indices: str | None = None
@@ -103,6 +109,13 @@ def main(args: EvalArgs) -> None:
 
     grouped = group_samples_by_episode(samples)
     modes = _parse_eval_modes(args.eval_modes)
+    rollout_options = EvalRolloutOptions(
+        apply_rollout_memory_rule=args.apply_rollout_memory_rule,
+        known_prior_eval=args.known_prior_eval,
+        known_prior_advance_threshold=args.known_prior_advance_threshold,
+        known_prior_match_threshold=args.known_prior_match_threshold,
+        known_prior_max_advance_steps=args.known_prior_max_advance_steps,
+    )
     metrics = _evaluate_with_progress(
         grouped,
         hl_config,
@@ -110,6 +123,7 @@ def main(args: EvalArgs) -> None:
         modes=modes,
         batch_size=args.eval_batch_size,
         batch_log_interval=args.eval_batch_log_interval,
+        rollout_options=rollout_options,
         show_progress=args.progress,
         total_samples=len(samples),
     )
@@ -129,6 +143,7 @@ def _evaluate_with_progress(
     modes: tuple[AblationMode, ...],
     batch_size: int,
     batch_log_interval: int,
+    rollout_options: EvalRolloutOptions,
     show_progress: bool,
     total_samples: int,
 ):
@@ -198,6 +213,7 @@ def _evaluate_with_progress(
                 batch_size=batch_size,
                 on_sample_done=on_sample_done,
                 on_batch_start=on_batch_start,
+                rollout_options=rollout_options,
             )
         finally:
             progress_bar.close()
