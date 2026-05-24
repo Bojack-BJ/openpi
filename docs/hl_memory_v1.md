@@ -404,7 +404,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subt
 
 不要在这一步同时依赖 `--auto-export-annotations` 生成 raw annotations 再导出 train/val；正确顺序是先生成 `hl_annotations.jsonl`，再 normalize 成 `hl_annotations_llm_normalized.jsonl`，最后从 normalized 文件导出 samples。
 
-如果之前已经用旧 annotations 导出过 `samples.jsonl`，新增的 `task_progress` 修正、`subtask_progress`、`should_advance_objective` 和 `active_hand` 不会自动写进旧 samples；需要从 normalized annotations 重新跑这一节的 HL dataset export。Raw -> LeRobot 不需要重跑。
+如果之前已经用旧 annotations 导出过 `samples.jsonl`，新增的 `task_progress` 修正、`subtask_progress`、`should_advance_objective`、`active_hand` 和 `step_prior` 不会自动写进旧 samples；需要从 normalized annotations 重新跑这一节的 HL dataset export。Raw -> LeRobot 不需要重跑。
 
 ```bash
 python scripts/hl_memory/export_hl_memory_dataset.py \
@@ -443,6 +443,7 @@ exported/
   "instruction": "put the motor into the box",
   "language_memory": "Task progress: ...\nCurrent objective: ...\nRelevant objects: ...\nNotes: ...",
   "updated_language_memory": "Task progress: ...\nCurrent objective: ...\nRelevant objects: ...\nNotes: ...",
+  "step_prior": ["approach motor", "grasp motor", "place motor into box"],
   "task_progress": "The motor has been picked up.",
   "current_objective": "place the motor into the box",
   "subtask_progress": 0.42,
@@ -460,7 +461,7 @@ exported/
 }
 ```
 
-训练 target JSON 来自 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/...`。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。
+训练 target JSON 来自 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/...`。`step_prior` 只进入 prompt 作为 nominal ordered plan，不作为 target JSON 监督。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。
 
 推荐按 episode 做 held-out split，而不是直接用同一个 `exported/` 同时训练和评估。下面这条命令会在一次运行里计算一次 split，并同时生成互斥的 train / val episode，避免两次运行时误填不同 ratio/seed：
 
@@ -505,6 +506,7 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --lora-alpha 32 \
   --lora-dropout 0.1 \
   --language-memory-dropout 0.3 \
+  --step-prior-dropout 0.3 \
   --distributed-strategy fsdp \
   --fsdp-min-num-params 20000000 \
   --batch-size 1 \
@@ -536,7 +538,7 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
 
 Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 prompt tokens 和 padding tokens 置为 `-100`，只监督 target JSON token。Hugging Face causal LM loss 是所有未 mask target tokens 的平均 cross entropy。`grad_accum_steps` 内每个 micro batch 的 loss 会除以 accum steps 再 backward；日志里的 `train/loss` 也按 accum steps 做平均，因此不同 accum 配置下数值可比。DDP 下每个 rank 算本地 loss，日志再跨 rank 求平均。
 
-多任务训练建议优先用 LoRA + `--language-memory-dropout`。原因是不同 task 的语言目标差异大，full finetune 更容易记住任务模板或破坏原 VLM 的通用视觉能力。`--num-train-steps` 是 optimizer steps，不是 epoch；实际见过的样本数约等于 `num_train_steps * global_batch_size`，需要按总 sample 数和任务数量估算。
+多任务训练建议优先用 LoRA + `--language-memory-dropout` + `--step-prior-dropout`。原因是不同 task 的语言目标差异大，full finetune 更容易记住任务模板或破坏原 VLM 的通用视觉能力；step prior dropout 则避免模型只背 plan，不看 recent clip。`--num-train-steps` 是 optimizer steps，不是 epoch；实际见过的样本数约等于 `num_train_steps * global_batch_size`，需要按总 sample 数和任务数量估算。
 
 单任务训练仍然保留，适合先确认某一个 dataset export 没有格式问题：
 
@@ -598,15 +600,16 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
   --lora-dropout 0.05 \
   --language-memory-dropout 0.3 \
   --language-memory-dropout-value "No progress has been recorded yet." \
+  --step-prior-dropout 0.3 \
   --batch-size 4 \
   --grad-accum-steps 1 \
   --num-train-steps 2000 \
   --save-interval 200
 ```
 
-LoRA 需要安装 `peft`。默认 LoRA target modules 是 Qwen 常见 attention/MLP 线性层：`q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`。`--language-memory-dropout` 会在训练时随机把输入 `language_memory` 替换成指定文本，逼模型更多依赖视觉和 recent clip。
+LoRA 需要安装 `peft`。默认 LoRA target modules 是 Qwen 常见 attention/MLP 线性层：`q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`。`--language-memory-dropout` 会在训练时随机把输入 `language_memory` 替换成指定文本，`--step-prior-dropout` 会随机移除 `step_prior`，逼模型更多依赖视觉和 recent clip。
 
-当前脚本默认值已经偏保守：`--learning-rate 5e-6`、`--lora-r 8`、`--lora-alpha 16`、`--language-memory-dropout 0.3`。如果模型第一步就背出完整流程，优先检查 GT 是否泄漏未来，再降低 learning rate / 训练步数，而不是增大 LoRA rank。
+当前脚本默认值已经偏保守：`--learning-rate 5e-6`、`--lora-r 8`、`--lora-alpha 16`、`--language-memory-dropout 0.3`、`--step-prior-dropout 0.3`。如果模型第一步就背出完整流程，优先检查 GT 是否泄漏未来，再降低 learning rate / 训练步数，而不是增大 LoRA rank。
 
 可用 backend / variant：
 
@@ -664,7 +667,8 @@ PYTHONPATH=src python scripts/hl_memory/batch_eval_hl_memory_rollout.py \
   --dataset-root /root/Users/dataset/hl_memory/subtask \
   --dataset-glob '*/val' \
   --output-root /root/Users/eval/hl_memory/subtask_multitask_qwen35_lora_step200 \
-  --workers 1 \
+  --workers 8 \
+  --gpu-ids 0,1,2,3,4,5,6,7 \
   --continue-on-error \
   -- \
   --local-vlm-ckpt-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-000200 \
@@ -672,10 +676,15 @@ PYTHONPATH=src python scripts/hl_memory/batch_eval_hl_memory_rollout.py \
   --vlm-variant qwen3_5_4b \
   --precision bfloat16 \
   --device cuda \
+  --eval-batch-size 4 \
   --frame-cache-size 512
 ```
 
 输出包括每个 task 的 `eval_metrics.json` / `eval.log`，以及 `batch_hl_memory_eval_summary.json`。默认 `--workers 1` 是因为每个 eval 子进程都会加载一份 VLM；同一张 GPU 上并行通常只会更慢或 OOM。
+
+`batch_eval_hl_memory_rollout.py` 是 task 级并行，不是 DDP。`--workers` 控制同时跑多少个 eval 子进程；`--gpu-ids 0,1,...` 会把 task 按 round-robin 分配到不同物理 GPU，并给每个子进程设置 `CUDA_VISIBLE_DEVICES=<gpu_id>`。如果不传 `--gpu-ids`，所有子进程继承当前 shell 的 CUDA 环境，通常只会用默认可见 GPU。
+
+单个 eval 子进程内部可用 `--eval-batch-size N` 做 sample batch 并行。由于 `full` / `language_memory_only` rollout 有 episode 内状态依赖，batching 只会跨 episode frontier 合批：每个 episode 当前待评估 sample 进入同一个 VLM batch，预测返回后再推进各自 memory 状态。因此 `--eval-batch-size` 不能把单个 episode 的未来 samples 乱序并行；如果只评估 1 个 episode，它基本不会提速。显存不够时先降 `--eval-batch-size`，再降 `--workers`。
 
 `--max-samples` 也可用于快速调试，但它可能截断 episode 中间序列；正式 rollout metrics 更推荐用 `--max-episodes`。
 

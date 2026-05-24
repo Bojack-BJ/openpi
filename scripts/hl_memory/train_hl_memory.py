@@ -49,6 +49,7 @@ class TrainArgs:
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
     language_memory_dropout: float = 0.3
     language_memory_dropout_value: str = "No progress has been recorded yet."
+    step_prior_dropout: float = 0.3
     batch_size: int = 1
     grad_accum_steps: int = 1
     num_train_steps: int = 100
@@ -166,7 +167,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     else nullcontext()
                 )
                 with sync_context:
-                    batch_samples = [_maybe_drop_language_memory(sample, args=args, rng=rng) for sample in batch]
+                    batch_samples = [_maybe_apply_training_dropouts(sample, args=args, rng=rng) for sample in batch]
                     data_start_time = time.perf_counter()
                     batch_clips = [
                         load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
@@ -281,6 +282,11 @@ def _apply_lora(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> to
     return model
 
 
+def _maybe_apply_training_dropouts(sample, *, args: TrainArgs, rng: random.Random):
+    sample = _maybe_drop_language_memory(sample, args=args, rng=rng)
+    return _maybe_drop_step_prior(sample, args=args, rng=rng)
+
+
 def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
     if args.language_memory_dropout <= 0.0:
         return sample
@@ -289,6 +295,16 @@ def _maybe_drop_language_memory(sample, *, args: TrainArgs, rng: random.Random):
     if rng.random() >= args.language_memory_dropout:
         return sample
     return dataclasses.replace(sample, language_memory=args.language_memory_dropout_value)
+
+
+def _maybe_drop_step_prior(sample, *, args: TrainArgs, rng: random.Random):
+    if args.step_prior_dropout <= 0.0:
+        return sample
+    if not 0.0 <= args.step_prior_dropout <= 1.0:
+        raise ValueError(f"--step-prior-dropout must be in [0, 1], got {args.step_prior_dropout}")
+    if rng.random() >= args.step_prior_dropout:
+        return sample
+    return dataclasses.replace(sample, step_prior=())
 
 
 def _init_distributed(args: TrainArgs) -> bool:

@@ -135,6 +135,130 @@ def run_offline_rollout(
     return dict(metrics)
 
 
+def run_offline_rollout_batched(
+    samples_by_episode: Mapping[int, Sequence[ExportedHLMemorySample]],
+    hl_config: HLMemoryConfig,
+    predict_batch_fn: Callable[[Sequence[ExportedHLMemorySample]], Sequence[HLMemoryPrediction]],
+    *,
+    mode: AblationMode,
+    batch_size: int,
+    on_sample_done: Callable[[ExportedHLMemorySample], None] | None = None,
+) -> dict[str, float]:
+    if batch_size <= 1:
+        def predict_one(sample: ExportedHLMemorySample) -> HLMemoryPrediction:
+            prediction = predict_batch_fn([sample])[0]
+            if on_sample_done is not None:
+                on_sample_done(sample)
+            return prediction
+
+        return run_offline_rollout(
+            samples_by_episode,
+            hl_config,
+            predict_one,
+            mode=mode,
+        )
+
+    totals: dict[str, float] = defaultdict(float)
+    total_steps = 0
+    states = {
+        episode_index: _EpisodeRolloutState(episode_samples, hl_config)
+        for episode_index, episode_samples in samples_by_episode.items()
+        if episode_samples
+    }
+
+    while True:
+        pending_episode_indices = [
+            episode_index for episode_index, state in states.items() if state.has_next_sample()
+        ]
+        if not pending_episode_indices:
+            break
+
+        batch_episode_indices = pending_episode_indices[:batch_size]
+        batch_samples = [
+            states[episode_index].runtime_sample(mode=mode)
+            for episode_index in batch_episode_indices
+        ]
+        predictions = list(predict_batch_fn(batch_samples))
+        if len(predictions) != len(batch_samples):
+            raise ValueError(f"Expected {len(batch_samples)} predictions, got {len(predictions)}.")
+
+        for episode_index, runtime_sample, prediction in zip(
+            batch_episode_indices,
+            batch_samples,
+            predictions,
+            strict=True,
+        ):
+            state = states[episode_index]
+            source_sample = state.current_sample
+            metrics = compute_prediction_metrics(prediction, source_sample)
+            for key, value in metrics.items():
+                totals[key] += value
+            state.advance(prediction, mode=mode)
+            total_steps += 1
+            if on_sample_done is not None:
+                on_sample_done(runtime_sample)
+
+    if total_steps == 0:
+        return {}
+
+    metrics = {key: value / total_steps for key, value in totals.items()}
+    episode_count = len(states)
+    exact_sequence_episodes = sum(int(state.sequence_ok) for state in states.values())
+    metrics["episode_sequence_accuracy"] = exact_sequence_episodes / max(episode_count, 1)
+    metrics["num_steps"] = float(total_steps)
+    metrics["num_episodes"] = float(episode_count)
+    return dict(metrics)
+
+
+class _EpisodeRolloutState:
+    def __init__(self, episode_samples: Sequence[ExportedHLMemorySample], hl_config: HLMemoryConfig):
+        self.samples = list(episode_samples)
+        self.memory = EpisodicKeyframeMemory(
+            memory_length=hl_config.memory_length,
+            merge_distance=hl_config.merge_distance,
+        )
+        self.frame_lookup = {
+            frame_index: frame_path
+            for sample in self.samples
+            for frame_index, frame_path in zip(sample.recent_frame_indices, sample.recent_frame_paths)
+        }
+        self.language_memory = DEFAULT_LANGUAGE_MEMORY
+        self.sample_index = 0
+        self.sequence_ok = True
+
+    @property
+    def current_sample(self) -> ExportedHLMemorySample:
+        return self.samples[self.sample_index]
+
+    def has_next_sample(self) -> bool:
+        return self.sample_index < len(self.samples)
+
+    def runtime_sample(self, *, mode: AblationMode) -> ExportedHLMemorySample:
+        return _with_ablation_context(
+            self.current_sample,
+            mode=mode,
+            memory=self.memory,
+            frame_lookup=self.frame_lookup,
+            language_memory=self.language_memory,
+        )
+
+    def advance(self, prediction: HLMemoryPrediction, *, mode: AblationMode) -> None:
+        source_sample = self.current_sample
+        self.sequence_ok &= (
+            _normalize_text(prediction.current_objective)
+            == _normalize_text(source_sample.target_prediction().current_objective)
+        )
+        if mode in ("language_memory_only", "full"):
+            self.language_memory = prediction.updated_language_memory
+        if mode in ("keyframe_memory_only", "full"):
+            absolute_positions, _ = map_relative_positions_to_absolute(
+                prediction.keyframe_candidate_positions,
+                source_sample.recent_frame_indices,
+            )
+            self.memory.add_candidates(absolute_positions)
+        self.sample_index += 1
+
+
 def _with_ablation_context(
     sample: ExportedHLMemorySample,
     *,

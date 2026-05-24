@@ -182,6 +182,7 @@ def _run_single_prediction(
         video_path=_sample_video_path(args),
         instruction=_instruction_with_task_plan(args),
         language_memory=args.language_memory,
+        step_prior=_task_config_steps(args.task_config_path),
         memory_seconds=selection.memory_seconds,
         recent_seconds=selection.recent_seconds,
     )
@@ -206,6 +207,7 @@ def _run_single_prediction(
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
         "instruction": args.instruction,
         "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
+        "step_prior": list(sample.step_prior),
         "language_memory": args.language_memory,
         "duration_sec": selection.duration_sec,
         "recent_step_sec": _resolved_recent_step_sec(args),
@@ -324,6 +326,7 @@ def _run_rollout(
                 known_prior_index=known_prior_index if known_prior_steps else None,
             ),
             language_memory=language_memory_before,
+            step_prior=known_prior_steps or _task_config_steps(args.task_config_path),
             memory_seconds=selection.memory_seconds,
             recent_seconds=selection.recent_seconds,
         )
@@ -470,6 +473,7 @@ def _run_rollout(
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
         "known_prior_mode": bool(known_prior_steps),
         "known_prior_steps": list(known_prior_steps),
+        "step_prior": list(known_prior_steps or _task_config_steps(args.task_config_path)),
         "known_prior_advance_threshold": args.known_prior_advance_threshold,
         "known_prior_match_threshold": args.known_prior_match_threshold,
         "known_prior_max_advance_steps": args.known_prior_max_advance_steps,
@@ -580,20 +584,16 @@ def _instruction_with_task_plan(
     task_config = _load_task_config(args.task_config_path)
     description = _task_config_description(task_config)
     subtasks = list(known_prior_steps) or _task_config_subtasks(task_config, path=args.task_config_path)
-    rendered_steps = [f"{index}. {subtask}" for index, subtask in enumerate(subtasks, start=1)]
     plan_lines = [
         instruction,
         "",
         (
-            "Nominal manipulation plan from task config. Use it as a segmentation prior, "
-            "not as a substitute for visual evidence."
+            "A nominal manipulation step prior may be provided separately in this prompt. Use it as a segmentation "
+            "prior, not as a substitute for visual evidence."
         ),
     ]
     if description:
         plan_lines.append(f"Task description: {description}")
-    if rendered_steps:
-        plan_lines.append("Expected primitive sequence:")
-        plan_lines.extend(rendered_steps)
     if known_prior_index is not None and 0 <= known_prior_index < len(subtasks):
         plan_lines.extend(
             [
@@ -619,6 +619,13 @@ def _instruction_with_task_plan(
             "report the observed step."
         )
     return "\n".join(plan_lines)
+
+
+def _task_config_steps(path: pathlib.Path | None) -> tuple[str, ...]:
+    if path is None:
+        return ()
+    task_config = _load_task_config(path)
+    return tuple(_task_config_subtasks(task_config, path=path))
 
 
 def _load_task_config(path: pathlib.Path) -> dict[str, object]:

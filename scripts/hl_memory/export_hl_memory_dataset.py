@@ -442,6 +442,7 @@ def _export_episode(
         merge_distance=hl_config.merge_distance,
     )
     samples: list[ExportedHLMemorySample] = []
+    episode_step_prior = _episode_step_prior(episode_annotations)
 
     for step_index, annotation in enumerate(episode_annotations):
         if step_index > 0 and step_index % 50 == 0:
@@ -499,6 +500,7 @@ def _export_episode(
             recent_valid_length=len(recent_frame_paths),
             event_type=annotation.event_type,
             event_text=annotation.event_text,
+            step_prior=episode_step_prior,
             task_progress=str(next_memory_fields["task_progress"]),
             current_objective=str(next_memory_fields["current_objective"]),
             relevant_objects=tuple(next_memory_fields["relevant_objects"]),  # type: ignore[arg-type]
@@ -514,6 +516,19 @@ def _export_episode(
         progress_state = next_progress_state
 
     return samples
+
+
+def _episode_step_prior(episode_annotations: list[Any]) -> tuple[str, ...]:
+    steps: list[str] = []
+    previous = ""
+    for annotation in sorted(episode_annotations, key=lambda item: int(item.frame_index)):
+        current = str(annotation.current_subtask).strip()
+        normalized = " ".join(current.lower().split())
+        if not current or normalized == previous:
+            continue
+        steps.append(current)
+        previous = normalized
+    return tuple(steps)
 
 
 def _build_episode_index_map(dataset: Any) -> dict[int, list[int]]:

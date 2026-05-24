@@ -68,6 +68,7 @@ class ExportedHLMemorySample:
     recent_valid_length: int
     event_type: str = "none"
     event_text: str = ""
+    step_prior: tuple[str, ...] = ()
     task_progress: str = ""
     current_objective: str = ""
     relevant_objects: tuple[str, ...] = ()
@@ -101,6 +102,7 @@ class ExportedHLMemorySample:
             recent_valid_length=int(data.get("recent_valid_length", len(data["recent_frame_paths"]))),
             event_type=str(data.get("event_type", "none")),
             event_text=str(data.get("event_text", "")),
+            step_prior=tuple(str(value).strip() for value in data.get("step_prior", ()) if str(value).strip()),
             task_progress=str(data.get("task_progress", "")).strip(),
             current_objective=str(data.get("current_objective", data.get("current_subtask", ""))).strip(),
             relevant_objects=_parse_relevant_objects(data.get("relevant_objects", ())),
@@ -132,6 +134,7 @@ class ExportedHLMemorySample:
             "recent_valid_length": self.recent_valid_length,
             "event_type": self.event_type,
             "event_text": self.event_text,
+            "step_prior": list(self.step_prior),
             "task_progress": self.task_progress,
             "current_objective": self.current_objective,
             "relevant_objects": list(self.relevant_objects),

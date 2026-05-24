@@ -148,6 +148,16 @@ class BaseHLVLMAdapter:
     ) -> HLMemoryPrediction:
         return self.generate_prediction(loaded, sample, clips, device=device).prediction
 
+    def predict_batch(
+        self,
+        loaded: LoadedHLVLM,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+        *,
+        device: str | torch.device,
+    ) -> list[HLMemoryPrediction]:
+        return [generation.prediction for generation in self.generate_batch_predictions(loaded, samples, clips, device=device)]
+
     def generate_prediction(
         self,
         loaded: LoadedHLVLM,
@@ -194,6 +204,61 @@ class BaseHLVLMAdapter:
                 parse_error=parse_error,
             )
 
+    def generate_batch_predictions(
+        self,
+        loaded: LoadedHLVLM,
+        samples: list[ExportedHLMemorySample],
+        clips: list[LoadedVideoClips],
+        *,
+        device: str | torch.device,
+    ) -> list[HLVLMGeneration]:
+        if len(samples) != len(clips):
+            raise ValueError(f"Expected one clip set per sample, got {len(samples)} samples and {len(clips)} clips.")
+        if not samples:
+            return []
+        inputs = self._encode_batch_prompt_only(loaded.processor, samples, clips)
+        input_device = self._resolve_input_device(loaded.model, device)
+        input_ids = inputs["input_ids"].to(input_device)
+        generation_inputs = {
+            key: value.to(input_device)
+            for key, value in inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+        generation_kwargs: dict[str, Any] = {}
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            pad_token_id = getattr(tokenizer, "eos_token_id", None)
+        if pad_token_id is not None:
+            generation_kwargs["pad_token_id"] = pad_token_id
+        generated_ids = loaded.model.generate(
+            **generation_inputs,
+            max_new_tokens=self._generation_max_new_tokens(),
+            do_sample=False,
+            **generation_kwargs,
+        )
+        generated_suffix = generated_ids[:, input_ids.shape[-1] :]
+        decoded_outputs = tokenizer.batch_decode(generated_suffix, skip_special_tokens=True)
+        generations: list[HLVLMGeneration] = []
+        for sample, clip, decoded in zip(samples, clips, decoded_outputs, strict=True):
+            try:
+                prediction = HLMemoryPrediction.from_json(decoded).with_recent_position_limit(clip.recent_valid_length)
+                generations.append(HLVLMGeneration(prediction=prediction, raw_output=decoded))
+            except ValueError as exc:
+                parse_error = f"{type(exc).__name__}: {exc}"
+                logging.warning(
+                    "HL VLM batch output could not be parsed as JSON; using fallback prediction. raw_output=%r",
+                    decoded[:1000],
+                )
+                generations.append(
+                    HLVLMGeneration(
+                        prediction=self._fallback_prediction(sample),
+                        raw_output=decoded,
+                        parse_error=parse_error,
+                    )
+                )
+        return generations
+
     def generate_image_text_response(
         self,
         loaded: LoadedHLVLM,
@@ -236,6 +301,7 @@ class BaseHLVLMAdapter:
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
+        step_prior = _render_step_prior(sample.step_prior)
         current_width, current_height = _current_recent_frame_size(clips)
         thinking_instruction = (
             "Thinking is enabled. If you produce private reasoning, keep it brief: at most "
@@ -341,6 +407,7 @@ class BaseHLVLMAdapter:
             "`keyframe_candidate_positions`.\n"
             "Do not include markdown, explanation text, or extra keys outside the JSON object.\n"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
+            f"{step_prior}"
             f"Previous language memory: {previous_memory}\n"
         )
 
@@ -896,6 +963,19 @@ def _is_usable_fallback_objective(objective: str, instruction: str) -> bool:
     if normalized_objective in {"continue the task", "task started"}:
         return False
     return normalized_objective not in {normalized_instruction, normalized_primary_instruction}
+
+
+def _render_step_prior(step_prior: tuple[str, ...] | list[str]) -> str:
+    steps = [str(step).strip() for step in step_prior if str(step).strip()]
+    if not steps:
+        return ""
+    rendered = "\n".join(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+    return (
+        "Task step prior:\n"
+        f"{rendered}\n"
+        "Use the step prior as a nominal ordered segmentation plan. Prefer visual evidence from the last valid "
+        "recent frame if the plan and video disagree.\n"
+    )
 
 
 def _current_recent_frame_size(clips: LoadedVideoClips) -> tuple[int, int]:

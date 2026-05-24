@@ -381,11 +381,13 @@ def build_zero_shot_sample(
     video_path: pathlib.Path | str,
     instruction: str,
     language_memory: str = "",
+    step_prior: Iterable[str] = (),
     memory_seconds: Iterable[float] = (),
     recent_seconds: Iterable[float] = (),
 ) -> ExportedHLMemorySample:
     recent_seconds = list(recent_seconds)
     memory_seconds = list(memory_seconds)
+    step_prior = tuple(str(step).strip() for step in step_prior if str(step).strip())
     return ExportedHLMemorySample(
         sample_id=f"zero_shot::{pathlib.Path(video_path).stem}",
         episode_index=0,
@@ -407,6 +409,7 @@ def build_zero_shot_sample(
         recent_valid_length=len(recent_seconds),
         event_type="none",
         event_text="",
+        step_prior=step_prior,
     )
 
 

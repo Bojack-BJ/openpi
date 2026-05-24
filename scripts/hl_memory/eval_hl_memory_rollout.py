@@ -17,7 +17,7 @@ from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.eval import AblationMode
 from openpi.hl_memory.eval import group_samples_by_episode
-from openpi.hl_memory.eval import run_offline_rollout
+from openpi.hl_memory.eval import run_offline_rollout_batched
 from openpi.hl_memory.hf_adapter import create_hf_adapter
 
 
@@ -41,6 +41,7 @@ class EvalArgs:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     frame_cache_size: int = 512
     progress: bool = True
+    eval_batch_size: int = 1
     eval_modes: str = "no_memory,language_memory_only,keyframe_memory_only,full"
     episode_indices: str | None = None
     exclude_episode_indices: str | None = None
@@ -92,17 +93,21 @@ def main(args: EvalArgs) -> None:
     logging.info("[stage] model ready; starting offline rollout evaluation")
     frame_cache = FrameCache(args.frame_cache_size)
 
-    def predict(sample):
-        clips = load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
-        return adapter.predict(loaded, sample, clips, device=args.device)
+    def predict_batch(batch_samples):
+        batch_clips = [
+            load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
+            for sample in batch_samples
+        ]
+        return adapter.predict_batch(loaded, list(batch_samples), batch_clips, device=args.device)
 
     grouped = group_samples_by_episode(samples)
     modes = _parse_eval_modes(args.eval_modes)
     metrics = _evaluate_with_progress(
         grouped,
         hl_config,
-        predict,
+        predict_batch,
         modes=modes,
+        batch_size=args.eval_batch_size,
         show_progress=args.progress,
         total_samples=len(samples),
     )
@@ -117,15 +122,24 @@ def main(args: EvalArgs) -> None:
 def _evaluate_with_progress(
     grouped,
     hl_config: HLMemoryConfig,
-    predict,
+    predict_batch,
     *,
     modes: tuple[AblationMode, ...],
+    batch_size: int,
     show_progress: bool,
     total_samples: int,
 ):
+    if batch_size <= 0:
+        raise ValueError(f"--eval-batch-size must be positive, got {batch_size}")
     metrics = {}
     for mode in modes:
-        logging.info("[stage] evaluating mode=%s samples=%d episodes=%d", mode, total_samples, len(grouped))
+        logging.info(
+            "[stage] evaluating mode=%s samples=%d episodes=%d batch_size=%d",
+            mode,
+            total_samples,
+            len(grouped),
+            batch_size,
+        )
         progress_bar = tqdm(
             total=total_samples,
             desc=f"HL eval {mode}",
@@ -134,24 +148,23 @@ def _evaluate_with_progress(
             disable=not show_progress,
         )
 
-        def predict_with_progress(sample):
+        def on_sample_done(sample):
             progress_bar.set_postfix(
                 episode=sample.episode_index,
                 step=sample.step_index,
                 refresh=False,
             )
-            try:
-                return predict(sample)
-            finally:
-                progress_bar.update(1)
+            progress_bar.update(1)
 
         mode_started_at = time.perf_counter()
         try:
-            metrics[mode] = run_offline_rollout(
+            metrics[mode] = run_offline_rollout_batched(
                 grouped,
                 hl_config,
-                predict_with_progress,
+                predict_batch,
                 mode=mode,
+                batch_size=batch_size,
+                on_sample_done=on_sample_done,
             )
         finally:
             progress_bar.close()
