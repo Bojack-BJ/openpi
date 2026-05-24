@@ -240,7 +240,7 @@ def _aggregate_metrics(results: list[Result]) -> dict[str, dict[str, float]]:
             for key, value in metrics.items():
                 if not isinstance(value, (int, float)):
                     continue
-                if key == "num_steps":
+                if key in {"num_steps", "num_generate_batches"}:
                     weight = 1.0
                     weighted_value = float(value)
                 elif key == "num_episodes":
@@ -255,7 +255,7 @@ def _aggregate_metrics(results: list[Result]) -> dict[str, dict[str, float]]:
     for mode, metrics in per_mode_values.items():
         aggregate[mode] = {}
         for key, values in metrics.items():
-            if key in {"num_steps", "num_episodes"}:
+            if key in {"num_steps", "num_episodes", "num_generate_batches"}:
                 aggregate[mode][key] = sum(value for value, _ in values)
                 continue
             weighted_total = sum(value * weight for value, weight in values)

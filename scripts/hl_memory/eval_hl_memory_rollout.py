@@ -168,7 +168,17 @@ def _evaluate_with_progress(
             )
         finally:
             progress_bar.close()
-        logging.info("[stage] finished mode=%s in %.1fs", mode, time.perf_counter() - mode_started_at)
+        mode_metrics = metrics[mode]
+        logging.info(
+            "[stage] finished mode=%s in %.1fs requested_batch=%.0f actual_batch_mean=%.2f "
+            "actual_batch_max=%.0f generate_batches=%.0f",
+            mode,
+            time.perf_counter() - mode_started_at,
+            mode_metrics.get("eval_batch_size_requested", float(batch_size)),
+            mode_metrics.get("actual_eval_batch_size_mean", 0.0),
+            mode_metrics.get("actual_eval_batch_size_max", 0.0),
+            mode_metrics.get("num_generate_batches", 0.0),
+        )
     return metrics
 
 

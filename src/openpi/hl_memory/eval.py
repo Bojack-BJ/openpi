@@ -145,21 +145,30 @@ def run_offline_rollout_batched(
     on_sample_done: Callable[[ExportedHLMemorySample], None] | None = None,
 ) -> dict[str, float]:
     if batch_size <= 1:
+        sample_count = sum(len(episode_samples) for episode_samples in samples_by_episode.values())
+
         def predict_one(sample: ExportedHLMemorySample) -> HLMemoryPrediction:
             prediction = predict_batch_fn([sample])[0]
             if on_sample_done is not None:
                 on_sample_done(sample)
             return prediction
 
-        return run_offline_rollout(
+        metrics = run_offline_rollout(
             samples_by_episode,
             hl_config,
             predict_one,
             mode=mode,
         )
+        if metrics:
+            metrics["eval_batch_size_requested"] = float(batch_size)
+            metrics["actual_eval_batch_size_mean"] = 1.0
+            metrics["actual_eval_batch_size_max"] = 1.0
+            metrics["num_generate_batches"] = float(sample_count)
+        return metrics
 
     totals: dict[str, float] = defaultdict(float)
     total_steps = 0
+    actual_batch_sizes: list[int] = []
     states = {
         episode_index: _EpisodeRolloutState(episode_samples, hl_config)
         for episode_index, episode_samples in samples_by_episode.items()
@@ -178,6 +187,7 @@ def run_offline_rollout_batched(
             states[episode_index].runtime_sample(mode=mode)
             for episode_index in batch_episode_indices
         ]
+        actual_batch_sizes.append(len(batch_samples))
         predictions = list(predict_batch_fn(batch_samples))
         if len(predictions) != len(batch_samples):
             raise ValueError(f"Expected {len(batch_samples)} predictions, got {len(predictions)}.")
@@ -207,6 +217,12 @@ def run_offline_rollout_batched(
     metrics["episode_sequence_accuracy"] = exact_sequence_episodes / max(episode_count, 1)
     metrics["num_steps"] = float(total_steps)
     metrics["num_episodes"] = float(episode_count)
+    metrics["eval_batch_size_requested"] = float(batch_size)
+    metrics["actual_eval_batch_size_mean"] = (
+        sum(actual_batch_sizes) / len(actual_batch_sizes) if actual_batch_sizes else 0.0
+    )
+    metrics["actual_eval_batch_size_max"] = float(max(actual_batch_sizes, default=0))
+    metrics["num_generate_batches"] = float(len(actual_batch_sizes))
     return dict(metrics)
 
 
