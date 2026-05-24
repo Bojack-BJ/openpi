@@ -89,6 +89,11 @@ def parse_args() -> argparse.Namespace:
         help="Pass --progress-sample-fractions to the exporter.",
     )
     parser.add_argument(
+        "--progress-extra-fractions",
+        default="",
+        help="Pass --progress-extra-fractions to the exporter.",
+    )
+    parser.add_argument(
         "--progress-sample-target-frames",
         type=int,
         default=0,
@@ -224,6 +229,7 @@ def main() -> None:
             goal_query=args.goal_query,
             emit_success_events=args.emit_success_events,
             progress_sample_fractions=args.progress_sample_fractions,
+            progress_extra_fractions=args.progress_extra_fractions,
             progress_sample_target_frames=args.progress_sample_target_frames,
             progress_sample_jitter=args.progress_sample_jitter,
             progress_sample_seed=args.progress_sample_seed,
@@ -375,6 +381,7 @@ def build_export_command(
     goal_query: str,
     emit_success_events: bool,
     progress_sample_fractions: str,
+    progress_extra_fractions: str,
     progress_sample_target_frames: int,
     progress_sample_jitter: float,
     progress_sample_seed: int,
@@ -402,6 +409,8 @@ def build_export_command(
         cmd.append("--emit-success-events")
     if progress_sample_fractions:
         cmd.extend(["--progress-sample-fractions", progress_sample_fractions])
+    if progress_extra_fractions:
+        cmd.extend(["--progress-extra-fractions", progress_extra_fractions])
     if progress_sample_target_frames > 0:
         cmd.extend(["--progress-sample-target-frames", str(progress_sample_target_frames)])
     if progress_sample_jitter > 0:

@@ -100,6 +100,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --workers 8 \
   --progress-sample-target-frames 40 \
+  --progress-extra-fractions 0.85,0.9,0.95 \
   --min-progress-samples-per-segment 2 \
   --max-progress-samples-per-segment 10 \
   --progress-sample-jitter 0.05 \
@@ -165,9 +166,10 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
 num_samples = clamp(segment_length / target_frames, min_samples, max_samples)
 fractions = 1/(n+1), 2/(n+1), ..., n/(n+1)
 optional jitter: fraction += uniform(-jitter, +jitter)
+extra_fractions: add late-stage candidates such as 0.85/0.9/0.95
 ```
 
-也就是说，`--progress-sample-target-frames` 不是直接每 N 帧固定 stride 取点，而是用 N 决定这个 segment 应该采几个内部 progress 点；位置仍按 segment 内部比例均匀铺开。`subtask_boundary` 覆盖 start，`--emit-success-events` 覆盖 end，所以 progress samples 不包含两端。
+也就是说，`--progress-sample-target-frames` 不是直接每 N 帧固定 stride 取点，而是用 N 决定这个 segment 应该采几个内部 progress 点；位置仍按 segment 内部比例均匀铺开。`--progress-extra-fractions` 会在动态/固定/stride/midpoint 采样基础上额外补 late-stage 候选点，仍然受 `--progress-min-gap` 和 `--max-progress-samples-per-segment` 约束。`subtask_boundary` 覆盖 start，`--emit-success-events` 覆盖 end，所以 progress samples 不包含两端。
 
 固定比例采样适合 segment 长度差异不大、希望分布稳定的任务：
 
@@ -192,6 +194,7 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --instruction "Put the target object into the target slot" \
   --progress-sample-target-frames 40 \
+  --progress-extra-fractions 0.85,0.9,0.95 \
   --min-progress-samples-per-segment 2 \
   --max-progress-samples-per-segment 10 \
   --progress-sample-jitter 0.05 \
@@ -201,7 +204,7 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
-`--progress-sample-fractions` 优先级高于 `--progress-sample-target-frames`，两者都不设置时才回退到 `--progress-sample-stride` / midpoint 旧逻辑。`--progress-sample-jitter` 是 deterministic 的：同一 seed、episode、segment 会生成相同采样点，重跑可复现；不同 episode/segment 的 progress 不会永远落在完全相同的比例位置。正式训练前建议抽查 `hl_annotations.jsonl` 的 progress 分布，确认每个常见 subtask 至少包含 early/mid/late/end 样本。
+`--progress-sample-fractions` 优先级高于 `--progress-sample-target-frames`，两者都不设置时才回退到 `--progress-sample-stride` / midpoint 旧逻辑。`--progress-extra-fractions` 不参与优先级判断，它总是在主采样模式后额外添加候选点，适合强化切换前的 late-stage 状态。`--progress-sample-jitter` 是 deterministic 的：同一 seed、episode、segment 会生成相同采样点，重跑可复现；不同 episode/segment 的 progress 不会永远落在完全相同的比例位置。正式训练前建议抽查 `hl_annotations.jsonl` 的 progress 分布，确认每个常见 subtask 至少包含 early/mid/late/end 样本。
 
 ### 3. LLM GT Normalization Before Dataset Export
 

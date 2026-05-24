@@ -93,6 +93,15 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--progress-extra-fractions",
+        default="",
+        help=(
+            "Comma-separated additional relative positions inside each segment, for example '0.85,0.9,0.95'. "
+            "These are added on top of dynamic/stride/default progress sampling and still respect "
+            "--progress-min-gap and --max-progress-samples-per-segment."
+        ),
+    )
+    parser.add_argument(
         "--progress-sample-target-frames",
         type=int,
         default=0,
@@ -379,6 +388,7 @@ def _segments_to_rows(
             subtask=subtask,
             stride=args.progress_sample_stride,
             fractions=_parse_progress_sample_fractions(args.progress_sample_fractions),
+            extra_fractions=_parse_progress_sample_fractions(args.progress_extra_fractions),
             target_frames=args.progress_sample_target_frames,
             min_samples=args.min_progress_samples_per_segment,
             max_samples=args.max_progress_samples_per_segment,
@@ -431,6 +441,7 @@ def _progress_sample_frames(
     subtask: str,
     stride: int,
     fractions: list[float],
+    extra_fractions: list[float],
     target_frames: int,
     min_samples: int,
     max_samples: int,
@@ -445,6 +456,7 @@ def _progress_sample_frames(
     2. sample locations are evenly spaced fractions inside the segment, not raw stride positions.
     3. optional deterministic jitter perturbs those fractions per episode/subtask so labels are not always at fixed
        0.25/0.5/0.75-style positions.
+    4. `extra_fractions` can add late-stage samples such as 0.85/0.9/0.95 on top of the primary mode.
 
     Endpoints are intentionally excluded: `subtask_boundary` covers the start and `--emit-success-events` can cover
     `end - 1`.
@@ -490,6 +502,17 @@ def _progress_sample_frames(
         candidates.append(middle)
     if stride > 0 and not fractions and target_frames <= 0:
         candidates.extend(range(start + stride, end, stride))
+    if extra_fractions:
+        effective_extra_fractions = _jitter_fractions(
+            extra_fractions,
+            jitter=jitter,
+            seed=seed + 1,
+            episode_index=episode_index,
+            subtask=subtask,
+            start=start,
+            end=end,
+        )
+        candidates.extend(_frames_from_fractions(start, end, effective_extra_fractions))
 
     raw_unique = sorted({int(frame) for frame in candidates if start < int(frame) < end})
     unique = _apply_progress_min_gap(raw_unique, anchor=anchor, min_gap=min_gap)
