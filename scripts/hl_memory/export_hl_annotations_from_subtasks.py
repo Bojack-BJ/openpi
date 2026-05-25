@@ -393,6 +393,7 @@ def _segments_to_rows(
             min_samples=args.min_progress_samples_per_segment,
             max_samples=args.max_progress_samples_per_segment,
             min_gap=args.progress_min_gap,
+            reserved_frames=(start, end - 1) if args.emit_success_events else (start,),
             jitter=args.progress_sample_jitter,
             seed=args.progress_sample_seed,
         ):
@@ -417,7 +418,7 @@ def _segments_to_rows(
                     args=args,
                 )
             )
-    return rows
+    return _dedupe_rows(rows)
 
 
 def _parse_progress_sample_fractions(value: str) -> list[float]:
@@ -446,6 +447,7 @@ def _progress_sample_frames(
     min_samples: int,
     max_samples: int,
     min_gap: int = 0,
+    reserved_frames: tuple[int, ...] = (),
     jitter: float = 0.0,
     seed: int = 0,
 ) -> list[int]:
@@ -514,12 +516,13 @@ def _progress_sample_frames(
         )
         candidates.extend(_frames_from_fractions(start, end, effective_extra_fractions))
 
-    raw_unique = sorted({int(frame) for frame in candidates if start < int(frame) < end})
-    unique = _apply_progress_min_gap(raw_unique, anchor=anchor, min_gap=min_gap)
+    reserved_set = {int(frame) for frame in reserved_frames}
+    raw_unique = sorted({int(frame) for frame in candidates if start < int(frame) < end and int(frame) not in reserved_set})
+    unique = _apply_progress_min_gap(raw_unique, anchor=anchor, min_gap=min_gap, reserved_frames=reserved_frames)
     min_budget = min(max(min_samples, 0), max_samples)
     if target_frames > 0 and len(unique) < min_budget:
         for frame in _prioritize_coverage(raw_unique, anchor=anchor):
-            if frame not in unique:
+            if frame not in unique and not _violates_min_gap(frame, unique, min_gap=min_gap, reserved_frames=reserved_frames):
                 unique.append(frame)
             if len(unique) >= min_budget:
                 break
@@ -556,19 +559,33 @@ def _jitter_fractions(
     return sorted(jittered)
 
 
-def _apply_progress_min_gap(values: list[int], *, anchor: int, min_gap: int) -> list[int]:
-    if min_gap <= 0 or len(values) <= 1:
+def _apply_progress_min_gap(
+    values: list[int],
+    *,
+    anchor: int,
+    min_gap: int,
+    reserved_frames: tuple[int, ...] = (),
+) -> list[int]:
+    if min_gap <= 0:
         return values
 
     selected: list[int] = []
-    if anchor in values:
+    if anchor in values and not _violates_min_gap(anchor, selected, min_gap=min_gap, reserved_frames=reserved_frames):
         selected.append(anchor)
     for value in _prioritize_coverage(values, anchor=anchor):
         if value == anchor:
             continue
-        if all(abs(value - existing) >= min_gap for existing in selected):
+        if not _violates_min_gap(value, selected, min_gap=min_gap, reserved_frames=reserved_frames):
             selected.append(value)
     return sorted(selected)
+
+
+def _violates_min_gap(value: int, selected: list[int], *, min_gap: int, reserved_frames: tuple[int, ...]) -> bool:
+    if min_gap <= 0:
+        return False
+    return any(abs(value - existing) < min_gap for existing in selected) or any(
+        abs(value - reserved) < min_gap for reserved in reserved_frames
+    )
 
 
 def _prioritize_coverage(values: list[int], *, anchor: int) -> list[int]:
@@ -624,6 +641,28 @@ def _sort_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
             str(row["current_subtask"]),
         ),
     )
+
+
+def _dedupe_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Drop duplicate labels for the same subtask at the same frame.
+
+    Dense progress fractions can round onto the success frame, especially for
+    short segments. Keep the strongest event label for that subtask/frame.
+    """
+
+    event_priority = {"progress": 0, "subtask_boundary": 1, "success": 2}
+    deduped: dict[tuple[int, int, str], dict[str, object]] = {}
+    for row in rows:
+        key = (int(row["episode_index"]), int(row["frame_index"]), str(row["current_subtask"]))
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = row
+            continue
+        current_priority = event_priority.get(str(row["event_type"]), 0)
+        existing_priority = event_priority.get(str(existing["event_type"]), 0)
+        if current_priority > existing_priority:
+            deduped[key] = row
+    return _sort_rows(list(deduped.values()))
 
 
 if __name__ == "__main__":
