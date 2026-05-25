@@ -126,6 +126,33 @@ def _parse_args() -> argparse.Namespace:
         help="Seed for deterministic progress sample jitter.",
     )
     parser.add_argument(
+        "--short-segment-max-frames",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, segments with length <= this threshold use --short-segment-progress-fractions instead of the "
+            "regular dynamic/stride progress sampler. This prevents very short segments from only contributing "
+            "start/success labels."
+        ),
+    )
+    parser.add_argument(
+        "--short-segment-progress-fractions",
+        default="",
+        help=(
+            "Comma-separated progress fractions for short segments, for example '0.25,0.5,0.75'. Used only when "
+            "--short-segment-max-frames > 0 and the segment is short enough."
+        ),
+    )
+    parser.add_argument(
+        "--short-segment-progress-min-gap",
+        type=int,
+        default=-1,
+        help=(
+            "Minimum frame gap for short-segment progress samples. Use -1 to adaptively cap the normal "
+            "--progress-min-gap so short segments can still keep internal samples."
+        ),
+    )
+    parser.add_argument(
         "--min-progress-samples-per-segment",
         type=int,
         default=0,
@@ -370,6 +397,9 @@ def _segments_to_rows(
     args: argparse.Namespace,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
+    progress_fractions = _parse_progress_sample_fractions(args.progress_sample_fractions)
+    progress_extra_fractions = _parse_progress_sample_fractions(args.progress_extra_fractions)
+    short_segment_fractions = _parse_progress_sample_fractions(args.short_segment_progress_fractions)
     for start, end, subtask in segments:
         rows.append(
             _make_row(
@@ -381,18 +411,32 @@ def _segments_to_rows(
                 args=args,
             )
         )
+        sampling = _progress_sampling_config(
+            start=start,
+            end=end,
+            stride=args.progress_sample_stride,
+            fractions=progress_fractions,
+            extra_fractions=progress_extra_fractions,
+            target_frames=args.progress_sample_target_frames,
+            min_samples=args.min_progress_samples_per_segment,
+            max_samples=args.max_progress_samples_per_segment,
+            min_gap=args.progress_min_gap,
+            short_segment_max_frames=args.short_segment_max_frames,
+            short_segment_fractions=short_segment_fractions,
+            short_segment_min_gap=args.short_segment_progress_min_gap,
+        )
         for progress_frame in _progress_sample_frames(
             start,
             end,
             episode_index=episode_index,
             subtask=subtask,
-            stride=args.progress_sample_stride,
-            fractions=_parse_progress_sample_fractions(args.progress_sample_fractions),
-            extra_fractions=_parse_progress_sample_fractions(args.progress_extra_fractions),
-            target_frames=args.progress_sample_target_frames,
-            min_samples=args.min_progress_samples_per_segment,
-            max_samples=args.max_progress_samples_per_segment,
-            min_gap=args.progress_min_gap,
+            stride=sampling["stride"],
+            fractions=sampling["fractions"],
+            extra_fractions=sampling["extra_fractions"],
+            target_frames=sampling["target_frames"],
+            min_samples=sampling["min_samples"],
+            max_samples=sampling["max_samples"],
+            min_gap=sampling["min_gap"],
             reserved_frames=(start, end - 1) if args.emit_success_events else (start,),
             jitter=args.progress_sample_jitter,
             seed=args.progress_sample_seed,
@@ -432,6 +476,74 @@ def _parse_progress_sample_fractions(value: str) -> list[float]:
             raise ValueError(f"progress sample fraction must be in (0, 1), got {fraction}")
         fractions.append(fraction)
     return fractions
+
+
+def _progress_sampling_config(
+    *,
+    start: int,
+    end: int,
+    stride: int,
+    fractions: list[float],
+    extra_fractions: list[float],
+    target_frames: int,
+    min_samples: int,
+    max_samples: int,
+    min_gap: int,
+    short_segment_max_frames: int,
+    short_segment_fractions: list[float],
+    short_segment_min_gap: int,
+) -> dict[str, object]:
+    length = end - start
+    use_short_mode = short_segment_max_frames > 0 and length <= short_segment_max_frames and bool(short_segment_fractions)
+    if not use_short_mode:
+        return {
+            "stride": stride,
+            "fractions": fractions,
+            "extra_fractions": extra_fractions,
+            "target_frames": target_frames,
+            "min_samples": min_samples,
+            "max_samples": max_samples,
+            "min_gap": min_gap,
+        }
+
+    return {
+        "stride": 0,
+        "fractions": short_segment_fractions,
+        "extra_fractions": [],
+        "target_frames": 0,
+        "min_samples": 0,
+        "max_samples": max(max_samples, len(short_segment_fractions)),
+        "min_gap": _short_segment_min_gap(
+            length=length,
+            fractions=short_segment_fractions,
+            normal_min_gap=min_gap,
+            short_segment_min_gap=short_segment_min_gap,
+        ),
+    }
+
+
+def _short_segment_min_gap(
+    *,
+    length: int,
+    fractions: list[float],
+    normal_min_gap: int,
+    short_segment_min_gap: int,
+) -> int:
+    if short_segment_min_gap >= 0:
+        return short_segment_min_gap
+    if normal_min_gap <= 0 or not fractions:
+        return normal_min_gap
+
+    # For a 20-frame segment with 0.25/0.5/0.75 samples and a success label at
+    # end - 1, a global min_gap=5 would drop the 0.75 sample. Cap the gap by the
+    # smallest expected spacing to reserved endpoints/internal samples.
+    expected_frames = [int(round(length * fraction)) for fraction in fractions]
+    anchors = [0, length - 1]
+    sorted_points = sorted({*anchors, *expected_frames})
+    positive_gaps = [right - left for left, right in zip(sorted_points, sorted_points[1:]) if right > left]
+    if not positive_gaps:
+        return normal_min_gap
+    return max(1, min(normal_min_gap, min(positive_gaps)))
 
 
 def _progress_sample_frames(

@@ -204,6 +204,29 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
+如果存在很短的 segment，例如 20 帧左右，普通 `--progress-min-gap` 和 late fractions 可能只留下 start/success，导致模型看不到连续 progress。可以对短 segment 单独启用自适应固定比例采样：
+
+```bash
+python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
+  --repo-id fastumi/sponge_visual_guided_xarm \
+  --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
+  --instruction "Put the target object into the target slot" \
+  --progress-sample-target-frames 40 \
+  --progress-extra-fractions 0.85,0.9,0.95 \
+  --min-progress-samples-per-segment 2 \
+  --max-progress-samples-per-segment 10 \
+  --progress-sample-jitter 0.05 \
+  --progress-sample-seed 42 \
+  --progress-min-gap 10 \
+  --short-segment-max-frames 30 \
+  --short-segment-progress-fractions 0.25,0.5,0.75 \
+  --short-segment-progress-min-gap -1 \
+  --emit-success-events \
+  --overwrite
+```
+
+`--short-segment-progress-min-gap -1` 会自动把全局 `--progress-min-gap` cap 到短 segment 内部采样点和 start/end 的最小间距，避免 20 帧 segment 里的 `0.75` 因为离 success 太近被删掉。如果想完全手动控制，可以设成 `2` 或 `3`。
+
 `--progress-sample-fractions` 优先级高于 `--progress-sample-target-frames`，两者都不设置时才回退到 `--progress-sample-stride` / midpoint 旧逻辑。`--progress-extra-fractions` 不参与优先级判断，它总是在主采样模式后额外添加候选点，适合强化切换前的 late-stage 状态。`--progress-sample-jitter` 是 deterministic 的：同一 seed、episode、segment 会生成相同采样点，重跑可复现；不同 episode/segment 的 progress 不会永远落在完全相同的比例位置。正式训练前建议抽查 `hl_annotations.jsonl` 的 progress 分布，确认每个常见 subtask 至少包含 early/mid/late/end 样本。
 
 ### 3. LLM GT Normalization Before Dataset Export
