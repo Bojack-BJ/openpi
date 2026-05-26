@@ -269,6 +269,43 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
 
 `--parallel-workers 4` 会自动把 4 个进程绑定到前 4 张可见 GPU。如果需要手动分组，可以用 `--worker-gpu-groups "0;1;2;3"` 表示 4 个进程各用一张卡，或 `"0,1;2,3"` 表示 2 个进程、每个进程内部用 `device_map auto` 切 2 张卡。27B 如果单卡放不下，就不要用一卡一进程，改用多卡分组。`--memory-summary-mode code --max-new-tokens 128` 是最快组合；如果希望 history summary 也由 LLM 精修，用 `--memory-summary-mode llm`，但它仍然只在 task sidecar 阶段执行一次。
 
+如果要多台机器同时跑，先用 divide 脚本按 task 的 input row 数做均衡切分。它不会加载模型，只会生成 `summary.json`、每个 shard 的 task list 和可直接复制执行的 command：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/divide_hl_annotation_normalize_tasks.py \
+  --annotation-root /root/Users/dataset/lerobot_home/subtask \
+  --shards 4 \
+  --output-dir /root/Users/dataset/hl_memory/normalize_shards \
+  --skip-existing \
+  -- \
+  --model-path /root/Users/lixiaotong/Qwen3.5-27B \
+  --device-map auto \
+  --granularity task \
+  --memory-summary-mode llm \
+  --max-new-tokens 128 \
+  --skip-existing \
+  --continue-on-error
+```
+
+输出示例：
+
+```text
+/root/Users/dataset/hl_memory/normalize_shards/
+  summary.json
+  shard_000_tasks.txt
+  shard_000_command.sh
+  shard_001_tasks.txt
+  shard_001_command.sh
+```
+
+每台机器只运行一个 shard 的 command，例如：
+
+```bash
+bash /root/Users/dataset/hl_memory/normalize_shards/shard_000_command.sh
+```
+
+`--skip-existing` 在 divide 阶段会把已经完成的 task 排除；生成的 command 里也建议继续保留 `--skip-existing`，这样某台机器中断后可以重跑同一个 shard。切分逻辑按 `hl_annotations.jsonl` 行数做贪心均衡，不是简单按 task 数平均，所以大任务不会集中到同一台机器。
+
 输出默认写在每个 task 目录：
 
 ```text
