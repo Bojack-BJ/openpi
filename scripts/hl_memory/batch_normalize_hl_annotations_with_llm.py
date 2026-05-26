@@ -94,10 +94,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--torch-dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--llm-batch-size", type=int, default=1, help="Forwarded to normalize_hl_annotations_with_llm.py.")
     parser.add_argument("--limit-per-task", type=int, default=None)
     parser.add_argument("--granularity", choices=["task", "segment", "row"], default="task")
     parser.add_argument("--memory-summary-mode", choices=["llm", "code"], default="llm")
     parser.add_argument("--advance-threshold", type=float, default=0.85)
+    parser.add_argument(
+        "--subtask-progress-quantum",
+        type=float,
+        default=0.05,
+        help="Round GT subtask_progress to the nearest quantum. Use 0 to keep raw frame-ratio floats.",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--overwrite",

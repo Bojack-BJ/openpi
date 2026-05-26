@@ -65,6 +65,7 @@ class ExportArgs:
     merge_distance: int = 5
     frame_height: int = 224
     frame_width: int = 456
+    subtask_progress_quantum: float = 0.05
     overwrite: bool = False
 
 
@@ -203,6 +204,7 @@ def _export_split(
                 output_dir=output_dir,
                 frame_cache=frame_cache,
                 hl_config=hl_config,
+                subtask_progress_quantum=args.subtask_progress_quantum,
             )
         )
 
@@ -436,6 +438,7 @@ def _export_episode(
     output_dir: pathlib.Path,
     frame_cache: dict[int, str],
     hl_config: HLMemoryConfig,
+    subtask_progress_quantum: float,
 ) -> list[ExportedHLMemorySample]:
     episode_start_time = time.perf_counter()
     progress_state = TaskProgressState()
@@ -507,7 +510,7 @@ def _export_episode(
             current_objective=str(next_memory_fields["current_objective"]),
             relevant_objects=tuple(next_memory_fields["relevant_objects"]),  # type: ignore[arg-type]
             notes=str(next_memory_fields["notes"]),
-            subtask_progress=annotation.subtask_progress,
+            subtask_progress=_quantize_optional_progress(annotation.subtask_progress, subtask_progress_quantum),
             should_advance_objective=annotation.should_advance_objective,
             active_hand=annotation.active_hand,
         )
@@ -785,6 +788,16 @@ def _write_jsonl(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+
+
+def _quantize_optional_progress(value: float | None, quantum: float) -> float | None:
+    if value is None:
+        return None
+    if quantum <= 0.0:
+        return float(min(max(value, 0.0), 1.0))
+    clipped = min(max(float(value), 0.0), 1.0)
+    quantized = round(clipped / quantum) * quantum
+    return float(round(min(max(quantized, 0.0), 1.0), 6))
 
 
 if __name__ == "__main__":

@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Exclude tasks whose normalized output already has at least as many rows as the input.",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Add --overwrite to generated normalize commands and ignore existing outputs when selecting tasks.",
+    )
     parser.add_argument("--normalize-script", type=pathlib.Path, default=DEFAULT_NORMALIZE_SCRIPT)
     parser.add_argument("--python-bin", default="python")
     parser.add_argument("--env-prefix", default="PYTHONPATH=src")
@@ -121,7 +126,7 @@ def discover_tasks(args: argparse.Namespace, *, annotation_root: pathlib.Path) -
         output_jsonl = resolve_normalize_output(args, task_id=task_id, task_dir=task_dir)
         input_rows = count_jsonl_lines(input_jsonl) or 0
         output_rows = count_jsonl_lines(output_jsonl)
-        if args.skip_existing and output_rows is not None and output_rows >= input_rows:
+        if args.skip_existing and not args.overwrite and output_rows is not None and output_rows >= input_rows:
             continue
         tasks.append(
             TaskInfo(
@@ -173,6 +178,8 @@ def build_command(args: argparse.Namespace, *, task_ids: list[str], normalize_ar
     )
     if args.normalize_output_root is not None:
         parts.extend(["--output-root", str(args.normalize_output_root)])
+    if args.overwrite:
+        parts.append("--overwrite")
     if task_ids:
         parts.append("--only-task-id")
         parts.extend(task_ids)

@@ -110,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--short-segment-max-frames", type=int, default=0, help="Forward to annotation exporter.")
     parser.add_argument("--short-segment-progress-fractions", default="", help="Forward to annotation exporter.")
     parser.add_argument("--short-segment-progress-min-gap", type=int, default=-1, help="Forward to annotation exporter.")
+    parser.add_argument(
+        "--subtask-progress-quantum",
+        type=float,
+        default=0.05,
+        help="Forward to export_hl_memory_dataset.py. Use 0 to keep raw progress floats.",
+    )
     parser.add_argument("--export-script", type=Path, default=DEFAULT_EXPORT_SCRIPT)
     parser.add_argument("--annotation-script", type=Path, default=DEFAULT_ANNOTATION_SCRIPT)
     parser.add_argument("--summary-json", type=Path, default=None)
@@ -271,6 +277,8 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             str(args.split_seed),
             "--missing-episode-policy",
             args.missing_episode_policy,
+            "--subtask-progress-quantum",
+            str(args.subtask_progress_quantum),
         ]
         if args.overwrite:
             cmd.append("--overwrite")

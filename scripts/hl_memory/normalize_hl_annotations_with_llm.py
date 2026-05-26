@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device-map", default="auto")
     parser.add_argument("--torch-dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument(
+        "--llm-batch-size",
+        type=int,
+        default=1,
+        help="Number of text prompts to batch in each model.generate call. Increase to improve GPU utilization.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--granularity", choices=["task", "segment", "row"], default="task")
@@ -64,6 +70,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--memory-summary-mode", choices=["llm", "code"], default="llm")
     parser.add_argument("--advance-threshold", type=float, default=0.85)
+    parser.add_argument(
+        "--subtask-progress-quantum",
+        type=float,
+        default=0.05,
+        help="Round GT subtask_progress to the nearest quantum. Use 0 to keep raw frame-ratio floats.",
+    )
     return parser.parse_args()
 
 
@@ -137,22 +149,21 @@ def _normalize_rows_per_row(
     stream: Any,
 ) -> None:
     grouped = _group_by_episode(rows)
-    for row in tqdm(rows, desc="Normalize HL annotations", unit="row"):
-        key = _row_key(row)
-        if key in done:
-            continue
-        prompt = _build_prompt(row, grouped.get(int(row["episode_index"]), []))
-        raw_response = _generate(tokenizer, model, prompt, max_new_tokens=args.max_new_tokens)
-        normalized, parse_error = _parse_normalized_response(raw_response)
-        output = dict(row)
-        if normalized is not None:
-            output.update(normalized)
-        output["llm_gt"] = normalized
-        output["llm_model"] = str(args.model_path)
-        output["prompt_version"] = "hl_gt_normalizer_v1_row"
-        output["raw_response"] = raw_response
-        output["parse_error"] = parse_error
-        stream.write(json.dumps(output, ensure_ascii=False) + "\n")
+    pending = [row for row in rows if _row_key(row) not in done]
+    for row_batch in tqdm(_chunks(pending, _llm_batch_size(args)), desc="Normalize HL annotations", unit="batch"):
+        prompts = [_build_prompt(row, grouped.get(int(row["episode_index"]), [])) for row in row_batch]
+        raw_responses = _generate_many(tokenizer, model, prompts, max_new_tokens=args.max_new_tokens)
+        for row, raw_response in zip(row_batch, raw_responses, strict=True):
+            normalized, parse_error = _parse_normalized_response(raw_response)
+            output = dict(row)
+            if normalized is not None:
+                output.update(normalized)
+            output["llm_gt"] = normalized
+            output["llm_model"] = str(args.model_path)
+            output["prompt_version"] = "hl_gt_normalizer_v1_row"
+            output["raw_response"] = raw_response
+            output["parse_error"] = parse_error
+            stream.write(json.dumps(output, ensure_ascii=False) + "\n")
         stream.flush()
 
 
@@ -198,6 +209,7 @@ def _normalize_rows_by_segment(
                 template=template,
                 task_progress=progress_summaries.get(segment.segment_index, "No completed subtask yet."),
                 advance_threshold=float(args.advance_threshold),
+                progress_quantum=float(args.subtask_progress_quantum),
             )
             output = dict(row)
             output.update(normalized)
@@ -258,6 +270,7 @@ def _normalize_rows_by_task_sidecar(
                 template=template,
                 task_progress=progress_summaries.get(canonical_index, "No completed subtask yet."),
                 advance_threshold=float(args.advance_threshold),
+                progress_quantum=float(args.subtask_progress_quantum),
             )
             output = dict(row)
             output.update(normalized)
@@ -489,10 +502,18 @@ def _normalize_segments(
     templates: dict[int, SegmentTemplate] = {}
     context = _compact_segment_context(episode_rows)
     instruction = _first_nonempty(str(row.get("instruction", "")).strip() for row in episode_rows) or "unspecified"
-    for segment in tqdm(segments, desc=f"Normalize segments e{segments[0].episode_index}", unit="segment", leave=False):
-        prompt = _build_segment_prompt(segment, instruction=instruction, segment_context=context)
-        raw_response = _generate(tokenizer, model, prompt, max_new_tokens=args.max_new_tokens)
-        templates[segment.segment_index] = _parse_segment_response(raw_response, fallback_subtask=segment.raw_subtask)
+    for segment_batch in tqdm(
+        _chunks(segments, _llm_batch_size(args)),
+        desc=f"Normalize segments e{segments[0].episode_index}",
+        unit="batch",
+        leave=False,
+    ):
+        prompts = [
+            _build_segment_prompt(segment, instruction=instruction, segment_context=context) for segment in segment_batch
+        ]
+        raw_responses = _generate_many(tokenizer, model, prompts, max_new_tokens=args.max_new_tokens)
+        for segment, raw_response in zip(segment_batch, raw_responses, strict=True):
+            templates[segment.segment_index] = _parse_segment_response(raw_response, fallback_subtask=segment.raw_subtask)
     return templates
 
 
@@ -505,18 +526,33 @@ def _build_progress_summaries(
     model: Any,
 ) -> dict[int | str, str]:
     summaries: dict[int | str, str] = {0: "No completed subtask yet."}
-    for segment in tqdm(segments[1:], desc=f"Summarize progress e{segments[0].episode_index}", unit="prefix", leave=False):
+    pending_prompts: list[tuple[SegmentInfo, str]] = []
+    for segment in segments[1:]:
         completed_templates = [templates[index] for index in range(segment.segment_index)]
         if args.memory_summary_mode == "code":
             summaries[segment.segment_index] = _code_progress_summary(completed_templates)
             continue
         prompt = _build_progress_summary_prompt(completed_templates)
-        raw_response = _generate(tokenizer, model, prompt, max_new_tokens=min(int(args.max_new_tokens), 256))
-        parsed, parse_error = _parse_progress_summary_response(raw_response)
-        summaries[segment.segment_index] = parsed or _code_progress_summary(completed_templates)
-        if parse_error:
-            summaries[f"{segment.segment_index}:parse_error"] = parse_error
-        summaries[f"{segment.segment_index}:raw_response"] = raw_response
+        pending_prompts.append((segment, prompt))
+    for prompt_batch in tqdm(
+        _chunks(pending_prompts, _llm_batch_size(args)),
+        desc=f"Summarize progress e{segments[0].episode_index}",
+        unit="batch",
+        leave=False,
+    ):
+        raw_responses = _generate_many(
+            tokenizer,
+            model,
+            [prompt for _segment, prompt in prompt_batch],
+            max_new_tokens=min(int(args.max_new_tokens), 256),
+        )
+        for (segment, _prompt), raw_response in zip(prompt_batch, raw_responses, strict=True):
+            completed_templates = [templates[index] for index in range(segment.segment_index)]
+            parsed, parse_error = _parse_progress_summary_response(raw_response)
+            summaries[segment.segment_index] = parsed or _code_progress_summary(completed_templates)
+            if parse_error:
+                summaries[f"{segment.segment_index}:parse_error"] = parse_error
+            summaries[f"{segment.segment_index}:raw_response"] = raw_response
     return summaries
 
 
@@ -672,8 +708,9 @@ def _expand_row_from_segment(
     template: SegmentTemplate,
     task_progress: str,
     advance_threshold: float,
+    progress_quantum: float,
 ) -> dict[str, Any]:
-    subtask_progress = _subtask_progress(row, segment)
+    subtask_progress = _quantize_progress(_subtask_progress(row, segment), progress_quantum)
     should_advance = bool(str(row.get("event_type", "")) == "success" or subtask_progress >= advance_threshold)
     relevant_objects = template.relevant_objects or _parse_objects([template.target_query, template.goal_query])
     return {
@@ -695,6 +732,14 @@ def _subtask_progress(row: dict[str, Any], segment: SegmentInfo) -> float:
     if str(row.get("event_type", "")) == "success":
         value = 1.0
     return float(min(max(value, 0.0), 1.0))
+
+
+def _quantize_progress(value: float, quantum: float) -> float:
+    if quantum <= 0.0:
+        return float(min(max(value, 0.0), 1.0))
+    clipped = min(max(float(value), 0.0), 1.0)
+    quantized = round(clipped / quantum) * quantum
+    return float(round(min(max(quantized, 0.0), 1.0), 6))
 
 
 def _code_progress_summary(completed_templates: list[SegmentTemplate]) -> str:
@@ -762,28 +807,52 @@ def _compact_segment_context(rows: list[dict[str, Any]]) -> str:
     return "\n".join(items[:40]) or "- unspecified"
 
 
+def _llm_batch_size(args: argparse.Namespace) -> int:
+    return max(int(getattr(args, "llm_batch_size", 1)), 1)
+
+
+def _chunks(items: list[Any], size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def _generate(tokenizer, model, prompt: str, *, max_new_tokens: int) -> str:
+    return _generate_many(tokenizer, model, [prompt], max_new_tokens=max_new_tokens)[0]
+
+
+def _generate_many(tokenizer, model, prompts: list[str], *, max_new_tokens: int) -> list[str]:
     import torch
 
-    messages = [
-        {"role": "system", "content": "You produce strict JSON for robot training labels."},
-        {"role": "user", "content": prompt},
-    ]
+    if not prompts:
+        return []
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
-    if apply_chat_template is not None:
-        try:
-            rendered = apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        except TypeError:
-            rendered = apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    else:
-        rendered = prompt
-    inputs = tokenizer([rendered], return_tensors="pt")
+    rendered_prompts: list[str] = []
+    for prompt in prompts:
+        messages = [
+            {"role": "system", "content": "You produce strict JSON for robot training labels."},
+            {"role": "user", "content": prompt},
+        ]
+        if apply_chat_template is not None:
+            try:
+                rendered = apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+            except TypeError:
+                rendered = apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            rendered = prompt
+        rendered_prompts.append(rendered)
+    previous_padding_side = getattr(tokenizer, "padding_side", "right")
+    tokenizer.padding_side = "left"
+    if getattr(tokenizer, "pad_token_id", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    inputs = tokenizer(rendered_prompts, return_tensors="pt", padding=True)
+    tokenizer.padding_side = previous_padding_side
     device = next(model.parameters()).device
     inputs = {key: value.to(device) for key, value in inputs.items()}
     with torch.inference_mode():
         output_ids = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-    suffix = output_ids[:, inputs["input_ids"].shape[-1] :]
-    return tokenizer.decode(suffix[0], skip_special_tokens=True).strip()
+    prompt_length = inputs["input_ids"].shape[-1]
+    suffixes = output_ids[:, prompt_length:]
+    return [tokenizer.decode(suffix, skip_special_tokens=True).strip() for suffix in suffixes]
 
 
 def _parse_normalized_response(text: str) -> tuple[dict[str, Any] | None, str | None]:

@@ -247,6 +247,8 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
   --device-map auto \
   --granularity task \
   --memory-summary-mode llm \
+  --llm-batch-size 4 \
+  --subtask-progress-quantum 0.05 \
   --max-new-tokens 128 \
   --skip-existing \
   --continue-on-error
@@ -269,6 +271,10 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
 
 `--parallel-workers 4` 会自动把 4 个进程绑定到前 4 张可见 GPU。如果需要手动分组，可以用 `--worker-gpu-groups "0;1;2;3"` 表示 4 个进程各用一张卡，或 `"0,1;2,3"` 表示 2 个进程、每个进程内部用 `device_map auto` 切 2 张卡。27B 如果单卡放不下，就不要用一卡一进程，改用多卡分组。`--memory-summary-mode code --max-new-tokens 128` 是最快组合；如果希望 history summary 也由 LLM 精修，用 `--memory-summary-mode llm`，但它仍然只在 task sidecar 阶段执行一次。
 
+`--llm-batch-size` 控制同一个 worker 的 `model.generate` 一次吃多少个 text prompts。旧逻辑等价于 `--llm-batch-size 1`，GPU 利用率通常较低；可以先试 `4`，显存足够再试 `8`。这个 batch 是 LLM prompt batch，不改变 task sharding，也不改变最终 row 顺序。
+
+`subtask_progress` 的 GT 原始值来自 `(frame_index - segment_start) / segment_length`，会产生很多不循环小数。默认 `--subtask-progress-quantum 0.05` 会把它量化到 `0.00, 0.05, ..., 1.00`，比任意小数更适合 VLM/LLM 学习和评估；如果要保留原始帧比例，设 `--subtask-progress-quantum 0`。
+
 如果要多台机器同时跑，先用 divide 脚本按 task 的 input row 数做均衡切分。它不会加载模型，只会生成 `summary.json`、每个 shard 的 task list 和可直接复制执行的 command：
 
 ```bash
@@ -282,6 +288,8 @@ PYTHONPATH=src python scripts/hl_memory/divide_hl_annotation_normalize_tasks.py 
   --device-map auto \
   --granularity task \
   --memory-summary-mode llm \
+  --llm-batch-size 4 \
+  --subtask-progress-quantum 0.05 \
   --max-new-tokens 128 \
   --skip-existing \
   --continue-on-error
@@ -305,6 +313,18 @@ bash /root/Users/dataset/hl_memory/normalize_shards/shard_000_command.sh
 ```
 
 `--skip-existing` 在 divide 阶段会把已经完成的 task 排除；生成的 command 里也建议继续保留 `--skip-existing`，这样某台机器中断后可以重跑同一个 shard。切分逻辑按 `hl_annotations.jsonl` 行数做贪心均衡，不是简单按 task 数平均，所以大任务不会集中到同一台机器。
+
+如果已经生成了 normalized annotations，只想批量 round 现有 `subtask_progress`，可以直接原地改写：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_round_hl_annotation_progress.py \
+  --annotation-root /root/Users/dataset/lerobot_home/subtask \
+  --input-name hl_annotations_llm_normalized.jsonl \
+  --quantum 0.05 \
+  --advance-threshold 0.85
+```
+
+这会同时更新 top-level `subtask_progress` 和 `llm_gt.subtask_progress`；传 `--advance-threshold` 时也会按 round 后的 progress 重新计算 `should_advance_objective`。
 
 输出默认写在每个 task 目录：
 
@@ -480,6 +500,7 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
   --frame-subsample 5 \
   --frame-height 224 \
   --frame-width 456 \
+  --subtask-progress-quantum 0.05 \
   --memory-length 8 \
   --merge-distance 5 \
   --overwrite
