@@ -14,18 +14,21 @@ def compose_observation_frame(
     *,
     frame_height: int,
     frame_width: int,
-    max_images: int = 4,
+    max_images: int = 2,
+    gap: int = 8,
 ) -> Image.Image:
+    if frame_width <= gap:
+        raise ValueError(f"frame_width must be greater than gap, got frame_width={frame_width} gap={gap}")
     ordered_images = [images[key] for key in sorted(images)[:max_images]]
     pil_images = [_to_pil_image(image) for image in ordered_images]
-    columns = min(2, max(len(pil_images), 1))
-    return _compose_grid(
-        pil_images,
-        cell_height=frame_height,
-        cell_width=frame_width,
-        columns=columns,
-        gap=8,
-    )
+    cell_width = (frame_width - gap) // 2
+    cell_height = frame_height
+    canvas = Image.new("RGB", (frame_width, frame_height), color=(0, 0, 0))
+    for index, image in enumerate(pil_images[:2]):
+        prepared = _resize_with_pad(image, cell_width=cell_width, cell_height=cell_height)
+        x = index * (cell_width + gap)
+        canvas.paste(prepared, (x, 0))
+    return canvas
 
 
 def compose_context_panel(

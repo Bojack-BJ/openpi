@@ -59,11 +59,12 @@ class ExportArgs:
     exclude_episode_indices: str | None = None
     max_episodes: int | None = None
     recent_frames_length: int = 8
+    training_fps: float = 20.0
     frame_subsample: int = 5
     memory_length: int = 8
     merge_distance: int = 5
     frame_height: int = 224
-    frame_width: int = 224
+    frame_width: int = 456
     overwrite: bool = False
 
 
@@ -104,6 +105,7 @@ def main(args: ExportArgs) -> None:
     logging.info("Episode index map ready for %d episodes.", len(episode_to_indices))
     hl_config = HLMemoryConfig(
         recent_frames_length=args.recent_frames_length,
+        training_fps=args.training_fps,
         frame_subsample=args.frame_subsample,
         memory_length=args.memory_length,
         merge_distance=args.merge_distance,

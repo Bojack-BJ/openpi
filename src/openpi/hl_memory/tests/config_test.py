@@ -58,3 +58,11 @@ def test_parallel_mode_accepts_tensor_parallel():
 def test_parallel_mode_rejects_unknown_value():
     with pytest.raises(ValueError, match="parallel_mode"):
         HLMemoryConfig(parallel_mode="fsdp")  # type: ignore[arg-type]
+
+
+def test_hl_memory_config_derives_video_fps_from_training_rate_and_subsample():
+    config = HLMemoryConfig(training_fps=20.0, frame_subsample=5)
+
+    assert config.video_fps == 4.0
+    assert config.frame_width == 456
+    assert config.frame_height == 224

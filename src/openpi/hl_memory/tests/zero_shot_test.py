@@ -13,6 +13,7 @@ from openpi.hl_memory.zero_shot import parse_seconds_argument
 from openpi.hl_memory.zero_shot import parse_video_paths_argument
 from openpi.hl_memory.zero_shot import save_prediction_debug_panel
 from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
+from openpi.hl_memory.zero_shot import _build_debug_text_lines
 
 
 def test_parse_seconds_argument_sorts_and_dedupes():
@@ -180,6 +181,8 @@ def test_save_prediction_debug_panel_writes_current_frame_summary(tmp_path):
         phase="retreat",
         target_query="right hand",
         goal_query="home position",
+        subtask_progress=0.75,
+        should_advance_objective=False,
     )
 
     output_path = save_prediction_debug_panel(
@@ -196,3 +199,34 @@ def test_save_prediction_debug_panel_writes_current_frame_summary(tmp_path):
 
     assert output_path.exists()
     assert Image.open(output_path).size == (1400, 820)
+
+
+def test_debug_text_lines_include_progress_and_advance_state():
+    prediction = HLMemoryPrediction(
+        updated_language_memory="Task progress: none",
+        current_subtask="approach object",
+        keyframe_candidate_positions=(),
+        phase="approach",
+        target_query="object",
+        goal_query="slot",
+        subtask_progress=0.5,
+        should_advance_objective=True,
+    )
+
+    lines = _build_debug_text_lines(
+        prediction=prediction,
+        step_index=0,
+        recent_end_sec=1.0,
+        current_second=1.0,
+        language_memory_before="before",
+        language_memory_after="after",
+        memory_seconds_before=(),
+        memory_seconds_after=(),
+        keyframe_candidate_seconds=(),
+        ground_truth_subtask=None,
+        parse_error=None,
+    )
+    rendered = "\n".join(text for text, _style in lines)
+
+    assert "Subtask progress: 0.500" in rendered
+    assert "Should advance: true" in rendered

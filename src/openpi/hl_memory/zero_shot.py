@@ -163,8 +163,22 @@ def build_zero_shot_clips_from_video(
             resolved_memory_seconds = []
         resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
 
-        memory_frames = [reader.read(second) for second in resolved_memory_seconds]
-        recent_frames = [reader.read(second) for second in resolved_recent_seconds]
+        memory_frames = [
+            _compose_single_view_frame(
+                reader.read(second),
+                frame_height=config.frame_height,
+                frame_width=config.frame_width,
+            )
+            for second in resolved_memory_seconds
+        ]
+        recent_frames = [
+            _compose_single_view_frame(
+                reader.read(second),
+                frame_height=config.frame_height,
+                frame_width=config.frame_width,
+            )
+            for second in resolved_recent_seconds
+        ]
     finally:
         reader.close()
 
@@ -646,6 +660,8 @@ def _build_debug_text_lines(
     if ground_truth_subtask:
         _append_wrapped_debug_line(lines, "GT subtask", ground_truth_subtask, style="accent", max_lines=2)
     _append_wrapped_debug_line(lines, "Current objective", prediction.current_objective, style="accent", max_lines=3)
+    _append_wrapped_debug_line(lines, "Subtask progress", _format_optional_progress(prediction.subtask_progress), max_lines=1)
+    _append_wrapped_debug_line(lines, "Should advance", _format_optional_bool(prediction.should_advance_objective), max_lines=1)
     _append_wrapped_debug_line(lines, "Phase", prediction.phase, max_lines=2)
     _append_wrapped_debug_line(lines, "Target", prediction.target_query or "none", max_lines=2)
     _append_wrapped_debug_line(lines, "Goal", prediction.goal_query or "none", max_lines=2)
@@ -690,6 +706,18 @@ def _append_wrapped_debug_line(
     if max_lines is not None and len(wrapped) > max_lines:
         wrapped = wrapped[: max_lines - 1] + ["..."]
     lines.extend((line, style) for line in wrapped)
+
+
+def _format_optional_progress(value: float | None) -> str:
+    if value is None:
+        return "none"
+    return f"{float(value):.3f}"
+
+
+def _format_optional_bool(value: bool | None) -> str:
+    if value is None:
+        return "none"
+    return "true" if value else "false"
 
 
 def _append_wrapped_debug_block(
@@ -987,6 +1015,19 @@ def _read_composed_multiview_frame(
 ) -> Image.Image:
     return compose_observation_frame(
         {view_name: reader.read(second) for view_name, reader in readers.items()},
+        frame_height=frame_height,
+        frame_width=frame_width,
+    )
+
+
+def _compose_single_view_frame(
+    frame: Image.Image,
+    *,
+    frame_height: int,
+    frame_width: int,
+) -> Image.Image:
+    return compose_observation_frame(
+        {"front": frame},
         frame_height=frame_height,
         frame_width=frame_width,
     )

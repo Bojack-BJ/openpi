@@ -790,11 +790,12 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         ]
 
     def _prepare_video_metadata(self, videos: list[list[Any]]) -> list[dict[str, Any]]:
+        fps = self.config.video_fps
         return [
             {
                 "total_num_frames": len(video),
-                "fps": 1.0,
-                "duration": float(len(video)),
+                "fps": fps,
+                "duration": float(max(len(video) - 1, 0)) / fps,
                 "frames_indices": list(range(len(video))),
             }
             for video in videos

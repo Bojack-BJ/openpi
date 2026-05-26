@@ -57,6 +57,40 @@ def test_load_video_clips_for_sample_pads_and_tracks_valid_lengths():
         assert clips.recent_frames[0].size == (8, 8)
 
 
+def test_load_video_clips_for_sample_keeps_exported_canvas_size():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        root = pathlib.Path(tmp_dir)
+        frames_dir = root / "frames"
+        frames_dir.mkdir()
+        Image.new("RGB", (456, 224), color=(255, 0, 0)).save(frames_dir / "recent.png")
+
+        sample = ExportedHLMemorySample(
+            sample_id="sample",
+            episode_index=0,
+            step_index=0,
+            frame_index=0,
+            instruction="task",
+            language_memory="memory",
+            updated_language_memory="updated",
+            current_subtask="step",
+            phase="step",
+            target_query="",
+            goal_query="",
+            keyframe_candidate_positions=(),
+            memory_frame_paths=(),
+            memory_frame_indices=(),
+            memory_valid_length=0,
+            recent_frame_paths=("frames/recent.png",),
+            recent_frame_indices=(0,),
+            recent_valid_length=1,
+        )
+        config = HLMemoryConfig(recent_frames_length=1, memory_length=1)
+
+        clips = load_video_clips_for_sample(sample, root, config)
+
+        assert clips.recent_frames[0].size == (456, 224)
+
+
 def test_build_loaded_video_clips_preserves_aspect_ratio_with_padding():
     config = HLMemoryConfig(
         recent_frames_length=1,

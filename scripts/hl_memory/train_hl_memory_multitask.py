@@ -82,6 +82,10 @@ class TrainArgs:
     enable_thinking: bool = False
     thinking_budget_tokens: int = 128
     thinking_max_new_tokens: int = 1024
+    training_fps: float = 20.0
+    frame_subsample: int = 5
+    frame_height: int = 224
+    frame_width: int = 456
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
@@ -177,6 +181,10 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         vlm_variant=args.vlm_variant,
         vlm_hf_model_id=args.vlm_hf_model_id,
         precision=args.precision,
+        training_fps=args.training_fps,
+        frame_subsample=args.frame_subsample,
+        frame_height=args.frame_height,
+        frame_width=args.frame_width,
         enable_thinking=args.enable_thinking,
         thinking_budget_tokens=args.thinking_budget_tokens,
         thinking_max_new_tokens=args.thinking_max_new_tokens,

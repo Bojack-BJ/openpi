@@ -86,7 +86,7 @@ class ZeroShotArgs:
     recent_frames_length: int = 8
     memory_length: int = 8
     frame_height: int = 224
-    frame_width: int = 224
+    frame_width: int = 456
     allow_single_frame_fallback: bool = True
     max_new_tokens: int = 256
     enable_thinking: bool = False
@@ -119,6 +119,8 @@ def main(args: ZeroShotArgs) -> None:
         vlm_hf_model_id=args.vlm_hf_model_id,
         precision=args.precision,
         recent_frames_length=args.recent_frames_length,
+        training_fps=args.training_fps,
+        frame_subsample=args.frame_subsample,
         memory_length=args.memory_length,
         frame_height=args.frame_height,
         frame_width=args.frame_width,
@@ -213,6 +215,7 @@ def _run_single_prediction(
         "recent_step_sec": _resolved_recent_step_sec(args),
         "training_fps": args.training_fps,
         "frame_subsample": args.frame_subsample,
+        "video_fps": config.video_fps,
         "memory_seconds": list(selection.memory_seconds),
         "recent_seconds": list(selection.recent_seconds),
         "memory_valid_length": clips.memory_valid_length,
@@ -470,6 +473,7 @@ def _run_rollout(
         "recent_step_sec": recent_step_sec,
         "training_fps": args.training_fps,
         "frame_subsample": args.frame_subsample,
+        "video_fps": config.video_fps,
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
         "known_prior_mode": bool(known_prior_steps),
         "known_prior_steps": list(known_prior_steps),

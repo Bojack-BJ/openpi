@@ -422,7 +422,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subt
   --workers 4 \
   --overwrite \
   --continue-on-error \
-  -- --recent-frames-length 8 --frame-subsample 5 --memory-length 8 --merge-distance 5
+  -- --recent-frames-length 8 --training-fps 20 --frame-subsample 5 --frame-height 224 --frame-width 456 --memory-length 8 --merge-distance 5
 ```
 
 不要在这一步同时依赖 `--auto-export-annotations` 生成 raw annotations 再导出 train/val；正确顺序是先生成 `hl_annotations.jsonl`，再 normalize 成 `hl_annotations_llm_normalized.jsonl`，最后从 normalized 文件导出 samples。
@@ -436,7 +436,10 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
   --output-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
   --visual-mode raw \
   --recent-frames-length 8 \
+  --training-fps 20 \
   --frame-subsample 5 \
+  --frame-height 224 \
+  --frame-width 456 \
   --memory-length 8 \
   --merge-distance 5 \
   --overwrite
@@ -523,6 +526,10 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
   --precision bfloat16 \
+  --training-fps 20 \
+  --frame-subsample 5 \
+  --frame-height 224 \
+  --frame-width 456 \
   --learning-rate 5e-6 \
   --lora-enabled \
   --lora-r 16 \
@@ -573,6 +580,10 @@ python scripts/hl_memory/train_hl_memory.py \
   --vlm-variant qwen3_5_2b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
   --precision float16 \
+  --training-fps 20 \
+  --frame-subsample 5 \
+  --frame-height 224 \
+  --frame-width 456 \
   --device cuda \
   --batch-size 1 \
   --grad-accum-steps 4 \
@@ -594,6 +605,10 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
   --vlm-variant qwen3_5_2b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-2B \
   --precision bfloat16 \
+  --training-fps 20 \
+  --frame-subsample 5 \
+  --frame-height 224 \
+  --frame-width 456 \
   --batch-size 4 \
   --grad-accum-steps 1 \
   --frame-cache-size 4096 \
@@ -791,9 +806,11 @@ Input rules：
 
 - 单视角 `--video-path` 映射为 `front`。
 - 双视角 `--left-video-path` / `--right-video-path` 映射为 `robot_0` / `robot_1`，同一时间抽帧后横向拼接。
+- HL frame 固定使用双槽画布，默认 `456x224`：每个视角槽位 `224x224`，中间 gap `8`。单视角放左槽，右槽为黑色 padding；双视角左右各一槽。
 - memory clip 和 recent clip 都按时间从旧到新排列。
 - recent clip 最后一张有效帧定义当前状态，`current_objective` 必须描述最后有效帧对应的当前低层目标。
 - 不传 `--recent-step-sec` 时，rollout 会按训练导出节奏自动取 `--frame-subsample / --training-fps` 秒；默认 `5 / 20 = 0.25s`，对应 LeRobot 20Hz 上每 5 帧取一帧。原始输入视频即使是 60Hz，也应按秒抽 `0.25s` 间隔来匹配训练时域。
+- Qwen video metadata 的 `fps` 同样按 `--training-fps / --frame-subsample` 推导，默认 `4.0Hz`；不要再把 HL clip 当作 1Hz 视频。
 - rollout 会把上一轮四字段 language memory 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
 - `known-prior` 会把 `task-config-path` 里的 `steps` 或 `segments[*].subtask` 当成固定 prior plan。模型判断当前 prior step 的进度/是否完成，也可以报告当前画面最接近的后续 prior step；rollout 侧维护单调 step pointer，并把最终 `current_objective` 重写成 pointer 对应的 prior step。
 
@@ -830,7 +847,7 @@ clip 和 memory 参数：
 | `--auto-memory` | 单次预测时自动从 recent 前面的时间段取 memory frames；rollout 模式会关闭它并使用上一步 keyframes。 |
 | `--recent-frames-length` | recent clip 最大帧数，默认 `8`。 |
 | `--memory-length` | memory clip 最大帧数，默认 `8`。 |
-| `--frame-height` / `--frame-width` | 输入 VLM 前的 frame resize 尺寸，默认 `224x224`。 |
+| `--frame-height` / `--frame-width` | 输入 VLM 前的固定双槽画布尺寸，默认 `456x224`（width x height），即两个 `224x224` 视角槽加 `8px` gap。 |
 | `--allow-single-frame-fallback` | 视频太短或时间点不足时允许复用单帧补齐，方便调试短视频。 |
 
 rollout 和调试参数：

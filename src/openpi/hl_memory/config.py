@@ -41,11 +41,12 @@ class HLMemoryConfig:
     vlm_hf_model_id: str | None = None
     precision: Precision = "bfloat16"
     recent_frames_length: int = 8
+    training_fps: float = 20.0
     frame_subsample: int = 5
     memory_length: int = 8
     merge_distance: int = 5
     frame_height: int = 224
-    frame_width: int = 224
+    frame_width: int = 456
     allow_single_frame_fallback: bool = True
     max_new_tokens: int = 256
     enable_thinking: bool = False
@@ -73,6 +74,8 @@ class HLMemoryConfig:
             object.__setattr__(self, "vlm_hf_model_id", default_model_id)
         if self.recent_frames_length <= 0:
             raise ValueError("recent_frames_length must be positive.")
+        if self.training_fps <= 0.0:
+            raise ValueError("training_fps must be positive.")
         if self.frame_subsample <= 0:
             raise ValueError("frame_subsample must be positive.")
         if self.memory_length <= 0:
@@ -100,6 +103,10 @@ class HLMemoryConfig:
     @property
     def supports_runtime_backend(self) -> bool:
         return self.vlm_backend in _SUPPORTED_RUNTIME_BACKENDS
+
+    @property
+    def video_fps(self) -> float:
+        return float(self.training_fps) / float(self.frame_subsample)
 
 
 def _resolve_variant(vlm_backend: HLVLMBackend, variant: str | None) -> str | None:
