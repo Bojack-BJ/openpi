@@ -225,7 +225,7 @@ def _export_split(
         "selected_episode_indices": [episode_index for episode_index, _ in sorted_episode_items],
         "num_samples": len(samples),
         "skipped_missing_episode_indices": skipped_episodes,
-        "hl_memory_config": dataclasses.asdict(hl_config),
+        "export_config": _export_config_metadata(hl_config),
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
     logging.info(
@@ -272,6 +272,19 @@ def _apply_export_overrides(config: Any, args: ExportArgs) -> Any:
             asset_id=args.asset_id_override or args.repo_id_override,
         )
     return dataclasses.replace(config, data=dataclasses.replace(data_factory, **replacements))
+
+
+def _export_config_metadata(hl_config: HLMemoryConfig) -> dict[str, Any]:
+    return {
+        "recent_frames_length": hl_config.recent_frames_length,
+        "training_fps": hl_config.training_fps,
+        "frame_subsample": hl_config.frame_subsample,
+        "video_fps": hl_config.video_fps,
+        "memory_length": hl_config.memory_length,
+        "merge_distance": hl_config.merge_distance,
+        "frame_height": hl_config.frame_height,
+        "frame_width": hl_config.frame_width,
+    }
 
 
 def _resolve_hl_visual_config(config: Any, *, visual_mode: str) -> Any:

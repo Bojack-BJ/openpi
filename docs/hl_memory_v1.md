@@ -532,6 +532,8 @@ exported/
 
 `samples.jsonl` 是 HL VLM 训练和评估的数据集。
 
+`metadata.json` 只记录数据导出信息，例如 selected episodes、visual/image column 选择、frame layout 和 clip fps。它不记录 VLM backend/variant；训练和推理实际使用的 Qwen 版本由 train/eval/zero-shot 命令参数或 checkpoint metadata 决定。
+
 `--visual-mode raw` 是默认值，也是推荐值。HL export 只读取必要的 parquet columns：episode/frame/task/subtask/prompt 和 RGB image columns；不会读取 state/action，也不会读取或传给 HL 任何 mask / overlay / 高亮目标。图像列由 `--image-columns` 控制；`--visual-mode config` 只影响是否沿用 config 的视觉模式变换，不会让 mask/overlay 进入 HL。
 
 每条 sample 的核心字段：
@@ -585,7 +587,7 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
   --overwrite
 ```
 
-也可以显式指定 episode：`--episode-indices 0,3,7-12` 或排除 episode：`--exclude-episode-indices 100-120`。`metadata.json` 会记录 selected episode 列表，方便确认 train/val 没有重叠。旧的单目录模式仍然可用：`--output-dir ... --episode-split train|val|all`。
+也可以显式指定 episode：`--episode-indices 0,3,7-12` 或排除 episode：`--exclude-episode-indices 100-120`。`metadata.json` 的 `selected_episode_indices` 会记录 selected episode 列表，方便确认 train/val 没有重叠。旧的单目录模式仍然可用：`--output-dir ... --episode-split train|val|all`。
 
 如果报 `Episode ... was not found in dataset`，说明 `annotations.jsonl` 的 episode index 和当前 LeRobot dataset 不匹配；优先用上一步的 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 重新生成 annotations。只有确认要导出交集时才加 `--missing-episode-policy skip`。
 
