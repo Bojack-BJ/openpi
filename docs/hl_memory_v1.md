@@ -93,19 +93,22 @@ $HF_LEROBOT_HOME/fastumi/sponge_visual_guided/subtask_segments.json
 
 ### 2. Subtasks To Raw HL Annotation JSONL
 
-多任务批量路径推荐先在每个 LeRobot task repo 旁边生成 raw `hl_annotations.jsonl`：
+主力路径是 batch wrapper：先在每个 LeRobot task repo 旁边生成 raw `hl_annotations.jsonl`，后续再统一做 LLM normalize 和 HL dataset export。推荐采样策略是“按 segment 长度动态分配 progress 样本 + late fractions 强化切换前状态 + short segment 单独补内部 progress”，避免只学到 start/mid/end。
 
 ```bash
 PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtasks.py \
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --workers 8 \
-  --progress-sample-target-frames 40 \
+  --progress-sample-target-frames 30 \
   --progress-extra-fractions 0.85,0.9,0.95 \
   --min-progress-samples-per-segment 2 \
   --max-progress-samples-per-segment 10 \
   --progress-sample-jitter 0.05 \
   --progress-sample-seed 42 \
   --progress-min-gap 10 \
+  --short-segment-max-frames 40 \
+  --short-segment-progress-fractions 0.2,0.4,0.6,0.75,0.9 \
+  --short-segment-progress-min-gap -1 \
   --emit-success-events \
   --overwrite \
   --continue-on-error
@@ -117,7 +120,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
 /root/Users/dataset/lerobot_home/subtask/<task_id>/hl_annotations.jsonl
 ```
 
-单任务也可以从 LeRobot root 或 repo id 生成：
+单任务命令主要用于 debug、只重跑某个 task，或本地检查一个 repo 的采样分布：
 
 ```bash
 python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
@@ -145,7 +148,7 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
-默认每个 segment 导出两条 annotation：`start_frame` 的 `subtask_boundary` 和 segment 中点的 `progress`。这样 HL 同时学习 subtask 切换点和 subtask 进行中的稳定状态。`--emit-success-events` 会额外在 `end_frame - 1` 导出 `success`，当前默认不启用。
+如果不传 progress 参数，默认每个 segment 导出两条 annotation：`start_frame` 的 `subtask_boundary` 和 segment 中点的 `progress`。这只适合 smoke test，不适合作为最终训练集。`--emit-success-events` 会额外在 `end_frame - 1` 导出 `success`，推荐训练时开启，让模型看到 `should_advance_objective=true` 附近的画面。
 
 旧的 stride 采样仍然可用，但不推荐作为主路径，因为它不保证覆盖固定 progress 位置：
 
@@ -186,14 +189,14 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
-动态采样适合 segment 长度差异较大的任务：短 segment 采 2–4 个，长 segment 最多采 5–10 个。
+动态采样适合 segment 长度差异较大的任务：短 segment 采 2–4 个，长 segment 最多采 5–10 个。batch wrapper 和单任务 exporter 支持同一组参数。
 
 ```bash
 python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --repo-id fastumi/sponge_visual_guided_xarm \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --instruction "Put the target object into the target slot" \
-  --progress-sample-target-frames 40 \
+  --progress-sample-target-frames 30 \
   --progress-extra-fractions 0.85,0.9,0.95 \
   --min-progress-samples-per-segment 2 \
   --max-progress-samples-per-segment 10 \
@@ -204,22 +207,22 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --overwrite
 ```
 
-如果存在很短的 segment，例如 20 帧左右，普通 `--progress-min-gap` 和 late fractions 可能只留下 start/success，导致模型看不到连续 progress。可以对短 segment 单独启用自适应固定比例采样：
+如果存在很短的 segment，例如 20–40 帧，普通 `--progress-min-gap` 和 late fractions 可能只留下 start/success，导致模型看不到连续 progress。可以对短 segment 单独启用自适应固定比例采样：
 
 ```bash
 python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
   --repo-id fastumi/sponge_visual_guided_xarm \
   --output-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations.jsonl \
   --instruction "Put the target object into the target slot" \
-  --progress-sample-target-frames 40 \
+  --progress-sample-target-frames 30 \
   --progress-extra-fractions 0.85,0.9,0.95 \
   --min-progress-samples-per-segment 2 \
   --max-progress-samples-per-segment 10 \
   --progress-sample-jitter 0.05 \
   --progress-sample-seed 42 \
   --progress-min-gap 10 \
-  --short-segment-max-frames 30 \
-  --short-segment-progress-fractions 0.25,0.5,0.75 \
+  --short-segment-max-frames 40 \
+  --short-segment-progress-fractions 0.2,0.4,0.6,0.75,0.9 \
   --short-segment-progress-min-gap -1 \
   --emit-success-events \
   --overwrite

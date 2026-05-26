@@ -99,7 +99,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-export-annotations", action="store_true", help="Create hl_annotations.jsonl when missing.")
     parser.add_argument("--emit-success-events", action="store_true", help="Forward to annotation exporter when auto-exporting.")
     parser.add_argument("--progress-sample-stride", type=int, default=0, help="Forward to annotation exporter.")
+    parser.add_argument("--progress-sample-fractions", default="", help="Forward to annotation exporter.")
+    parser.add_argument("--progress-extra-fractions", default="", help="Forward to annotation exporter.")
+    parser.add_argument("--progress-sample-target-frames", type=int, default=0, help="Forward to annotation exporter.")
+    parser.add_argument("--progress-sample-jitter", type=float, default=0.0, help="Forward to annotation exporter.")
+    parser.add_argument("--progress-sample-seed", type=int, default=0, help="Forward to annotation exporter.")
+    parser.add_argument("--min-progress-samples-per-segment", type=int, default=0, help="Forward to annotation exporter.")
     parser.add_argument("--max-progress-samples-per-segment", type=int, default=1, help="Forward to annotation exporter.")
+    parser.add_argument("--progress-min-gap", type=int, default=0, help="Forward to annotation exporter.")
+    parser.add_argument("--short-segment-max-frames", type=int, default=0, help="Forward to annotation exporter.")
+    parser.add_argument("--short-segment-progress-fractions", default="", help="Forward to annotation exporter.")
+    parser.add_argument("--short-segment-progress-min-gap", type=int, default=-1, help="Forward to annotation exporter.")
     parser.add_argument("--export-script", type=Path, default=DEFAULT_EXPORT_SCRIPT)
     parser.add_argument("--annotation-script", type=Path, default=DEFAULT_ANNOTATION_SCRIPT)
     parser.add_argument("--summary-json", type=Path, default=None)
@@ -215,7 +225,27 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
                 annotation_cmd.append("--emit-success-events")
             if args.progress_sample_stride > 0:
                 annotation_cmd.extend(["--progress-sample-stride", str(args.progress_sample_stride)])
-                annotation_cmd.extend(["--max-progress-samples-per-segment", str(args.max_progress_samples_per_segment)])
+            if args.progress_sample_fractions:
+                annotation_cmd.extend(["--progress-sample-fractions", args.progress_sample_fractions])
+            if args.progress_extra_fractions:
+                annotation_cmd.extend(["--progress-extra-fractions", args.progress_extra_fractions])
+            if args.progress_sample_target_frames > 0:
+                annotation_cmd.extend(["--progress-sample-target-frames", str(args.progress_sample_target_frames)])
+            if args.progress_sample_jitter > 0:
+                annotation_cmd.extend(["--progress-sample-jitter", str(args.progress_sample_jitter)])
+            if args.progress_sample_seed:
+                annotation_cmd.extend(["--progress-sample-seed", str(args.progress_sample_seed)])
+            if args.min_progress_samples_per_segment > 0:
+                annotation_cmd.extend(["--min-progress-samples-per-segment", str(args.min_progress_samples_per_segment)])
+            annotation_cmd.extend(["--max-progress-samples-per-segment", str(args.max_progress_samples_per_segment)])
+            if args.progress_min_gap > 0:
+                annotation_cmd.extend(["--progress-min-gap", str(args.progress_min_gap)])
+            if args.short_segment_max_frames > 0:
+                annotation_cmd.extend(["--short-segment-max-frames", str(args.short_segment_max_frames)])
+            if args.short_segment_progress_fractions:
+                annotation_cmd.extend(["--short-segment-progress-fractions", args.short_segment_progress_fractions])
+            if args.short_segment_progress_min_gap != -1:
+                annotation_cmd.extend(["--short-segment-progress-min-gap", str(args.short_segment_progress_min_gap)])
         cmd = [
             sys.executable,
             str(args.export_script.resolve()),

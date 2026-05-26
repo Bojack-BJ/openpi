@@ -129,6 +129,23 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Pass --progress-min-gap to the exporter.",
     )
+    parser.add_argument(
+        "--short-segment-max-frames",
+        type=int,
+        default=0,
+        help="Pass --short-segment-max-frames to the exporter.",
+    )
+    parser.add_argument(
+        "--short-segment-progress-fractions",
+        default="",
+        help="Pass --short-segment-progress-fractions to the exporter.",
+    )
+    parser.add_argument(
+        "--short-segment-progress-min-gap",
+        type=int,
+        default=-1,
+        help="Pass --short-segment-progress-min-gap to the exporter.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Pass --overwrite to the exporter.")
     parser.add_argument(
         "--skip-existing",
@@ -236,6 +253,9 @@ def main() -> None:
             min_progress_samples_per_segment=args.min_progress_samples_per_segment,
             max_progress_samples_per_segment=args.max_progress_samples_per_segment,
             progress_min_gap=args.progress_min_gap,
+            short_segment_max_frames=args.short_segment_max_frames,
+            short_segment_progress_fractions=args.short_segment_progress_fractions,
+            short_segment_progress_min_gap=args.short_segment_progress_min_gap,
             overwrite=args.overwrite,
             passthrough=passthrough,
         )
@@ -388,6 +408,9 @@ def build_export_command(
     min_progress_samples_per_segment: int,
     max_progress_samples_per_segment: int | None,
     progress_min_gap: int,
+    short_segment_max_frames: int,
+    short_segment_progress_fractions: str,
+    short_segment_progress_min_gap: int,
     overwrite: bool,
     passthrough: list[str],
 ) -> list[str]:
@@ -423,6 +446,12 @@ def build_export_command(
         cmd.extend(["--max-progress-samples-per-segment", str(max_progress_samples_per_segment)])
     if progress_min_gap > 0:
         cmd.extend(["--progress-min-gap", str(progress_min_gap)])
+    if short_segment_max_frames > 0:
+        cmd.extend(["--short-segment-max-frames", str(short_segment_max_frames)])
+    if short_segment_progress_fractions:
+        cmd.extend(["--short-segment-progress-fractions", short_segment_progress_fractions])
+    if short_segment_progress_min_gap != -1:
+        cmd.extend(["--short-segment-progress-min-gap", str(short_segment_progress_min_gap)])
     if overwrite:
         cmd.append("--overwrite")
     cmd.extend(passthrough)
