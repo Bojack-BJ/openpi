@@ -673,13 +673,15 @@ python scripts/hl_memory/train_hl_memory.py --config-yaml src/openpi/hl_memory/t
 
 ```bash
 python scripts/hl_memory/eval_hl_memory_rollout.py \
-  --dataset-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
-  --model-path /root/Users/checkpoints/hl_memory/sponge_visual_guided_qwen35/checkpoint-step-001000 \
+  --dataset-dir /root/Users/dataset/hl_memory/subtask/20260116W001/val \
+  --model-path /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora/checkpoint-step-002000 \
   --vlm-backend qwen3_5_vl \
-  --vlm-variant qwen3_5_2b \
+  --vlm-variant qwen3_5_4b \
   --device cuda \
   --frame-cache-size 512 \
-  --output-json /root/Users/dataset/hl_memory/sponge_visual_guided/eval_metrics.json
+  --known-prior-eval \
+  --output-json /root/Users/eval/hl_memory/subtask_multitask_qwen35_lora_step2000/20260116W001/eval_metrics.json \
+  --prediction-jsonl /root/Users/eval/hl_memory/subtask_multitask_qwen35_lora_step2000/20260116W001/full_predictions.jsonl
 ```
 
 评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标包括 `objective_exact_match` / `objective_normalized_match`、progress/advance/active-hand accuracy、target/goal accuracy、keyframe precision/recall、memory similarity/drift。

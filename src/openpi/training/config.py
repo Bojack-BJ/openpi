@@ -2521,6 +2521,29 @@ _CONFIGS = [
         num_workers=8,
     ),
     TrainConfig(
+        name="pi05_task_Pick_3_beers_from_5_original",
+        # Here is an example of loading a pi0 model for LoRA fine-tuning.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+        ),
+        data= FastUMIData7DRPYConfig(
+            repo_id="fastumi/Pick_3_beers_from_5_original",
+            base_config=DataConfig(
+                # local_files_only=True,  # Set to True for local-only datasets.
+                prompt_from_task=True,
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/root/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=60_000,
+        # The freeze filter defines which parameters should be frozen during training.
+        # We have a convenience function in the model config that returns the default freeze filter
+        # for the given model config for LoRA finetuning. Just make sure it matches the model config
+        # Turn off EMA for LoRA finetuning.
+        ema_decay=None,
+        batch_size = 32,
+        num_workers = 32
+        ),
+    TrainConfig(
         name="sponge_visual_guided_qwen3_5_2b_400m",
         model=pi0_config.Pi0Config(
             vlm_backend="qwen3_5_vl",
