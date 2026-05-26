@@ -264,6 +264,8 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
   --parallel-workers 4 \
   --granularity task \
   --memory-summary-mode code \
+  --llm-batch-size 4 \
+  --subtask-progress-quantum 0.05 \
   --max-new-tokens 128 \
   --skip-existing \
   --continue-on-error
@@ -273,7 +275,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.
 
 `--llm-batch-size` 控制同一个 worker 的 `model.generate` 一次吃多少个 text prompts。旧逻辑等价于 `--llm-batch-size 1`，GPU 利用率通常较低；可以先试 `4`，显存足够再试 `8`。这个 batch 是 LLM prompt batch，不改变 task sharding，也不改变最终 row 顺序。
 
-`subtask_progress` 的 GT 原始值来自 `(frame_index - segment_start) / segment_length`，会产生很多不循环小数。默认 `--subtask-progress-quantum 0.05` 会把它量化到 `0.00, 0.05, ..., 1.00`，比任意小数更适合 VLM/LLM 学习和评估；如果要保留原始帧比例，设 `--subtask-progress-quantum 0`。
+`subtask_progress` 的 GT 原始值来自 `(frame_index - segment_start) / segment_length`。默认 `--subtask-progress-quantum 0.05` 会量化到 `0.00, 0.05, ..., 1.00`，避免训练目标里出现长小数。训练/推理 schema 保持数值 `[0, 1]`，不要写成 `40%` 字符串；百分号会增加格式解析和 token 对齐难度。
 
 如果要多台机器同时跑，先用 divide 脚本按 task 的 input row 数做均衡切分。它不会加载模型，只会生成 `summary.json`、每个 shard 的 task list 和可直接复制执行的 command：
 
@@ -350,7 +352,7 @@ all episode annotations in one task
 {
   "task_progress": "The pen holder has been placed on the table.",
   "current_objective": "grasp the glue stick with the right hand and place it into the pen holder",
-  "subtask_progress": 0.42,
+  "subtask_progress": 0.4,
   "should_advance_objective": false,
   "active_hand": "right",
   "relevant_objects": ["glue stick", "pen holder"],
@@ -391,7 +393,7 @@ PYTHONPATH=src python scripts/hl_memory/normalize_hl_annotations_with_llm.py \
 {
   "task_progress": "The motor has been picked up.",
   "current_objective": "place the motor into the box",
-  "subtask_progress": 0.42,
+  "subtask_progress": 0.4,
   "should_advance_objective": false,
   "active_hand": "right",
   "relevant_objects": ["motor", "box"],
@@ -473,17 +475,29 @@ Current subtask: <HL current_objective>
 
 ```bash
 PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subtasks.py \
-  --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --output-root /root/Users/dataset/hl_memory/subtask \
   --repo-prefix subtask/ \
   --annotations-name hl_annotations_llm_normalized.jsonl \
   --visual-mode raw \
+  --image-columns auto \
   --workers 4 \
   --overwrite \
   --continue-on-error \
-  -- --recent-frames-length 8 --training-fps 20 --frame-subsample 5 --frame-height 224 --frame-width 456 --memory-length 8 --merge-distance 5
+  -- --recent-frames-length 8 --training-fps 20 --frame-subsample 5 --frame-height 224 --frame-width 456 --subtask-progress-quantum 0.05 --memory-length 8 --merge-distance 5
 ```
+
+Subtask 数据 schema 基本统一时，batch export 推荐不传 `--source-config-name`，而是用 `--repo-prefix subtask/` 和每个 task 目录名组成 `repo_id=subtask/<task_id>`。脚本会直接读 `<HF_LEROBOT_HOME>/<repo_id>`，只加载 episode/frame/task/prompt/subtask 和 RGB image columns，不读 state/action/mask。
+
+`--source-config-name` 仍可作为兼容路径使用。它主要提供 base LeRobot repo、prompt_from_task、subtask sidecar、assets 和原始 `dataset_columns`。但如果这个 config 只覆盖单臂或双臂其中一种，可能会把 HL 图像列限制错；因此 batch 路径默认 `--image-columns auto`，会忽略 config 的 image column 限制，按每个 repo 实际存在的非 mask/overlay `observation.images.*` 自动选择单视角或双视角。
+
+`--image-columns` 可选值：
+
+- `auto`：默认，读取所有非 mask/overlay 的 RGB image columns，适合混合单/双视角 subtask repos。
+- `config`：严格使用 `--source-config-name` 里配置的 RGB camera columns，适合复现某个固定 config。
+- `front,robot_0,robot_1` 或完整列名：显式指定视角列；短名会自动补成 `observation.images.<name>`。
+
+`--frame-width 456 --frame-height 224` 不是按原图自适应，而是固定 VLM 输入画布：两个 `224x224` view slot，中间 `8px` gap。单视角放左槽、右槽黑 padding；双视角左右各一槽。固定尺寸是为了让 train/eval/rollout 的视觉分布一致，不让单/双视角或不同原图尺寸改变 token layout。
 
 不要在这一步同时依赖 `--auto-export-annotations` 生成 raw annotations 再导出 train/val；正确顺序是先生成 `hl_annotations.jsonl`，再 normalize 成 `hl_annotations_llm_normalized.jsonl`，最后从 normalized 文件导出 samples。
 
@@ -491,10 +505,11 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subt
 
 ```bash
 python scripts/hl_memory/export_hl_memory_dataset.py \
-  --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
+  --repo-id-override fastumi/sponge_visual_guided \
   --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
   --output-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported \
   --visual-mode raw \
+  --image-columns auto \
   --recent-frames-length 8 \
   --training-fps 20 \
   --frame-subsample 5 \
@@ -517,7 +532,7 @@ exported/
 
 `samples.jsonl` 是 HL VLM 训练和评估的数据集。
 
-`--visual-mode raw` 是默认值，也是推荐值。HL export 只读取必要的 parquet columns：episode/frame/task/subtask/prompt 和 RGB image columns；不会读取 state/action，也不会读取或传给 HL 任何 mask / overlay / 高亮目标。`--visual-mode config` 只影响优先选择哪些已配置的 RGB camera column，仍然会排除 mask/overlay。
+`--visual-mode raw` 是默认值，也是推荐值。HL export 只读取必要的 parquet columns：episode/frame/task/subtask/prompt 和 RGB image columns；不会读取 state/action，也不会读取或传给 HL 任何 mask / overlay / 高亮目标。图像列由 `--image-columns` 控制；`--visual-mode config` 只影响是否沿用 config 的视觉模式变换，不会让 mask/overlay 进入 HL。
 
 每条 sample 的核心字段：
 
@@ -533,7 +548,7 @@ exported/
   "step_prior": ["approach motor", "grasp motor", "place motor into box"],
   "task_progress": "The motor has been picked up.",
   "current_objective": "place the motor into the box",
-  "subtask_progress": 0.42,
+  "subtask_progress": 0.4,
   "should_advance_objective": false,
   "active_hand": "right",
   "relevant_objects": ["motor", "box"],
@@ -554,13 +569,19 @@ exported/
 
 ```bash
 python scripts/hl_memory/export_hl_memory_dataset.py \
-  --source-config-name sponge_visual_guided_qwen3_5_2b_400m_touch \
+  --repo-id-override fastumi/sponge_visual_guided \
   --annotations-jsonl /root/Users/dataset/hl_memory/sponge_visual_guided/annotations_llm_normalized.jsonl \
   --output-train-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_train \
   --output-val-dir /root/Users/dataset/hl_memory/sponge_visual_guided/exported_val \
   --val-ratio 0.1 \
   --split-seed 42 \
   --visual-mode raw \
+  --image-columns auto \
+  --training-fps 20 \
+  --frame-subsample 5 \
+  --frame-height 224 \
+  --frame-width 456 \
+  --subtask-progress-quantum 0.05 \
   --overwrite
 ```
 
@@ -956,7 +977,7 @@ rollout 和调试参数：
   "current_subtask": "place the motor into the box",
   "current_objective": "place the motor into the box",
   "task_progress": "The motor has been picked up.",
-  "subtask_progress": 0.42,
+  "subtask_progress": 0.4,
   "should_advance_objective": false,
   "active_hand": "right",
   "relevant_objects": ["motor", "box"],
@@ -1063,7 +1084,7 @@ python scripts/hl_memory/check_crosstask_video_coverage.py \
 
 ## Troubleshooting
 
-- Episode 错位：用 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 生成 annotations；确认 `source_config_name` 指向同一个 LeRobot `repo_id`。
+- Episode 错位：用 `--repo-id` / `--lerobot-dir` 从 `subtask_segments.json` 生成 annotations；确认 export 时的 `--repo-id-override` 或 `--source-config-name` 指向同一个 LeRobot `repo_id`。
 - 缺依赖：HL export/train/eval 需要 `Pillow`、`torch`、`transformers`；`--config-yaml` 额外需要 `pyyaml`。
 - Qwen3.5 JSON 不稳定：默认关闭 thinking；只有需要 reasoning trace 时加 `--enable-thinking --thinking-budget-tokens 128 --thinking-max-new-tokens 1024`。
 - 多机 `.arrow` / `.incomplete`：`HF_LEROBOT_HOME` 是数据根目录，`HF_DATASETS_CACHE` 是 HuggingFace parquet/Arrow 派生缓存。多机不要共享同一个可写 cache，建议 `export HF_DATASETS_CACHE=/tmp/openpi_hf_datasets_cache_${HOSTNAME}`。

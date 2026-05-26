@@ -41,8 +41,8 @@ import openpi.transforms as _transforms
 
 @dataclasses.dataclass
 class ExportArgs:
-    source_config_name: str
-    annotations_jsonl: pathlib.Path
+    annotations_jsonl: pathlib.Path = tyro.MISSING
+    source_config_name: str | None = None
     output_dir: pathlib.Path | None = None
     repo_id_override: str | None = None
     asset_id_override: str | None = None
@@ -51,6 +51,7 @@ class ExportArgs:
     output_train_dir: pathlib.Path | None = None
     output_val_dir: pathlib.Path | None = None
     visual_mode: Literal["raw", "config"] = "raw"
+    image_columns: str = "auto"
     missing_episode_policy: Literal["error", "skip"] = "error"
     episode_split: Literal["all", "train", "val"] = "all"
     val_ratio: float = 0.1
@@ -76,17 +77,14 @@ def main(args: ExportArgs) -> None:
         _validate_output_dir(output_dir, overwrite=args.overwrite)
 
     start_time = time.perf_counter()
-    logging.info("Resolving training config: %s", args.source_config_name)
-    config = training_config.get_config(args.source_config_name)
-    config = _apply_export_overrides(config, args)
-    config = _resolve_hl_visual_config(config, visual_mode=args.visual_mode)
-    data_config = config.data.create(config.assets_dirs, config.model)
+    data_config = _resolve_export_data_config(args)
     logging.info(
-        "Creating LeRobot dataset for HL export: repo_id=%s visual_mode=%s",
+        "Creating LeRobot dataset for HL export: repo_id=%s visual_mode=%s image_columns=%s",
         data_config.repo_id,
         args.visual_mode,
+        args.image_columns,
     )
-    raw_dataset = _create_hl_export_dataset(data_config, visual_mode=args.visual_mode)
+    raw_dataset = _create_hl_export_dataset(data_config, visual_mode=args.visual_mode, image_columns=args.image_columns)
     logging.info("HL export dataset ready in %.1fs; len=%d", time.perf_counter() - start_time, len(raw_dataset))
     export_dataset = data_loader.TransformedDataset(
         raw_dataset,
@@ -172,7 +170,7 @@ def _export_split(
         if episode_index not in episode_to_indices:
             message = _format_missing_episode_error(
                 episode_index,
-                source_config_name=args.source_config_name,
+                source_config_name=args.source_config_name or f"repo_id={getattr(_unwrap_base_dataset(raw_dataset), 'repo_id', '<unknown>')}",
                 available_episode_indices=episode_to_indices.keys(),
                 dataset=_unwrap_base_dataset(raw_dataset),
             )
@@ -217,6 +215,7 @@ def _export_split(
         "source_config_name": args.source_config_name,
         "annotations_jsonl": str(args.annotations_jsonl),
         "visual_mode": args.visual_mode,
+        "image_columns": args.image_columns,
         "episode_split": split_name,
         "val_ratio": args.val_ratio,
         "split_seed": args.split_seed,
@@ -313,7 +312,25 @@ def _validate_output_dir(output_dir: pathlib.Path, *, overwrite: bool) -> None:
         raise FileExistsError(f"{output_dir} already exists and is not empty. Use --overwrite to replace it.")
 
 
-def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loader.Dataset:
+def _resolve_export_data_config(args: ExportArgs) -> training_config.DataConfig:
+    if args.source_config_name is None:
+        if args.repo_id_override is None:
+            raise ValueError("Set --repo-id-override when exporting without --source-config-name.")
+        logging.info("Using explicit HL subtask schema without an OpenPI training config.")
+        return training_config.DataConfig(
+            repo_id=args.repo_id_override,
+            prompt_from_task=args.force_prompt_from_task,
+            subtask_segments_path=args.subtask_segments_path_override or "subtask_segments.json",
+        )
+
+    logging.info("Resolving training config: %s", args.source_config_name)
+    config = training_config.get_config(args.source_config_name)
+    config = _apply_export_overrides(config, args)
+    config = _resolve_hl_visual_config(config, visual_mode=args.visual_mode)
+    return config.data.create(config.assets_dirs, config.model)
+
+
+def _create_hl_export_dataset(data_config: Any, *, visual_mode: str, image_columns: str) -> data_loader.Dataset:
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create HL export dataset.")
@@ -322,7 +339,7 @@ def _create_hl_export_dataset(data_config: Any, *, visual_mode: str) -> data_loa
 
     dataset_root = openpi_lerobot_dataset.HF_LEROBOT_HOME / repo_id
     dataset_meta = _load_lerobot_metadata(repo_id, dataset_root)
-    selected_columns = _resolve_hl_export_columns(data_config, dataset_meta)
+    selected_columns = _resolve_hl_export_columns(data_config, dataset_meta, image_columns=image_columns)
     parquet_files = sorted((dataset_root / "data").glob("**/*.parquet"))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found under {dataset_root / 'data'}")
@@ -377,7 +394,7 @@ def _load_lerobot_metadata(repo_id: str, dataset_root: pathlib.Path) -> Any:
         return _LocalLeRobotMetadata(features=dict(info.get("features", {})), tasks=tasks)
 
 
-def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any) -> tuple[str, ...]:
+def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any, *, image_columns: str) -> tuple[str, ...]:
     features = dict(getattr(dataset_meta, "features", {}) or {})
     existing_columns = set(features)
     selected: list[str] = []
@@ -385,21 +402,65 @@ def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any) -> tuple[str
     for column in ("timestamp", "frame_index", "episode_index", "index", "task_index", "subtask", "prompt"):
         _append_existing_column(selected, column, existing_columns)
 
-    configured_columns = tuple(data_config.dataset_columns or ())
-    for column in configured_columns:
-        if column.startswith("observation.images.") and not _is_guidance_visual_column(column):
-            _append_existing_column(selected, column, existing_columns)
-
-    if not any(column.startswith("observation.images.") for column in selected):
+    mode_or_columns = (image_columns or "auto").strip()
+    if mode_or_columns == "config":
+        configured_columns = tuple(data_config.dataset_columns or ())
+        for column in configured_columns:
+            if column.startswith("observation.images.") and not _is_guidance_visual_column(column):
+                _append_existing_column(selected, column, existing_columns)
+        if not any(column.startswith("observation.images.") for column in selected):
+            for column in sorted(existing_columns):
+                if column.startswith("observation.images.") and not _is_guidance_visual_column(column):
+                    _append_existing_column(selected, column, existing_columns)
+    elif mode_or_columns in ("auto", "all", "all_rgb"):
         for column in sorted(existing_columns):
             if column.startswith("observation.images."):
                 if _is_guidance_visual_column(column):
                     continue
                 _append_existing_column(selected, column, existing_columns)
+    else:
+        requested = _parse_image_columns(mode_or_columns)
+        missing: list[str] = []
+        for column in requested:
+            before = len(selected)
+            if column.startswith("observation.images.") and not _is_guidance_visual_column(column):
+                _append_existing_column(selected, column, existing_columns)
+            if len(selected) == before:
+                missing.append(column)
+        if missing:
+            raise ValueError(
+                "Requested image columns are missing from LeRobot metadata: "
+                f"{missing}. Available image columns: {_available_image_columns(existing_columns)}"
+            )
 
     if not any(column.startswith("observation.images.") for column in selected):
-        raise ValueError("Could not resolve any image columns for HL export.")
+        raise ValueError(
+            "Could not resolve any image columns for HL export. "
+            f"image_columns={image_columns!r}, available={_available_image_columns(existing_columns)}"
+        )
     return tuple(selected)
+
+
+def _parse_image_columns(value: str) -> tuple[str, ...]:
+    columns: list[str] = []
+    for item in value.split(","):
+        column = item.strip()
+        if not column:
+            continue
+        if not column.startswith("observation.images."):
+            column = f"observation.images.{column}"
+        columns.append(column)
+    if not columns:
+        raise ValueError("--image-columns must be `auto`, `config`, or a comma-separated image column list.")
+    return tuple(columns)
+
+
+def _available_image_columns(existing_columns: set[str]) -> list[str]:
+    return [
+        column
+        for column in sorted(existing_columns)
+        if column.startswith("observation.images.") and not _is_guidance_visual_column(column)
+    ]
 
 
 def _append_existing_column(selected: list[str], column: str, existing_columns: set[str]) -> None:

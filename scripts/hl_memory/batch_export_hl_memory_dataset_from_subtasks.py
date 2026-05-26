@@ -23,10 +23,10 @@ cd /root/Users/donggaoqi/openpi_vlm_finetune
 
 PYTHONPATH=src /root/Users/miniconda3/envs/pi0_dgq/bin/python \
   scripts/hl_memory/batch_export_hl_memory_dataset_from_subtasks.py \
-  --source-config-name toy_block_placement_Ba_qwen3_5_2b_400m_guided \
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --output-root /root/Users/dataset/hl_memory/subtask \
   --repo-prefix subtask/ \
+  --image-columns auto \
   --workers 4 \
   --auto-export-annotations \
   --overwrite \
@@ -71,7 +71,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch export HL-memory train/val datasets from HF_LEROBOT_HOME/subtask/<task_id>."
     )
-    parser.add_argument("--source-config-name", required=True, help="Base OpenPI training config to reuse transforms/model shape.")
+    parser.add_argument(
+        "--source-config-name",
+        default=None,
+        help="Optional base OpenPI training config. Omit when subtask repos use the standard LeRobot schema.",
+    )
     parser.add_argument("--subtask-root", type=Path, default=DEFAULT_SUBTASK_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--repo-prefix", default="subtask/", help="Repo id prefix. Default makes repo_id=subtask/<task_id>.")
@@ -81,6 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--split-seed", type=int, default=42)
     parser.add_argument("--visual-mode", choices=("raw", "config"), default="raw")
+    parser.add_argument(
+        "--image-columns",
+        default="auto",
+        help=(
+            "Forward to export_hl_memory_dataset.py. `auto` loads all non-mask RGB image columns in each repo; "
+            "`config` reuses the source config dataset_columns; or pass comma-separated columns/views."
+        ),
+    )
     parser.add_argument("--missing-episode-policy", choices=("error", "skip"), default="error")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
@@ -255,8 +267,6 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
         cmd = [
             sys.executable,
             str(args.export_script.resolve()),
-            "--source-config-name",
-            args.source_config_name,
             "--annotations-jsonl",
             str(annotations_jsonl),
             "--output-train-dir",
@@ -271,6 +281,8 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             "subtask_segments.json",
             "--visual-mode",
             args.visual_mode,
+            "--image-columns",
+            args.image_columns,
             "--val-ratio",
             str(args.val_ratio),
             "--split-seed",
@@ -280,6 +292,8 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             "--subtask-progress-quantum",
             str(args.subtask_progress_quantum),
         ]
+        if args.source_config_name:
+            cmd[2:2] = ["--source-config-name", args.source_config_name]
         if args.overwrite:
             cmd.append("--overwrite")
         cmd.extend(passthrough)
