@@ -7,6 +7,7 @@ from typing import Literal
 HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl"]
 Precision = Literal["bfloat16", "float16", "float32"]
 HLVLMParallelMode = Literal["none", "device_map", "tensor_parallel"]
+HLTargetProtocol = Literal["hl_v1", "memer_objective"]
 
 _DEFAULT_VARIANTS: dict[HLVLMBackend, str | None] = {
     "paligemma": None,
@@ -55,6 +56,7 @@ class HLMemoryConfig:
     parallel_mode: HLVLMParallelMode = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
+    target_protocol: HLTargetProtocol = "hl_v1"
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
@@ -63,6 +65,8 @@ class HLMemoryConfig:
             raise ValueError("`precision` must be one of `bfloat16`, `float16`, or `float32`.")
         if self.parallel_mode not in {"none", "device_map", "tensor_parallel"}:
             raise ValueError("`parallel_mode` must be one of `none`, `device_map`, or `tensor_parallel`.")
+        if self.target_protocol not in {"hl_v1", "memer_objective"}:
+            raise ValueError("`target_protocol` must be one of `hl_v1` or `memer_objective`.")
         if not self.device_map.strip():
             raise ValueError("device_map must be non-empty.")
         if not self.tensor_parallel_plan.strip():

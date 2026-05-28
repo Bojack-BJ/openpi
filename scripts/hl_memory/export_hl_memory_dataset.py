@@ -587,6 +587,11 @@ def _export_episode(
             subtask_progress=_quantize_optional_progress(annotation.subtask_progress, subtask_progress_quantum),
             should_advance_objective=annotation.should_advance_objective,
             active_hand=annotation.active_hand,
+            keyframe_label=annotation.keyframe_label,
+            horizon_frame_index=annotation.horizon_frame_index,
+            horizon_current_objective=annotation.horizon_current_objective,
+            horizon_current_subtask=annotation.horizon_current_subtask,
+            horizon_phase=annotation.horizon_phase,
         )
         samples.append(sample)
 

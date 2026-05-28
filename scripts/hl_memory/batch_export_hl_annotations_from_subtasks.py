@@ -82,6 +82,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-query", default="", help="Optional --target-query copied to every annotation row.")
     parser.add_argument("--goal-query", default="", help="Optional --goal-query copied to every annotation row.")
+    parser.add_argument("--sampling-mode", choices=("annotations", "dense-stride"), default="annotations", help="Forward to exporter.")
+    parser.add_argument("--dense-sample-stride-frames", type=int, default=5, help="Forward to exporter.")
+    parser.add_argument("--prediction-horizon-steps", type=int, default=2, help="Forward to exporter.")
+    parser.add_argument("--keyframe-label-mode", choices=("event_boundary", "memer_rules"), default="event_boundary", help="Forward to exporter.")
+    parser.add_argument("--keyframe-rule-path", type=Path, default=None, help="Forward to exporter.")
     parser.add_argument("--emit-success-events", action="store_true", help="Pass --emit-success-events to the exporter.")
     parser.add_argument(
         "--progress-sample-fractions",
@@ -244,6 +249,11 @@ def main() -> None:
             instruction=instruction,
             target_query=args.target_query,
             goal_query=args.goal_query,
+            sampling_mode=args.sampling_mode,
+            dense_sample_stride_frames=args.dense_sample_stride_frames,
+            prediction_horizon_steps=args.prediction_horizon_steps,
+            keyframe_label_mode=args.keyframe_label_mode,
+            keyframe_rule_path=args.keyframe_rule_path,
             emit_success_events=args.emit_success_events,
             progress_sample_fractions=args.progress_sample_fractions,
             progress_extra_fractions=args.progress_extra_fractions,
@@ -399,6 +409,11 @@ def build_export_command(
     instruction: str,
     target_query: str,
     goal_query: str,
+    sampling_mode: str,
+    dense_sample_stride_frames: int,
+    prediction_horizon_steps: int,
+    keyframe_label_mode: str,
+    keyframe_rule_path: Path | None,
     emit_success_events: bool,
     progress_sample_fractions: str,
     progress_extra_fractions: str,
@@ -428,6 +443,12 @@ def build_export_command(
         cmd.extend(["--target-query", target_query])
     if goal_query:
         cmd.extend(["--goal-query", goal_query])
+    cmd.extend(["--sampling-mode", sampling_mode])
+    cmd.extend(["--dense-sample-stride-frames", str(dense_sample_stride_frames)])
+    cmd.extend(["--prediction-horizon-steps", str(prediction_horizon_steps)])
+    cmd.extend(["--keyframe-label-mode", keyframe_label_mode])
+    if keyframe_rule_path is not None:
+        cmd.extend(["--keyframe-rule-path", str(keyframe_rule_path)])
     if emit_success_events:
         cmd.append("--emit-success-events")
     if progress_sample_fractions:

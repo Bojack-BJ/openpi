@@ -107,6 +107,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--reuse-sidecar",
+        action="store_true",
+        help=(
+            "Reuse existing per-task sidecars and only re-expand current input rows. "
+            "Skips model loading; combine with --overwrite when the input sampling changed."
+        ),
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Rewrite each output JSONL from scratch. Equivalent to --no-resume for per-task writes.",
@@ -193,12 +201,12 @@ def main() -> None:
 
 
 def should_run_parallel(args: argparse.Namespace, jobs: list[NormalizeJob]) -> bool:
-    return len(jobs) > 1 and len(resolve_worker_gpu_groups(args)) > 1
+    return not args.reuse_sidecar and len(jobs) > 1 and len(resolve_worker_gpu_groups(args)) > 1
 
 
 def run_jobs_serial(jobs: list[NormalizeJob], *, args: argparse.Namespace) -> list[NormalizeResult]:
     normalizer_module = load_normalizer_module()
-    tokenizer, model = normalizer_module._load_model(args)  # pylint: disable=protected-access
+    tokenizer, model = (None, None) if args.reuse_sidecar else normalizer_module._load_model(args)  # pylint: disable=protected-access
     results: list[NormalizeResult] = []
     for job in jobs:
         result = run_one_job_safely(job, args=args, tokenizer=tokenizer, model=model, normalizer_module=normalizer_module)

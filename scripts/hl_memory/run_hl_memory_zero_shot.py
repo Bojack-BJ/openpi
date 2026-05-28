@@ -101,6 +101,7 @@ class ZeroShotArgs:
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
+    target_protocol: str = "hl_v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -117,6 +118,8 @@ def main(args: ZeroShotArgs) -> None:
     _resolve_video_paths(args)
     if args.task_config_path is not None:
         _load_task_config(args.task_config_path)
+    if args.target_protocol == "memer_objective" and args.known_prior_mode:
+        raise ValueError("`--target-protocol memer_objective` does not support `--known-prior-mode` in v1.")
     config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -136,6 +139,7 @@ def main(args: ZeroShotArgs) -> None:
         parallel_mode=args.parallel_mode,
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
+        target_protocol=args.target_protocol,
     )
     adapter = create_hf_adapter(config)
     resolved_model_path = args.model_path
@@ -220,6 +224,7 @@ def _run_single_prediction(
         "training_fps": args.training_fps,
         "frame_subsample": args.frame_subsample,
         "video_fps": config.video_fps,
+        "target_protocol": config.target_protocol,
         "memory_seconds": list(selection.memory_seconds),
         "recent_seconds": list(selection.recent_seconds),
         "memory_valid_length": clips.memory_valid_length,
@@ -486,6 +491,7 @@ def _run_rollout(
         "training_fps": args.training_fps,
         "frame_subsample": args.frame_subsample,
         "video_fps": config.video_fps,
+        "target_protocol": config.target_protocol,
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
         "known_prior_mode": bool(known_prior_steps),
         "known_prior_steps": list(known_prior_steps),

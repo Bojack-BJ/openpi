@@ -32,6 +32,11 @@ class SubtaskAnnotation:
     active_hand: str = ""
     event_type: str = "none"
     event_text: str = ""
+    keyframe_label: bool | None = None
+    horizon_frame_index: int | None = None
+    horizon_current_objective: str = ""
+    horizon_current_subtask: str = ""
+    horizon_phase: str = ""
 
     def __post_init__(self) -> None:
         if self.frame_index < 0:
@@ -60,6 +65,11 @@ class SubtaskAnnotation:
             active_hand=str(data.get("active_hand", "")).strip(),
             event_type=str(data.get("event_type", "none")).strip(),
             event_text=str(data.get("event_text", "")).strip(),
+            keyframe_label=_parse_optional_bool(data.get("keyframe_label")),
+            horizon_frame_index=_parse_optional_int(data.get("horizon_frame_index")),
+            horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
+            horizon_current_subtask=str(data.get("horizon_current_subtask", "")).strip(),
+            horizon_phase=str(data.get("horizon_phase", "")).strip(),
         )
 
 
@@ -97,10 +107,15 @@ def derive_keyframe_positions(
 ) -> tuple[int, ...]:
     position_lookup = {int(frame_index): position + 1 for position, frame_index in enumerate(recent_indices)}
     positions: list[int] = []
+    explicit_keyframe_labels = any(annotation.keyframe_label is not None for annotation in annotations)
     for annotation_index, annotation in enumerate(annotations[: current_index + 1]):
-        previous = annotations[annotation_index - 1] if annotation_index > 0 else None
-        if not annotation_emits_keyframe(annotation, previous):
-            continue
+        if explicit_keyframe_labels:
+            if annotation.keyframe_label is not True:
+                continue
+        else:
+            previous = annotations[annotation_index - 1] if annotation_index > 0 else None
+            if not annotation_emits_keyframe(annotation, previous):
+                continue
         position = position_lookup.get(annotation.frame_index)
         if position is not None and position not in positions:
             positions.append(position)
@@ -227,3 +242,12 @@ def _parse_optional_bool(value: object) -> bool | None:
     if text in {"false", "0", "no", "n"}:
         return False
     return None
+
+
+def _parse_optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

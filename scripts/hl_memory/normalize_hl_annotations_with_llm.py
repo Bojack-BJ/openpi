@@ -61,6 +61,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--reuse-sidecar",
+        action="store_true",
+        help=(
+            "Reuse an existing task-level sidecar and only re-expand current input rows. "
+            "This skips loading/calling the LLM and is intended for re-normalizing new dense samples."
+        ),
+    )
     parser.add_argument("--granularity", choices=["task", "segment", "row"], default="task")
     parser.add_argument(
         "--sidecar-json",
@@ -85,8 +93,7 @@ def main() -> None:
     if args.limit is not None:
         rows = rows[: args.limit]
     done = _read_done(args.output_jsonl) if args.resume else set()
-    grouped = _group_by_episode(rows)
-    tokenizer, model = _load_model(args)
+    tokenizer, model = (None, None) if args.reuse_sidecar else _load_model(args)
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     with args.output_jsonl.open("a" if args.resume else "w", encoding="utf-8") as stream:
@@ -236,8 +243,13 @@ def _normalize_rows_by_task_sidecar(
 ) -> None:
     sidecar_path = _resolve_sidecar_path(args)
     sidecar = None
-    if bool(args.resume and not getattr(args, "overwrite", False)) and sidecar_path.exists():
+    should_load_existing = bool(args.resume and not getattr(args, "overwrite", False)) or bool(
+        getattr(args, "reuse_sidecar", False)
+    )
+    if should_load_existing and sidecar_path.exists():
         sidecar = _load_task_sidecar(sidecar_path)
+    if sidecar is None and bool(getattr(args, "reuse_sidecar", False)):
+        raise FileNotFoundError(f"--reuse-sidecar requires an existing sidecar: {sidecar_path}")
     if sidecar is None:
         sidecar = _build_task_sidecar(rows, args=args, tokenizer=tokenizer, model=model)
         sidecar_path.parent.mkdir(parents=True, exist_ok=True)
@@ -272,6 +284,14 @@ def _normalize_rows_by_task_sidecar(
                 advance_threshold=float(args.advance_threshold),
                 progress_quantum=float(args.subtask_progress_quantum),
             )
+            normalized.update(
+                _normalized_horizon_fields(
+                    row,
+                    segments=segments,
+                    templates=templates,
+                    canonical_by_subtask=canonical_by_subtask,
+                )
+            )
             output = dict(row)
             output.update(normalized)
             output["llm_gt"] = normalized
@@ -293,6 +313,36 @@ def _resolve_sidecar_path(args: argparse.Namespace) -> pathlib.Path:
         return pathlib.Path(sidecar_json).expanduser().resolve()
     output_jsonl = pathlib.Path(args.output_jsonl).expanduser().resolve()
     return output_jsonl.with_name("hl_segments_llm_sidecar.json")
+
+
+def _normalized_horizon_fields(
+    row: dict[str, Any],
+    *,
+    segments: list[SegmentInfo],
+    templates: dict[int, SegmentTemplate],
+    canonical_by_subtask: dict[str, int | None],
+) -> dict[str, Any]:
+    horizon_frame = row.get("horizon_frame_index")
+    if horizon_frame is None or horizon_frame == "":
+        return {}
+    try:
+        frame_index = int(horizon_frame)
+    except (TypeError, ValueError):
+        return {}
+    horizon_segment = _segment_at_frame(segments, frame_index)
+    if horizon_segment is None:
+        return {}
+    canonical_index = _resolve_canonical_segment_index(
+        horizon_segment,
+        canonical_by_subtask=canonical_by_subtask,
+        template_count=len(templates),
+    )
+    template = templates[canonical_index]
+    return {
+        "horizon_current_objective": template.current_objective,
+        "horizon_current_subtask": template.current_objective,
+        "horizon_phase": template.current_objective,
+    }
 
 
 def _build_task_sidecar(
@@ -489,6 +539,18 @@ def _assign_rows_to_segments(rows: list[dict[str, Any]], segments: list[SegmentI
             segment_index += 1
         assigned[id(row)] = segments[segment_index]
     return assigned
+
+
+def _segment_at_frame(segments: list[SegmentInfo], frame_index: int) -> SegmentInfo | None:
+    for segment in segments:
+        if segment.start_frame <= frame_index < segment.end_frame:
+            return segment
+    if not segments:
+        return None
+    previous = [segment for segment in segments if segment.start_frame <= frame_index]
+    if previous:
+        return previous[-1]
+    return segments[0]
 
 
 def _normalize_segments(

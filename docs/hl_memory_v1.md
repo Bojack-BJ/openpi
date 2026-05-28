@@ -234,6 +234,59 @@ python scripts/hl_memory/export_hl_annotations_from_subtasks.py \
 
 `--progress-sample-fractions` 优先级高于 `--progress-sample-target-frames`，两者都不设置时才回退到 `--progress-sample-stride` / midpoint 旧逻辑。`--progress-extra-fractions` 不参与优先级判断，它总是在主采样模式后额外添加候选点，适合强化切换前的 late-stage 状态。`--progress-sample-jitter` 是 deterministic 的：同一 seed、episode、segment 会生成相同采样点，重跑可复现；不同 episode/segment 的 progress 不会永远落在完全相同的比例位置。正式训练前建议抽查 `hl_annotations.jsonl` 的 progress 分布，确认每个常见 subtask 至少包含 early/mid/late/end 样本。
 
+MEMER-style 对照实验可以复用同一套 `samples.jsonl` schema，只在 raw annotation 里额外写入 horizon label 和显式 keyframe label，再由训练时 `--target-protocol` 决定监督目标。dense 采样命令示例：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtasks.py \
+  --subtask-root /root/Users/dataset/lerobot_home/subtask \
+  --workers 8 \
+  --sampling-mode dense-stride \
+  --dense-sample-stride-frames 5 \
+  --prediction-horizon-steps 2 \
+  --keyframe-label-mode memer_rules \
+  --overwrite \
+  --continue-on-error
+```
+
+新增字段是可选的，旧数据仍可读：
+
+```json
+{
+  "horizon_frame_index": 1234,
+  "horizon_current_objective": "place the cup into the cabinet",
+  "horizon_current_subtask": "place the cup into the cabinet",
+  "horizon_phase": "place the cup into the cabinet",
+  "keyframe_label": true
+}
+```
+
+`--sampling-mode annotations` 是旧路径，继续使用 segment boundary/progress/success rows。`--sampling-mode dense-stride` 会在每个 segment 内每 `--dense-sample-stride-frames` 帧生成一个 sample，并额外强制包含 MEMER keyframe rule 选中的帧。`--prediction-horizon-steps 2` 表示 horizon label 来自 `sample_frame + 2 * dense_sample_stride_frames` 所在 segment，超过 episode 末尾会 clip 到最后一帧；设为 `0` 就是 current-frame objective baseline。
+
+`--keyframe-label-mode event_boundary` 保持旧 keyframe 规则。`--keyframe-label-mode memer_rules` 会用文本规则把 state-changing segments 的代表帧写成显式 keyframe label：默认 `place/release/put/insert/stack/open/close/press/handover/pick up stack` 选 segment 最后一帧，approach/return/retreat/move back/observation 等默认不选。需要改规则时传 `--keyframe-rule-path rules.json`，格式为：
+
+```json
+{
+  "default_select": "none",
+  "rules": [
+    {"match": "place|release|put|insert|stack", "select": "last"},
+    {"match": "pick", "select": "last"}
+  ]
+}
+```
+
+支持的 `select` 是 `none`、`first`、`last`、`both`。导出到 HL dataset 后仍然只写现有 `keyframe_candidate_positions`，不引入新的 keyframe schema。
+
+推荐 ablation matrix：
+
+| Data sampling | Keyframe labels | Target protocol | 用途 |
+| --- | --- | --- | --- |
+| `annotations` | `event_boundary` | `hl_v1` | 当前完整 HL baseline |
+| `dense-stride` | `event_boundary` | `hl_v1` | 单独验证 dense 采样是否解决节奏问题 |
+| `dense-stride` | `memer_rules` | `hl_v1` | 验证更干净的 keyframe label 是否帮助完整 HL |
+| `dense-stride` | `memer_rules` | `memer_objective` | MEMER-style 简化 objective + keyframe baseline |
+| `dense-stride`, horizon=0 | `memer_rules` | `memer_objective` | current-frame objective baseline |
+| `dense-stride`, horizon=2 | `memer_rules` | `memer_objective` | short-horizon objective baseline |
+
 ### 3. LLM GT Normalization Before Dataset Export
 
 这一步在导出 train/val samples 之前执行。它是第 3 步，因为它依赖第 2 步生成的 raw `hl_annotations.jsonl`；不要先 export train/val 再 normalize，否则旧 `samples.jsonl` 不会自动带上新字段。
@@ -329,6 +382,20 @@ PYTHONPATH=src python scripts/hl_memory/batch_round_hl_annotation_progress.py \
 ```
 
 这会同时更新 top-level `subtask_progress` 和 `llm_gt.subtask_progress`；传 `--advance-threshold` 时也会按 round 后的 progress 重新计算 `should_advance_objective`。
+
+如果每个 task 的 `hl_segments_llm_sidecar.json` 已经生成过，但你改了采样方式，例如从 annotations 换成 `dense-stride`，不需要重新调用 27B。先重新生成新的 raw `hl_annotations.jsonl`，再复用旧 sidecar 重新展开每个 sample row：
+
+```bash
+PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py \
+  --annotation-root /root/Users/dataset/lerobot_home/subtask \
+  --input-name hl_annotations.jsonl \
+  --output-name hl_annotations_llm_normalized.jsonl \
+  --reuse-sidecar \
+  --overwrite \
+  --continue-on-error
+```
+
+`--reuse-sidecar` 会跳过模型加载和 LLM generate，只读取每个 task 目录下已有的 `hl_segments_llm_sidecar.json`，把当前 input rows 重新展开成 normalized rows。这里推荐配合 `--overwrite`，因为 row 采样变了以后旧 output 的 done/resume 记录不再代表完整新数据。对于 MEMER-style horizon 数据，reuse-sidecar 展开时也会把 `horizon_current_objective/horizon_current_subtask/horizon_phase` 映射成 sidecar 里的 normalized objective，而不是保留 raw subtask 文本。
 
 输出默认写在每个 task 目录：
 
@@ -555,6 +622,11 @@ exported/
   "subtask_progress": 0.4,
   "should_advance_objective": false,
   "active_hand": "right",
+  "horizon_frame_index": 286,
+  "horizon_current_objective": "return the right hand to the observation region",
+  "horizon_current_subtask": "return the right hand to the observation region",
+  "horizon_phase": "return the right hand to the observation region",
+  "keyframe_label": true,
   "relevant_objects": ["motor", "box"],
   "notes": "none",
   "current_subtask": "place the motor into the box",
@@ -567,7 +639,7 @@ exported/
 }
 ```
 
-训练 target JSON 来自 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/...`。`step_prior` 只进入 prompt 作为 nominal ordered plan，不作为 target JSON 监督。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。
+训练 target JSON 默认来自 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/...`。`step_prior` 只进入 prompt 作为 nominal ordered plan，不作为 target JSON 监督。`updated_language_memory/current_subtask` 是兼容旧代码的派生字段，不应该作为新协议的唯一真值。`horizon_*` 和 `keyframe_label` 是 MEMER-style 对照实验的可选字段；`hl_v1` 默认忽略 horizon objective，`memer_objective` 会优先用 `horizon_current_objective` 作为训练/eval target。
 
 推荐按 episode 做 held-out split，而不是直接用同一个 `exported/` 同时训练和评估。下面这条命令会在一次运行里计算一次 split，并同时生成互斥的 train / val episode，避免两次运行时误填不同 ratio/seed：
 
@@ -655,6 +727,37 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
 Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 prompt tokens 和 padding tokens 置为 `-100`，只监督 target JSON token。Hugging Face causal LM loss 是所有未 mask target tokens 的平均 cross entropy。`grad_accum_steps` 内每个 micro batch 的 loss 会除以 accum steps 再 backward；日志里的 `train/loss` 也按 accum steps 做平均，因此不同 accum 配置下数值可比。DDP 下每个 rank 算本地 loss，日志再跨 rank 求平均。
 
 多任务训练建议优先用 LoRA + `--language-memory-dropout` + `--step-prior-dropout`。原因是不同 task 的语言目标差异大，full finetune 更容易记住任务模板或破坏原 VLM 的通用视觉能力；step prior dropout 则避免模型只背 plan，不看 recent clip。`--num-train-steps` 是 optimizer steps，不是 epoch；实际见过的样本数约等于 `num_train_steps * global_batch_size`，需要按总 sample 数和任务数量估算。
+
+训练协议由 `--target-protocol` 控制：
+
+- `--target-protocol hl_v1`：默认完整 HL V1 target，监督 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/keyframes/...`。
+- `--target-protocol memer_objective`：MEMER-style 简化 target，只监督 `{"current_objective": "...", "keyframe_candidate_positions": [...]}`。如果 sample 有 `horizon_current_objective`，优先监督 horizon objective；否则 fallback 到当前帧 `current_objective`。
+
+MEMER-style 训练示例：
+
+```bash
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
+  --dataset-root /root/Users/dataset/hl_memory/subtask_dense \
+  --dataset-glob '*/train' \
+  --val-dataset-root /root/Users/dataset/hl_memory/subtask_dense \
+  --val-dataset-glob '*/val' \
+  --output-dir /root/Users/checkpoints/hl_memory/subtask_dense_memer_objective_qwen35_lora \
+  --target-protocol memer_objective \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
+  --precision bfloat16 \
+  --learning-rate 5e-6 \
+  --lora-enabled \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --batch-size 1 \
+  --grad-accum-steps 8 \
+  --num-train-steps 1500 \
+  --val-interval 100 \
+  --val-batches 10
+```
 
 单任务训练仍然保留，适合先确认某一个 dataset export 没有格式问题：
 
@@ -773,6 +876,23 @@ python scripts/hl_memory/eval_hl_memory_rollout.py \
 评估默认跑四种 ablation：`no_memory`、`language_memory_only`、`keyframe_memory_only`、`full`。核心指标包括 `objective_exact_match` / `objective_normalized_match`、progress/advance/active-hand accuracy、target/goal accuracy、keyframe precision/recall、memory similarity/drift。
 
 当前 HL V1 主协议以 `current_objective`、`subtask_progress`、`should_advance_objective` 为主。Eval 的主指标是 `objective_*`、`subtask_progress_mae`、`subtask_progress_accuracy_0_1`、`should_advance_accuracy`、`active_hand_accuracy`、`target_query_accuracy`、`goal_query_accuracy`。`legacy_subtask_*`、`legacy_phase_accuracy`、`legacy_event_accuracy` 只用于排查旧字段兼容问题，不建议作为是否训好的主判断。
+
+如果训练时用了 `--target-protocol memer_objective`，eval 也必须显式传同一个协议：
+
+```bash
+python scripts/hl_memory/eval_hl_memory_rollout.py \
+  --dataset-dir /root/Users/dataset/hl_memory/subtask_dense/20260116W001/val \
+  --model-path /root/Users/checkpoints/hl_memory/subtask_dense_memer_objective_qwen35_lora/checkpoint-step-001500 \
+  --target-protocol memer_objective \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --device cuda \
+  --eval-modes full \
+  --output-json /root/Users/eval/hl_memory/memer_objective/eval_metrics.json \
+  --prediction-jsonl /root/Users/eval/hl_memory/memer_objective/full_predictions.jsonl
+```
+
+`memer_objective` 的主指标是 `objective_exact_match/objective_normalized_match` 和 `keyframe_precision/keyframe_recall`。progress、advance、language memory、target/goal 等指标仍会输出，但该协议没有监督这些字段，不应作为主判断。
 
 快速 smoke eval 可以先只跑少量未见 episode 或单个 ablation：
 
@@ -927,6 +1047,7 @@ Input rules：
 | `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
 | `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |
 | `--vlm-variant` | Qwen3.5 变体，例如 `qwen3_5_2b`，也可用短名 `2b` / `4b` / `27b`。 |
+| `--target-protocol` | 推理 prompt/输出协议，默认 `hl_v1`；`memer_objective` 只输出 objective + keyframes，不能和 `--known-prior-mode` 同时使用。 |
 | `--precision` | 推理精度，常用 `float16` 或 `bfloat16`；遇到 vision/cuDNN 问题先试 `float16`。 |
 | `--device` | 推理设备，通常是 `cuda`；CPU 只适合小模型/调试。 |
 
@@ -979,6 +1100,23 @@ rollout 和调试参数：
 ```json
 {"episode_index": 0, "frame_index": 276, "current_subtask": "place the motor into the box"}
 ```
+
+MEMER-style 对照实验可选字段：
+
+```json
+{
+  "episode_index": 0,
+  "frame_index": 276,
+  "current_subtask": "place the motor into the box",
+  "horizon_frame_index": 286,
+  "horizon_current_objective": "return the hand to the observation region",
+  "horizon_current_subtask": "return the hand to the observation region",
+  "horizon_phase": "return the hand to the observation region",
+  "keyframe_label": true
+}
+```
+
+这些字段向后兼容：旧 `hl_v1` 训练仍读当前帧字段；`memer_objective` 训练/eval 才会把 `horizon_current_objective` 当作 expected objective。`keyframe_label` 只影响导出 samples 时的 `keyframe_candidate_positions` 计算，不改变最终 keyframe schema。
 
 推荐行：
 

@@ -110,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--auto-export-annotations", action="store_true", help="Create hl_annotations.jsonl when missing.")
     parser.add_argument("--emit-success-events", action="store_true", help="Forward to annotation exporter when auto-exporting.")
+    parser.add_argument("--sampling-mode", choices=("annotations", "dense-stride"), default="annotations", help="Forward to annotation exporter.")
+    parser.add_argument("--dense-sample-stride-frames", type=int, default=5, help="Forward to annotation exporter.")
+    parser.add_argument("--prediction-horizon-steps", type=int, default=2, help="Forward to annotation exporter.")
+    parser.add_argument("--keyframe-label-mode", choices=("event_boundary", "memer_rules"), default="event_boundary", help="Forward to annotation exporter.")
+    parser.add_argument("--keyframe-rule-path", type=Path, default=None, help="Forward to annotation exporter.")
     parser.add_argument("--progress-sample-stride", type=int, default=0, help="Forward to annotation exporter.")
     parser.add_argument("--progress-sample-fractions", default="", help="Forward to annotation exporter.")
     parser.add_argument("--progress-extra-fractions", default="", help="Forward to annotation exporter.")
@@ -241,6 +246,12 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             ]
             if args.emit_success_events:
                 annotation_cmd.append("--emit-success-events")
+            annotation_cmd.extend(["--sampling-mode", args.sampling_mode])
+            annotation_cmd.extend(["--dense-sample-stride-frames", str(args.dense_sample_stride_frames)])
+            annotation_cmd.extend(["--prediction-horizon-steps", str(args.prediction_horizon_steps)])
+            annotation_cmd.extend(["--keyframe-label-mode", args.keyframe_label_mode])
+            if args.keyframe_rule_path is not None:
+                annotation_cmd.extend(["--keyframe-rule-path", str(args.keyframe_rule_path)])
             if args.progress_sample_stride > 0:
                 annotation_cmd.extend(["--progress-sample-stride", str(args.progress_sample_stride)])
             if args.progress_sample_fractions:

@@ -46,8 +46,10 @@ def group_samples_by_episode(
 def compute_prediction_metrics(
     prediction: HLMemoryPrediction,
     sample: ExportedHLMemorySample,
+    *,
+    target_protocol: str = "hl_v1",
 ) -> dict[str, float]:
-    expected = sample.target_prediction()
+    expected = sample.target_prediction(target_protocol=target_protocol)
     expected_positions = set(expected.keyframe_candidate_positions)
     predicted_positions = set(prediction.keyframe_candidate_positions)
     overlap = expected_positions & predicted_positions
@@ -122,7 +124,7 @@ def run_offline_rollout(
             runtime_sample = state.runtime_sample(mode=mode)
             prediction = predict_fn(runtime_sample)
             prediction = state.postprocess_prediction(prediction, mode=mode)
-            metrics = compute_prediction_metrics(prediction, sample)
+            metrics = compute_prediction_metrics(prediction, sample, target_protocol=hl_config.target_protocol)
             for key, value in metrics.items():
                 totals[key] += value
             if on_prediction is not None:
@@ -216,7 +218,11 @@ def run_offline_rollout_batched(
             state = states[episode_index]
             source_sample = state.current_sample
             prediction = state.postprocess_prediction(prediction, mode=mode)
-            metrics = compute_prediction_metrics(prediction, source_sample)
+            metrics = compute_prediction_metrics(
+                prediction,
+                source_sample,
+                target_protocol=hl_config.target_protocol,
+            )
             for key, value in metrics.items():
                 totals[key] += value
             if on_prediction is not None:
@@ -265,6 +271,7 @@ class _EpisodeRolloutState:
         }
         self.known_prior_steps = self.samples[0].step_prior if self.samples else ()
         self.known_prior_index = 0
+        self.target_protocol = hl_config.target_protocol
         self.language_memory = self._initial_language_memory()
         self.sample_index = 0
         self.sequence_ok = True
@@ -317,7 +324,7 @@ class _EpisodeRolloutState:
         source_sample = self.current_sample
         self.sequence_ok &= (
             _normalize_text(prediction.current_objective)
-            == _normalize_text(source_sample.target_prediction().current_objective)
+            == _normalize_text(source_sample.target_prediction(target_protocol=self.target_protocol).current_objective)
         )
         if mode in ("language_memory_only", "full"):
             self.language_memory = prediction.updated_language_memory

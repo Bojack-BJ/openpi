@@ -76,6 +76,11 @@ class ExportedHLMemorySample:
     subtask_progress: float | None = None
     should_advance_objective: bool | None = None
     active_hand: str = ""
+    keyframe_label: bool | None = None
+    horizon_frame_index: int | None = None
+    horizon_current_objective: str = ""
+    horizon_current_subtask: str = ""
+    horizon_phase: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ExportedHLMemorySample":
@@ -110,6 +115,11 @@ class ExportedHLMemorySample:
             subtask_progress=_parse_optional_float(data.get("subtask_progress")),
             should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
             active_hand=str(data.get("active_hand", "")).strip(),
+            keyframe_label=_parse_optional_bool(data.get("keyframe_label")),
+            horizon_frame_index=_parse_optional_int(data.get("horizon_frame_index")),
+            horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
+            horizon_current_subtask=str(data.get("horizon_current_subtask", "")).strip(),
+            horizon_phase=str(data.get("horizon_phase", "")).strip(),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -142,9 +152,29 @@ class ExportedHLMemorySample:
             "subtask_progress": self.subtask_progress,
             "should_advance_objective": self.should_advance_objective,
             "active_hand": self.active_hand,
+            "keyframe_label": self.keyframe_label,
+            "horizon_frame_index": self.horizon_frame_index,
+            "horizon_current_objective": self.horizon_current_objective,
+            "horizon_current_subtask": self.horizon_current_subtask,
+            "horizon_phase": self.horizon_phase,
         }
 
-    def target_prediction(self) -> HLMemoryPrediction:
+    def target_prediction(self, *, target_protocol: str = "hl_v1") -> HLMemoryPrediction:
+        if target_protocol == "memer_objective":
+            objective = self.horizon_current_objective or self.current_objective or self.current_subtask
+            subtask = self.horizon_current_subtask or objective
+            phase = self.horizon_phase or subtask
+            return HLMemoryPrediction(
+                updated_language_memory="",
+                current_subtask=subtask,
+                keyframe_candidate_positions=self.keyframe_candidate_positions,
+                phase=phase,
+                target_query="",
+                goal_query="",
+                current_objective=objective,
+            )
+        if target_protocol != "hl_v1":
+            raise ValueError(f"Unsupported target_protocol: {target_protocol!r}")
         return HLMemoryPrediction(
             updated_language_memory=self.updated_language_memory,
             current_subtask=self.current_subtask,
@@ -322,6 +352,15 @@ def _parse_optional_bool(value: object) -> bool | None:
     if text in {"false", "0", "no", "n"}:
         return False
     return None
+
+
+def _parse_optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def build_loaded_video_clips_from_frames(

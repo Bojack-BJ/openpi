@@ -18,6 +18,36 @@ def test_derive_keyframe_positions_uses_boundaries_and_events():
     assert positions == (1, 2, 3)
 
 
+def test_derive_keyframe_positions_uses_explicit_keyframe_labels_when_present():
+    annotations = [
+        SubtaskAnnotation(
+            episode_index=0,
+            frame_index=0,
+            current_subtask="approach apple",
+            event_type="subtask_boundary",
+            keyframe_label=False,
+        ),
+        SubtaskAnnotation(
+            episode_index=0,
+            frame_index=5,
+            current_subtask="place apple",
+            event_type="success",
+            keyframe_label=True,
+        ),
+        SubtaskAnnotation(
+            episode_index=0,
+            frame_index=9,
+            current_subtask="return hand",
+            event_type="subtask_boundary",
+            keyframe_label=False,
+        ),
+    ]
+
+    positions = derive_keyframe_positions(annotations, 2, [0, 5, 9])
+
+    assert positions == (2,)
+
+
 def test_render_language_memory_defaults_when_no_progress():
     assert render_language_memory(TaskProgressState()) == DEFAULT_LANGUAGE_MEMORY
     assert "Task progress: No completed subtask yet." in DEFAULT_LANGUAGE_MEMORY

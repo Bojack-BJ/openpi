@@ -44,6 +44,7 @@ class TrainArgs:
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
+    target_protocol: str = "hl_v1"
     learning_rate: float = 5e-6
     weight_decay: float = 1e-4
     lora_enabled: bool = False
@@ -119,6 +120,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         parallel_mode=args.parallel_mode,
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
+        target_protocol=args.target_protocol,
     )
     adapter = create_hf_adapter(hl_config)
     device = _resolve_training_device(args, distributed=distributed)

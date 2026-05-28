@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import random
+import re
 from typing import Any
 
 
@@ -64,6 +65,36 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--instruction", default="", help="Optional task instruction copied to every annotation.")
     parser.add_argument("--target-query", default="", help="Optional target query copied to every annotation.")
     parser.add_argument("--goal-query", default="", help="Optional goal query copied to every annotation.")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("annotations", "dense-stride"),
+        default="annotations",
+        help="Annotation sampling mode. `annotations` keeps the existing segment/progress samples; `dense-stride` samples every N frames.",
+    )
+    parser.add_argument(
+        "--dense-sample-stride-frames",
+        type=int,
+        default=5,
+        help="Frame stride for --sampling-mode dense-stride.",
+    )
+    parser.add_argument(
+        "--prediction-horizon-steps",
+        type=int,
+        default=2,
+        help="Horizon label offset in dense stride steps. The horizon frame is clipped to the episode end.",
+    )
+    parser.add_argument(
+        "--keyframe-label-mode",
+        choices=("event_boundary", "memer_rules"),
+        default="event_boundary",
+        help="How to label keyframe supervision. `event_boundary` keeps legacy behavior; `memer_rules` writes explicit sparse keyframe labels.",
+    )
+    parser.add_argument(
+        "--keyframe-rule-path",
+        type=pathlib.Path,
+        default=None,
+        help="Optional JSON rule file for --keyframe-label-mode memer_rules.",
+    )
     parser.add_argument(
         "--start-episode-index",
         type=int,
@@ -396,6 +427,19 @@ def _segments_to_rows(
     segments: list[Segment],
     args: argparse.Namespace,
 ) -> list[dict[str, object]]:
+    if args.dense_sample_stride_frames <= 0:
+        raise ValueError("--dense-sample-stride-frames must be positive.")
+    if args.prediction_horizon_steps < 0:
+        raise ValueError("--prediction-horizon-steps must be non-negative.")
+    keyframe_labels = _build_keyframe_label_map(segments, args)
+    if args.sampling_mode == "dense-stride":
+        return _dense_stride_rows(
+            episode_index=episode_index,
+            segments=segments,
+            args=args,
+            keyframe_labels=keyframe_labels,
+        )
+
     rows: list[dict[str, object]] = []
     progress_fractions = _parse_progress_sample_fractions(args.progress_sample_fractions)
     progress_extra_fractions = _parse_progress_sample_fractions(args.progress_extra_fractions)
@@ -409,6 +453,8 @@ def _segments_to_rows(
                 event_type="subtask_boundary",
                 event_text=f"Started {subtask}.",
                 args=args,
+                segments=segments,
+                keyframe_label=keyframe_labels.get(start),
             )
         )
         sampling = _progress_sampling_config(
@@ -449,6 +495,8 @@ def _segments_to_rows(
                     event_type="progress",
                     event_text=f"Continuing {subtask}.",
                     args=args,
+                    segments=segments,
+                    keyframe_label=keyframe_labels.get(progress_frame),
                 )
             )
         if args.emit_success_events:
@@ -460,9 +508,128 @@ def _segments_to_rows(
                     event_type="success",
                     event_text=f"Completed {subtask}.",
                     args=args,
+                    segments=segments,
+                    keyframe_label=keyframe_labels.get(end - 1),
+                )
+            )
+        for keyframe_frame, enabled in sorted(keyframe_labels.items()):
+            if not enabled or not start <= keyframe_frame < end:
+                continue
+            if keyframe_frame in {start, end - 1} or any(
+                int(row["frame_index"]) == keyframe_frame and int(row["episode_index"]) == episode_index
+                for row in rows
+            ):
+                continue
+            rows.append(
+                _make_row(
+                    episode_index=episode_index,
+                    frame_index=keyframe_frame,
+                    subtask=subtask,
+                    event_type="progress",
+                    event_text=f"Continuing {subtask}.",
+                    args=args,
+                    segments=segments,
+                    keyframe_label=True,
                 )
             )
     return _dedupe_rows(rows)
+
+
+def _dense_stride_rows(
+    *,
+    episode_index: int,
+    segments: list[Segment],
+    args: argparse.Namespace,
+    keyframe_labels: dict[int, bool],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    stride = int(args.dense_sample_stride_frames)
+    forced_keyframes = {frame for frame, enabled in keyframe_labels.items() if enabled}
+    for start, end, subtask in segments:
+        sample_frames = set(range(start, end, stride))
+        sample_frames.update(frame for frame in forced_keyframes if start <= frame < end)
+        for frame_index in sorted(sample_frames):
+            event_type = "progress"
+            event_text = f"Continuing {subtask}."
+            if frame_index == start:
+                event_type = "subtask_boundary"
+                event_text = f"Started {subtask}."
+            elif args.emit_success_events and frame_index == end - 1:
+                event_type = "success"
+                event_text = f"Completed {subtask}."
+            rows.append(
+                _make_row(
+                    episode_index=episode_index,
+                    frame_index=frame_index,
+                    subtask=subtask,
+                    event_type=event_type,
+                    event_text=event_text,
+                    args=args,
+                    segments=segments,
+                    keyframe_label=keyframe_labels.get(frame_index),
+                )
+            )
+    return _dedupe_rows(rows)
+
+
+def _build_keyframe_label_map(segments: list[Segment], args: argparse.Namespace) -> dict[int, bool]:
+    if args.keyframe_label_mode == "event_boundary":
+        return {}
+    rules = _load_keyframe_rules(args.keyframe_rule_path)
+    labels: dict[int, bool] = {}
+    for start, end, subtask in segments:
+        selection = _select_keyframe_rule(subtask, rules)
+        for frame in _selected_keyframe_frames(start, end, selection):
+            labels[frame] = True
+        if selection == "none":
+            for frame in range(start, end):
+                labels.setdefault(frame, False)
+    return labels
+
+
+def _load_keyframe_rules(path: pathlib.Path | None) -> dict[str, object]:
+    if path is None:
+        return {
+            "default_select": "none",
+            "rules": [
+                {"match": "place|release|put|insert|stack|open|close|press|handover|pick up stack", "select": "last"},
+            ],
+        }
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in --keyframe-rule-path: {path}")
+    return payload
+
+
+def _select_keyframe_rule(subtask: str, rules: dict[str, object]) -> str:
+    default_select = str(rules.get("default_select", "none")).strip().lower() or "none"
+    for rule in rules.get("rules", []):
+        if not isinstance(rule, dict):
+            continue
+        pattern = str(rule.get("match", "")).strip()
+        if not pattern:
+            continue
+        if re.search(pattern, subtask, flags=re.IGNORECASE):
+            return _normalize_keyframe_select(rule.get("select", default_select))
+    return _normalize_keyframe_select(default_select)
+
+
+def _normalize_keyframe_select(value: object) -> str:
+    selection = str(value).strip().lower()
+    if selection not in {"none", "first", "last", "both"}:
+        raise ValueError(f"Unsupported keyframe select value: {value!r}")
+    return selection
+
+
+def _selected_keyframe_frames(start: int, end: int, selection: str) -> list[int]:
+    if selection == "none" or start >= end:
+        return []
+    if selection == "first":
+        return [start]
+    if selection == "last":
+        return [end - 1]
+    return [start] if end - 1 == start else [start, end - 1]
 
 
 def _parse_progress_sample_fractions(value: str) -> list[float]:
@@ -723,7 +890,15 @@ def _make_row(
     event_type: str,
     event_text: str,
     args: argparse.Namespace,
+    segments: list[Segment],
+    keyframe_label: bool | None = None,
 ) -> dict[str, object]:
+    horizon_frame, horizon_subtask = _horizon_label(
+        frame_index=frame_index,
+        segments=segments,
+        dense_stride_frames=args.dense_sample_stride_frames,
+        horizon_steps=args.prediction_horizon_steps,
+    )
     row: dict[str, object] = {
         "episode_index": int(episode_index),
         "frame_index": int(frame_index),
@@ -731,7 +906,13 @@ def _make_row(
         "phase": subtask,
         "event_type": event_type,
         "event_text": event_text,
+        "horizon_frame_index": int(horizon_frame),
+        "horizon_current_objective": horizon_subtask,
+        "horizon_current_subtask": horizon_subtask,
+        "horizon_phase": horizon_subtask,
     }
+    if keyframe_label is not None:
+        row["keyframe_label"] = bool(keyframe_label)
     for key, value in (
         ("instruction", args.instruction),
         ("target_query", args.target_query),
@@ -740,6 +921,37 @@ def _make_row(
         if value:
             row[key] = value
     return row
+
+
+def _horizon_label(
+    *,
+    frame_index: int,
+    segments: list[Segment],
+    dense_stride_frames: int,
+    horizon_steps: int,
+) -> tuple[int, str]:
+    if not segments:
+        return int(frame_index), ""
+    max_frame = max(end - 1 for _start, end, _subtask in segments)
+    target_frame = min(int(frame_index) + int(horizon_steps) * int(dense_stride_frames), max_frame)
+    segment = _segment_at_frame(segments, target_frame)
+    if segment is None:
+        # Sidecars occasionally have gaps. Use the nearest previous segment, then nearest next as fallback.
+        previous = [item for item in segments if item[0] <= target_frame]
+        if previous:
+            segment = previous[-1]
+        else:
+            segment = segments[0]
+        target_frame = max(segment[0], min(target_frame, segment[1] - 1))
+    return int(target_frame), segment[2]
+
+
+def _segment_at_frame(segments: list[Segment], frame_index: int) -> Segment | None:
+    for segment in segments:
+        start, end, _subtask = segment
+        if start <= frame_index < end:
+            return segment
+    return None
 
 
 def _sort_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:

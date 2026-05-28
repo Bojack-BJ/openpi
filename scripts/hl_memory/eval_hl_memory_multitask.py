@@ -50,6 +50,7 @@ class EvalArgs:
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
+    target_protocol: str = "hl_v1"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     frame_cache_size: int = 512
     eval_modes: str = "sample_context"
@@ -79,6 +80,7 @@ def main(args: EvalArgs) -> None:
         parallel_mode=args.parallel_mode,
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
+        target_protocol=args.target_protocol,
     )
     adapter = create_hf_adapter(hl_config)
     logging.info("[stage] loading model from %s", args.model_path)
@@ -97,6 +99,7 @@ def main(args: EvalArgs) -> None:
         if mode == "sample_context":
             metrics[mode] = _run_sample_context_eval(
                 items,
+                hl_config,
                 predict,
                 prediction_rows=prediction_rows if mode == modes[-1] else None,
                 show_progress=args.progress,
@@ -115,6 +118,7 @@ def main(args: EvalArgs) -> None:
         "model_path": str(args.model_path),
         "dataset_root": str(args.dataset_root),
         "dataset_glob": args.dataset_glob,
+        "target_protocol": hl_config.target_protocol,
         "num_dataset_dirs": len(dataset_dirs),
         "num_samples": len(items),
         "metrics": metrics,
@@ -206,15 +210,21 @@ def _run_multitask_rollout(
                 )
                 runtime_item = RuntimeSample(dataset_dir=item.dataset_dir, sample=runtime_sample)
                 prediction = predict_fn(runtime_item)
-                metrics = compute_prediction_metrics(prediction, item.sample)
+                metrics = compute_prediction_metrics(
+                    prediction,
+                    item.sample,
+                    target_protocol=hl_config.target_protocol,
+                )
                 for key, value in metrics.items():
                     totals[key] += value
                 sequence_ok &= _normalize(prediction.current_objective) == _normalize(
-                    item.sample.target_prediction().current_objective
+                    item.sample.target_prediction(target_protocol=hl_config.target_protocol).current_objective
                 )
                 total_steps += 1
                 if prediction_rows is not None:
-                    prediction_rows.append(_prediction_row(item, prediction, metrics))
+                    prediction_rows.append(
+                        _prediction_row(item, prediction, metrics, target_protocol=hl_config.target_protocol)
+                    )
                 if mode in ("language_memory_only", "full"):
                     language_memory = prediction.updated_language_memory
                 if mode in ("keyframe_memory_only", "full"):
@@ -236,6 +246,7 @@ def _run_multitask_rollout(
 
 def _run_sample_context_eval(
     items: Sequence[RuntimeSample],
+    hl_config: HLMemoryConfig,
     predict_fn,
     *,
     prediction_rows: list[dict[str, object]] | None,
@@ -247,11 +258,17 @@ def _run_sample_context_eval(
     try:
         for item in items:
             prediction = predict_fn(item)
-            metrics = compute_prediction_metrics(prediction, item.sample)
+            metrics = compute_prediction_metrics(
+                prediction,
+                item.sample,
+                target_protocol=hl_config.target_protocol,
+            )
             for key, value in metrics.items():
                 totals[key] += value
             if prediction_rows is not None:
-                prediction_rows.append(_prediction_row(item, prediction, metrics))
+                prediction_rows.append(
+                    _prediction_row(item, prediction, metrics, target_protocol=hl_config.target_protocol)
+                )
             progress.update(1)
     finally:
         progress.close()
@@ -277,7 +294,7 @@ def _with_ablation_context(sample, *, mode, memory, frame_lookup, language_memor
     )
 
 
-def _prediction_row(item: RuntimeSample, prediction, metrics: dict[str, float]) -> dict[str, object]:
+def _prediction_row(item: RuntimeSample, prediction, metrics: dict[str, float], *, target_protocol: str = "hl_v1") -> dict[str, object]:
     sample = item.sample
     return {
         "task_id": item.dataset_dir.parent.name,
@@ -286,7 +303,7 @@ def _prediction_row(item: RuntimeSample, prediction, metrics: dict[str, float]) 
         "episode_index": sample.episode_index,
         "step_index": sample.step_index,
         "instruction": sample.instruction,
-        "expected": sample.target_prediction().to_dict(),
+        "expected": sample.target_prediction(target_protocol=target_protocol).to_dict(),
         "prediction": prediction.to_dict(),
         "metrics": metrics,
     }

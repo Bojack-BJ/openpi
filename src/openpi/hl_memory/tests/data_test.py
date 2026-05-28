@@ -11,6 +11,58 @@ from openpi.hl_memory.data import build_loaded_video_clips_from_frames
 from openpi.hl_memory.data import load_video_clips_for_sample
 
 
+def _sample(**overrides) -> ExportedHLMemorySample:
+    values = dict(
+        sample_id="sample",
+        episode_index=0,
+        step_index=0,
+        frame_index=0,
+        instruction="task",
+        language_memory="memory",
+        updated_language_memory="updated",
+        current_subtask="current step",
+        phase="current phase",
+        target_query="target",
+        goal_query="goal",
+        keyframe_candidate_positions=(1, 3),
+        memory_frame_paths=(),
+        memory_frame_indices=(),
+        memory_valid_length=0,
+        recent_frame_paths=("frames/recent.png",),
+        recent_frame_indices=(0,),
+        recent_valid_length=1,
+    )
+    values.update(overrides)
+    return ExportedHLMemorySample(**values)
+
+
+def test_memer_objective_target_uses_horizon_objective_when_available():
+    sample = _sample(
+        current_objective="current objective",
+        horizon_frame_index=10,
+        horizon_current_objective="horizon objective",
+        horizon_current_subtask="horizon subtask",
+        horizon_phase="horizon phase",
+    )
+
+    prediction = sample.target_prediction(target_protocol="memer_objective")
+
+    assert prediction.current_objective == "horizon objective"
+    assert prediction.current_subtask == "horizon subtask"
+    assert prediction.phase == "horizon phase"
+    assert prediction.keyframe_candidate_positions == (1, 3)
+    assert prediction.target_query == ""
+    assert prediction.goal_query == ""
+
+
+def test_memer_objective_target_falls_back_to_current_objective():
+    sample = _sample(current_objective="current objective")
+
+    prediction = sample.target_prediction(target_protocol="memer_objective")
+
+    assert prediction.current_objective == "current objective"
+
+
 def test_load_video_clips_for_sample_pads_and_tracks_valid_lengths():
     with tempfile.TemporaryDirectory() as tmp_dir:
         root = pathlib.Path(tmp_dir)

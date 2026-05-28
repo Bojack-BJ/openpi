@@ -66,3 +66,14 @@ def test_hl_memory_config_derives_video_fps_from_training_rate_and_subsample():
     assert config.video_fps == 4.0
     assert config.frame_width == 456
     assert config.frame_height == 224
+
+
+def test_target_protocol_accepts_memer_objective():
+    config = HLMemoryConfig(target_protocol="memer_objective")
+
+    assert config.target_protocol == "memer_objective"
+
+
+def test_target_protocol_rejects_unknown_value():
+    with pytest.raises(ValueError, match="target_protocol"):
+        HLMemoryConfig(target_protocol="unknown")  # type: ignore[arg-type]

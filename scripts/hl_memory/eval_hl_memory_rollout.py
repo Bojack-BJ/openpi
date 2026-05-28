@@ -42,6 +42,7 @@ class EvalArgs:
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
+    target_protocol: str = "hl_v1"
     output_json: pathlib.Path | None = None
     prediction_jsonl: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -101,6 +102,7 @@ def main(args: EvalArgs) -> None:
         parallel_mode=args.parallel_mode,
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
+        target_protocol=args.target_protocol,
     )
     logging.info("[stage] creating adapter")
     adapter = create_hf_adapter(hl_config)
@@ -125,7 +127,7 @@ def main(args: EvalArgs) -> None:
         known_prior_match_threshold=args.known_prior_match_threshold,
         known_prior_max_advance_steps=args.known_prior_max_advance_steps,
     )
-    prediction_writer = _PredictionJsonlWriter(args.prediction_jsonl)
+    prediction_writer = _PredictionJsonlWriter(args.prediction_jsonl, target_protocol=hl_config.target_protocol)
     try:
         metrics = _evaluate_with_progress(
             grouped,
@@ -294,8 +296,9 @@ def _filter_samples(
 
 
 class _PredictionJsonlWriter:
-    def __init__(self, path: pathlib.Path | None):
+    def __init__(self, path: pathlib.Path | None, *, target_protocol: str):
         self._handle = None
+        self._target_protocol = target_protocol
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._handle = path.open("w", encoding="utf-8")
@@ -303,7 +306,7 @@ class _PredictionJsonlWriter:
     def write(self, *, mode, runtime_sample, source_sample, prediction, metrics) -> None:
         if self._handle is None:
             return
-        expected = source_sample.target_prediction()
+        expected = source_sample.target_prediction(target_protocol=self._target_protocol)
         payload = {
             "mode": mode,
             "sample_id": source_sample.sample_id,

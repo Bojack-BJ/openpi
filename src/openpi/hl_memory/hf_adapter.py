@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import pathlib
 import time
@@ -300,6 +301,8 @@ class BaseHLVLMAdapter:
         return tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
+        if self.config.target_protocol == "memer_objective":
+            return self._build_memer_objective_prompt(sample, clips)
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
         step_prior = _render_step_prior(sample.step_prior)
         current_width, current_height = _current_recent_frame_size(clips)
@@ -412,6 +415,18 @@ class BaseHLVLMAdapter:
         )
 
     def build_system_prompt(self) -> str:
+        if self.config.target_protocol == "memer_objective":
+            thinking_instruction = (
+                f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
+                "valid JSON object after the thinking text."
+                if self.config.enable_thinking
+                else "Do not output chain-of-thought or analysis text. Output only valid JSON."
+            )
+            return (
+                "You are a robot high-level objective classifier and visual memory selector. Use the ordered "
+                "historical keyframes and recent observation clip to predict the short-horizon executable objective "
+                f"for the robot. {thinking_instruction}"
+            )
         thinking_instruction = (
             f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
             "valid JSON object after the thinking text."
@@ -427,10 +442,51 @@ class BaseHLVLMAdapter:
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
-        prediction = sample.target_prediction()
+        prediction = sample.target_prediction(target_protocol=self.config.target_protocol)
+        if self.config.target_protocol == "memer_objective":
+            return json.dumps(
+                {
+                    "current_objective": prediction.current_objective,
+                    "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
         if not prediction.sam_text_prompt and sample.target_query:
             prediction = dataclasses.replace(prediction, sam_text_prompt=sample.target_query)
         return prediction.to_json()
+
+    def _build_memer_objective_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
+        thinking_instruction = (
+            "Thinking is enabled. If you produce private reasoning, keep it brief and finish with exactly one final "
+            "JSON object.\n"
+            if self.config.enable_thinking
+            else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
+        )
+        horizon_text = (
+            "Predict the short-horizon objective a few frames after the current frame, using recent motion as context.\n"
+            if sample.horizon_frame_index is not None
+            else "Predict the current executable objective at the last valid recent frame.\n"
+        )
+        return (
+            "You receive two ordered video clips.\n"
+            "The first clip contains selected historical keyframes from earlier in the episode.\n"
+            "The second clip contains the recent observation window, ordered oldest to newest.\n"
+            f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
+            f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+            f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
+            "is the last/current valid frame.\n"
+            "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
+            f"{horizon_text}"
+            "Return exactly one JSON object with keys `current_objective` and `keyframe_candidate_positions`.\n"
+            "`current_objective` must be one short executable robot instruction.\n"
+            "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
+            f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
+            "Select only recent frames that should be kept as long-term visual memory for future decisions; return [] if none.\n"
+            "Do not include progress, language memory, notes, markdown, explanation text, or extra keys.\n"
+            f"{thinking_instruction}"
+            f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
+        )
 
     def _fallback_prediction(self, sample: ExportedHLMemorySample) -> HLMemoryPrediction:
         previous_fields = _parse_ll_memory_fields(sample.language_memory)
