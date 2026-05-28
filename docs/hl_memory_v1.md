@@ -607,7 +607,7 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --dataset-glob '*/train' \
   --val-dataset-root /root/Users/dataset/hl_memory/subtask \
   --val-dataset-glob '*/val' \
-  --output-dir /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora \
+  --output-dir /root/Users/checkpoints/hl_memory/subtask_multitask_qwen35_lora_with_prior_new_sampling \
   --vlm-backend qwen3_5_vl \
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
@@ -628,14 +628,14 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --batch-size 1 \
   --grad-accum-steps 32 \
   --frame-cache-size 4096 \
-  --num-train-steps 2000 \
+  --num-train-steps 6000 \
   --save-interval 200 \
   --log-interval 10 \
   --val-interval 100 \
   --val-batches 10 \
   --wandb-enabled \
   --wandb-project openpi-hl-memory \
-  --wandb-run-name subtask-multitask-qwen35-4b-lora
+  --wandb-run-name subtask-multitask-qwen35-4b-lora_with_prior_new_sampling
 ```
 
 数据选择方式：
