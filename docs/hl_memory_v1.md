@@ -28,6 +28,8 @@ HL Memory 是高层 VLM 子系统，负责从历史 keyframes、recent observati
 
 兼容性说明：`current_subtask` 和 `updated_language_memory` 仍然会读写，用于兼容旧数据和旧 checkpoint；新协议以 `current_objective` 和四字段 language memory 为准。
 
+实验 setting 对照表见 [`docs/hl_memory_experiment_settings.md`](hl_memory_experiment_settings.md)。
+
 ## FastUMI Pipeline
 
 生产路径必须以 LeRobot episode index 为准：先转 LeRobot，再从 `subtask_segments.json` 生成 raw HL annotations，然后用 LLM normalize，最后从 normalized annotations 导出 train/val samples。不要直接用 raw session 排序做训练 annotations，因为 raw session 可能被过滤、跳过或合并，顺序不一定等于最终 `episode_index`。
@@ -876,6 +878,10 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --known-prior-advance-threshold 0.65 \
   --known-prior-match-threshold 0.62 \
   --known-prior-max-advance-steps 3 \
+  --known-prior-safe-skip-mode \
+  --known-prior-skip-match-threshold 0.95 \
+  --known-prior-skip-min-progress 0.8 \
+  --known-prior-skip-min-stall-steps 2 \
   --rollout-interval-sec 1 \
   --rollout-start-sec 0 \
   --rollout-end-sec 40 \
@@ -913,6 +919,10 @@ Input rules：
 | `--known-prior-advance-threshold` | 如果模型没有显式输出 `should_advance_objective=true`，则用 `subtask_progress >= threshold` 推进到下一 prior step，默认 `0.65`；当前模型常输出粗粒度 `0.33/0.66`，用 `0.95` 很容易永远不切。 |
 | `--known-prior-match-threshold` | 如果模型输出的 `current_objective/current_subtask/phase` 与后续 prior step 的文本相似度超过该阈值，则直接推进到该 step，默认 `0.62`。 |
 | `--known-prior-max-advance-steps` | 每轮 rollout 最多向后匹配/跳过多少个 prior steps，默认 `3`；如果 `--rollout-interval-sec` 大、subtask 很短，需要调大，否则 pointer 会追不上。 |
+| `--known-prior-safe-skip-mode` | 开启受限追赶模式：普通文本匹配最多推进一步；跨步跳转需要更强 match 和完成/卡住证据，避免从 step 5 直接跳到 step 7。 |
+| `--known-prior-skip-match-threshold` | safe-skip 模式下允许跨步追赶的更高文本匹配阈值，默认 `0.95`。 |
+| `--known-prior-skip-min-progress` | safe-skip 模式下允许跨步追赶的 progress 下限，默认 `0.8`；`should_advance_objective=true` 也会视作完成证据。 |
+| `--known-prior-skip-min-stall-steps` | safe-skip 模式下，如果 pointer 连续卡在同一 prior step 至少 N 轮，即使 progress 不高也允许高置信跨步追赶，默认 `2`。 |
 | `--model-path` | 已训练 HL checkpoint 或 Hugging Face/local model 路径。 |
 | `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
 | `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |

@@ -77,6 +77,10 @@ class ZeroShotArgs:
     known_prior_advance_threshold: float = 0.65
     known_prior_match_threshold: float = 0.62
     known_prior_max_advance_steps: int = 3
+    known_prior_safe_skip_mode: bool = False
+    known_prior_skip_match_threshold: float = 0.95
+    known_prior_skip_min_progress: float = 0.8
+    known_prior_skip_min_stall_steps: int = 2
 
     # VLM backend and generation settings.
     vlm_backend: str = "qwen2_5_vl"
@@ -297,6 +301,7 @@ def _run_rollout(
     keyframe_vote_seconds = list(memory_seconds)
     known_prior_steps = _known_prior_steps(args)
     known_prior_index = _initial_known_prior_index(args, known_prior_steps)
+    known_prior_stall_steps = 0
     if known_prior_steps and not language_memory.strip():
         language_memory = _known_prior_language_memory(
             known_prior_steps,
@@ -347,7 +352,13 @@ def _run_rollout(
                 advance_threshold=args.known_prior_advance_threshold,
                 match_threshold=args.known_prior_match_threshold,
                 max_advance_steps=args.known_prior_max_advance_steps,
+                safe_skip_mode=args.known_prior_safe_skip_mode,
+                skip_match_threshold=args.known_prior_skip_match_threshold,
+                skip_min_progress=args.known_prior_skip_min_progress,
+                skip_min_stall_steps=args.known_prior_skip_min_stall_steps,
+                stall_steps=known_prior_stall_steps,
             )
+            known_prior_stall_steps = 0 if known_prior_index != known_prior_index_before else known_prior_stall_steps + 1
         ground_truth_subtask = _task_config_subtask_at(args.task_config_path, end_sec)
         candidate_seconds = keyframe_candidate_seconds(
             prediction,
@@ -418,6 +429,7 @@ def _run_rollout(
                 "known_prior_index_before": known_prior_index_before if known_prior_steps else None,
                 "known_prior_index_after": known_prior_index if known_prior_steps else None,
                 "known_prior_current_step": known_prior_steps[known_prior_index] if known_prior_steps else None,
+                "known_prior_stall_steps": known_prior_stall_steps if known_prior_steps else None,
                 "known_prior_match": known_prior_match,
                 "memory_seconds_before": list(memory_before),
                 "memory_seconds_after": list(memory_seconds),
@@ -481,6 +493,10 @@ def _run_rollout(
         "known_prior_advance_threshold": args.known_prior_advance_threshold,
         "known_prior_match_threshold": args.known_prior_match_threshold,
         "known_prior_max_advance_steps": args.known_prior_max_advance_steps,
+        "known_prior_safe_skip_mode": args.known_prior_safe_skip_mode,
+        "known_prior_skip_match_threshold": args.known_prior_skip_match_threshold,
+        "known_prior_skip_min_progress": args.known_prior_skip_min_progress,
+        "known_prior_skip_min_stall_steps": args.known_prior_skip_min_stall_steps,
         "final_known_prior_index": known_prior_index if known_prior_steps else None,
         "final_language_memory": language_memory,
         "final_memory_seconds": list(memory_seconds),
@@ -670,6 +686,11 @@ def _apply_known_prior_rollout_state(
     advance_threshold: float,
     match_threshold: float,
     max_advance_steps: int,
+    safe_skip_mode: bool = False,
+    skip_match_threshold: float = 0.95,
+    skip_min_progress: float = 0.8,
+    skip_min_stall_steps: int = 2,
+    stall_steps: int = 0,
 ) -> tuple[HLMemoryPrediction, int, dict[str, object]]:
     if not known_prior_steps:
         return prediction, current_index, {}
@@ -683,9 +704,29 @@ def _apply_known_prior_rollout_state(
     should_advance = _known_prior_should_advance(prediction, threshold=advance_threshold)
     next_index = current_index
     advance_reason = "hold"
-    if match["index"] > current_index and match["score"] >= match_threshold:
-        next_index = int(match["index"])
-        advance_reason = "matched_later_prior_step"
+    matched_index = int(match["index"])
+    matched_score = float(match["score"])
+    if matched_index > current_index and matched_score >= match_threshold:
+        if not safe_skip_mode:
+            next_index = matched_index
+            advance_reason = "matched_later_prior_step"
+        elif matched_index == current_index + 1:
+            next_index = matched_index
+            advance_reason = "matched_next_prior_step"
+        elif _known_prior_can_safe_skip(
+            prediction,
+            should_advance=should_advance,
+            matched_score=matched_score,
+            skip_match_threshold=skip_match_threshold,
+            skip_min_progress=skip_min_progress,
+            skip_min_stall_steps=skip_min_stall_steps,
+            stall_steps=stall_steps,
+        ):
+            next_index = matched_index
+            advance_reason = "safe_skip_matched_later_prior_step"
+        else:
+            next_index = current_index + 1
+            advance_reason = "safe_skip_clamped_to_next_step"
     elif should_advance and current_index + 1 < len(known_prior_steps):
         next_index = current_index + 1
         advance_reason = "progress_or_advance_flag"
@@ -721,9 +762,33 @@ def _apply_known_prior_rollout_state(
             "advance_threshold": advance_threshold,
             "match_threshold": match_threshold,
             "max_advance_steps": max_advance_steps,
+            "safe_skip_mode": safe_skip_mode,
+            "skip_match_threshold": skip_match_threshold,
+            "skip_min_progress": skip_min_progress,
+            "skip_min_stall_steps": skip_min_stall_steps,
+            "stall_steps": stall_steps,
             "should_advance_by_progress": should_advance,
         },
     )
+
+
+def _known_prior_can_safe_skip(
+    prediction: HLMemoryPrediction,
+    *,
+    should_advance: bool,
+    matched_score: float,
+    skip_match_threshold: float,
+    skip_min_progress: float,
+    skip_min_stall_steps: int,
+    stall_steps: int,
+) -> bool:
+    if matched_score < skip_match_threshold:
+        return False
+    if should_advance:
+        return True
+    if prediction.subtask_progress is not None and float(prediction.subtask_progress) >= skip_min_progress:
+        return True
+    return stall_steps >= max(0, int(skip_min_stall_steps))
 
 
 def _known_prior_should_advance(prediction: HLMemoryPrediction, *, threshold: float) -> bool:
