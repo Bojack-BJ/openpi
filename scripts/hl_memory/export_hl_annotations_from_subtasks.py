@@ -67,9 +67,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-query", default="", help="Optional goal query copied to every annotation.")
     parser.add_argument(
         "--sampling-mode",
-        choices=("annotations", "dense-stride"),
-        default="annotations",
-        help="Annotation sampling mode. `annotations` keeps the existing segment/progress samples; `dense-stride` samples every N frames.",
+        choices=("fraction-rules", "annotations", "dense-stride"),
+        default="fraction-rules",
+        help=(
+            "Annotation-row sampling mode. `fraction-rules` uses boundary/progress/success rows plus the configured "
+            "fraction/dynamic/stride rules; `annotations` is a backward-compatible alias; `dense-stride` samples every N frames."
+        ),
     )
     parser.add_argument(
         "--dense-sample-stride-frames",

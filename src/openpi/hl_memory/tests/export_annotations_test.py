@@ -5,7 +5,7 @@ from scripts.hl_memory.export_hl_annotations_from_subtasks import _segments_to_r
 
 def _args(**overrides) -> argparse.Namespace:
     values = dict(
-        sampling_mode="annotations",
+        sampling_mode="fraction-rules",
         dense_sample_stride_frames=5,
         prediction_horizon_steps=2,
         keyframe_label_mode="event_boundary",

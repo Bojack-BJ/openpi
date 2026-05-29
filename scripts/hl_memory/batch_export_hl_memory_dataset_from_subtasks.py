@@ -110,7 +110,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--auto-export-annotations", action="store_true", help="Create hl_annotations.jsonl when missing.")
     parser.add_argument("--emit-success-events", action="store_true", help="Forward to annotation exporter when auto-exporting.")
-    parser.add_argument("--sampling-mode", choices=("annotations", "dense-stride"), default="annotations", help="Forward to annotation exporter.")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("fraction-rules", "annotations", "dense-stride"),
+        default="fraction-rules",
+        help="Forward to annotation exporter. `annotations` is a backward-compatible alias for `fraction-rules`.",
+    )
     parser.add_argument("--dense-sample-stride-frames", type=int, default=5, help="Forward to annotation exporter.")
     parser.add_argument("--prediction-horizon-steps", type=int, default=2, help="Forward to annotation exporter.")
     parser.add_argument("--keyframe-label-mode", choices=("event_boundary", "memer_rules"), default="event_boundary", help="Forward to annotation exporter.")

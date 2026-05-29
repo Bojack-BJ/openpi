@@ -82,7 +82,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--target-query", default="", help="Optional --target-query copied to every annotation row.")
     parser.add_argument("--goal-query", default="", help="Optional --goal-query copied to every annotation row.")
-    parser.add_argument("--sampling-mode", choices=("annotations", "dense-stride"), default="annotations", help="Forward to exporter.")
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("fraction-rules", "annotations", "dense-stride"),
+        default="fraction-rules",
+        help="Forward to exporter. `annotations` is a backward-compatible alias for `fraction-rules`.",
+    )
     parser.add_argument("--dense-sample-stride-frames", type=int, default=5, help="Forward to exporter.")
     parser.add_argument("--prediction-horizon-steps", type=int, default=2, help="Forward to exporter.")
     parser.add_argument("--keyframe-label-mode", choices=("event_boundary", "memer_rules"), default="event_boundary", help="Forward to exporter.")

@@ -260,7 +260,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
 }
 ```
 
-`--sampling-mode annotations` 是旧路径，继续使用 segment boundary/progress/success rows。`--sampling-mode dense-stride` 会在每个 segment 内每 `--dense-sample-stride-frames` 帧生成一个 sample，并额外强制包含 MEMER keyframe rule 选中的帧。`--prediction-horizon-steps 2` 表示 horizon label 来自 `sample_frame + 2 * dense_sample_stride_frames` 所在 segment，超过 episode 末尾会 clip 到最后一帧；设为 `0` 就是 current-frame objective baseline。
+`--sampling-mode fraction-rules` 是当前默认路径：先生成 segment boundary/progress/success rows，再叠加 `--progress-sample-*`、short-segment 和 late-fraction 等规则。`--sampling-mode annotations` 只是兼容旧命令的 alias，行为等同于 `fraction-rules`。`--sampling-mode dense-stride` 会在每个 segment 内每 `--dense-sample-stride-frames` 帧生成一个 sample，并额外强制包含 MEMER keyframe rule 选中的帧。`--prediction-horizon-steps 2` 表示 horizon label 来自 `sample_frame + 2 * dense_sample_stride_frames` 所在 segment，超过 episode 末尾会 clip 到最后一帧；设为 `0` 就是 current-frame objective baseline。
 
 `--keyframe-label-mode event_boundary` 保持旧 keyframe 规则。`--keyframe-label-mode memer_rules` 会用文本规则把 state-changing segments 的代表帧写成显式 keyframe label：默认 `place/release/put/insert/stack/open/close/press/handover/pick up stack` 选 segment 最后一帧，approach/return/retreat/move back/observation 等默认不选。需要改规则时传 `--keyframe-rule-path rules.json`，格式为：
 
@@ -278,9 +278,9 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
 
 推荐 ablation matrix：
 
-| Data sampling | Keyframe labels | Target protocol | 用途 |
+| Sample row selection | Keyframe labels | Target protocol | 用途 |
 | --- | --- | --- | --- |
-| `annotations` | `event_boundary` | `hl_v1` | 当前完整 HL baseline |
+| `fraction-rules` | `event_boundary` | `hl_v1` | 当前完整 HL baseline，使用 boundary/progress/success + fraction/dynamic rules |
 | `dense-stride` | `event_boundary` | `hl_v1` | 单独验证 dense 采样是否解决节奏问题 |
 | `dense-stride` | `memer_rules` | `hl_v1` | 验证更干净的 keyframe label 是否帮助完整 HL |
 | `dense-stride` | `memer_rules` | `memer_objective` | MEMER-style 简化 objective + keyframe baseline |
@@ -383,7 +383,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_round_hl_annotation_progress.py \
 
 这会同时更新 top-level `subtask_progress` 和 `llm_gt.subtask_progress`；传 `--advance-threshold` 时也会按 round 后的 progress 重新计算 `should_advance_objective`。
 
-如果每个 task 的 `hl_segments_llm_sidecar.json` 已经生成过，但你改了采样方式，例如从 annotations 换成 `dense-stride`，不需要重新调用 27B。先重新生成新的 raw `hl_annotations.jsonl`，再复用旧 sidecar 重新展开每个 sample row：
+如果每个 task 的 `hl_segments_llm_sidecar.json` 已经生成过，但你改了 sample row selection，例如从 `fraction-rules` 换成 `dense-stride`，不需要重新调用 27B。先重新生成新的 raw `hl_annotations.jsonl`，再复用旧 sidecar 重新展开每个 sample row：
 
 ```bash
 PYTHONPATH=src python scripts/hl_memory/batch_normalize_hl_annotations_with_llm.py \
