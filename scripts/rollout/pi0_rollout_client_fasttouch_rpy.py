@@ -81,6 +81,7 @@ import pathlib
 import select
 import sys
 import termios
+import threading
 import time
 import tty
 
@@ -576,6 +577,252 @@ def interp_and_move_both(arm0: SingleArm, arm1: SingleArm,
     arm1.setGripperPosition(g1)
 
 
+def _euler_xyz_to_quat_wxyz(euler_rad) -> np.ndarray:
+    roll, pitch, yaw = np.asarray(euler_rad, dtype=np.float64)
+    cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+    cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+    cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
+    return np.asarray(
+        [
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _run_blocking_calls_concurrently(calls: list[tuple[str, object, tuple, dict]]) -> dict[str, object]:
+    results: dict[str, object] = {}
+    errors: list[tuple[str, BaseException]] = []
+    lock = threading.Lock()
+
+    def worker(name, fn, fn_args, kwargs):
+        try:
+            value = fn(*fn_args, **kwargs)
+        except BaseException as exc:
+            with lock:
+                errors.append((name, exc))
+            return
+        with lock:
+            results[name] = value
+
+    threads = [threading.Thread(target=worker, args=call, daemon=True) for call in calls]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        name, exc = errors[0]
+        raise RuntimeError(f"{name} 执行失败: {exc}") from exc
+    return results
+
+
+def _joint_waypoints_motion_kwargs(trajectory_time_sec: float, speed_percent: float) -> dict:
+    if speed_percent > 0.0:
+        return {"speed_percent": float(speed_percent)}
+    return {"time_sec": float(trajectory_time_sec)}
+
+
+def _build_single_pose_trajectory(actions: np.ndarray, tcp_off: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    poses = []
+    grippers = []
+    for action in actions:
+        x_a, y_a, z_a, roll, pitch, yaw, g_open = action[:7]
+        euler = np.deg2rad([roll, pitch, yaw])
+        pos = tcp_position_to_flange([x_a, y_a, z_a], euler, tcp_off)
+        poses.append([*pos.tolist(), *euler.tolist()])
+        grippers.append(float(np.clip(g_open, 0.0, 1.0)))
+    return np.asarray(poses, dtype=np.float64), np.asarray(grippers, dtype=np.float64)
+
+
+def _build_dual_pose_trajectories(actions: np.ndarray, tcp_off: np.ndarray):
+    left_poses = []
+    right_poses = []
+    left_grippers = []
+    right_grippers = []
+    for action in actions:
+        x_a0, y_a0, z_a0, roll0, pitch0, yaw0, g_open0, x_a1, y_a1, z_a1, roll1, pitch1, yaw1, g_open1 = action
+        euler0 = np.deg2rad([roll0, pitch0, yaw0])
+        euler1 = np.deg2rad([roll1, pitch1, yaw1])
+        pos0 = tcp_position_to_flange([x_a0, y_a0, z_a0], euler0, tcp_off)
+        pos1 = tcp_position_to_flange([x_a1, y_a1, z_a1], euler1, tcp_off)
+        left_poses.append([*pos0.tolist(), *euler0.tolist()])
+        right_poses.append([*pos1.tolist(), *euler1.tolist()])
+        left_grippers.append(float(np.clip(g_open0, 0.0, 1.0)))
+        right_grippers.append(float(np.clip(g_open1, 0.0, 1.0)))
+    return (
+        np.asarray(left_poses, dtype=np.float64),
+        np.asarray(right_poses, dtype=np.float64),
+        np.asarray(left_grippers, dtype=np.float64),
+        np.asarray(right_grippers, dtype=np.float64),
+    )
+
+
+def _solve_joint_waypoints_from_poses(
+    arm: SingleArm,
+    poses: np.ndarray,
+    arm_name: str,
+    *,
+    ik_retries: int,
+    ik_retry_sleep_s: float,
+) -> np.ndarray:
+    if not hasattr(arm, "solve_ik"):
+        raise RuntimeError(f"{arm_name} arm 当前 SDK 没有 solve_ik()，无法使用 joint_waypoints mode")
+    if not hasattr(arm, "move_joint_waypoints"):
+        raise RuntimeError(f"{arm_name} arm 当前 SDK 没有 move_joint_waypoints()，无法使用 joint_waypoints mode")
+
+    poses = np.asarray(poses, dtype=np.float64)
+    q_seed = list(np.asarray(arm.get_joint_positions(), dtype=np.float64))
+    joint_waypoints = []
+    max_attempts = 1 + max(0, int(ik_retries))
+    retry_sleep_s = max(0.0, float(ik_retry_sleep_s))
+    for waypoint_idx, pose in enumerate(poses):
+        pos = pose[:3]
+        euler = pose[3:6]
+        quat = _euler_xyz_to_quat_wxyz(euler)
+        input_seed = list(q_seed)
+        q_output = None
+        ok = False
+        attempt_count = 0
+        for attempt_idx in range(max_attempts):
+            attempt_count = attempt_idx + 1
+            try:
+                q_sol, ok = arm.solve_ik(pos.tolist(), quat.tolist(), q_seed=input_seed)
+            except Exception:
+                if attempt_idx + 1 < max_attempts:
+                    if retry_sleep_s > 0.0:
+                        time.sleep(retry_sleep_s)
+                    continue
+                raise
+            q_output = list(np.asarray(q_sol, dtype=np.float64)) if q_sol is not None else None
+            if ok:
+                break
+            if attempt_idx + 1 < max_attempts and retry_sleep_s > 0.0:
+                time.sleep(retry_sleep_s)
+        if not ok or q_output is None:
+            raise RuntimeError(
+                f"{arm_name} IK failed at waypoint {waypoint_idx} after {attempt_count} attempts: "
+                f"pos={np.round(pos, 6).tolist()}, euler={np.round(euler, 6).tolist()}, "
+                f"seed={np.round(input_seed, 6).tolist()}"
+            )
+        q_seed = q_output
+        joint_waypoints.append(q_seed)
+    return np.asarray(joint_waypoints, dtype=np.float64)
+
+
+def _start_gripper_sync(arm: SingleArm, targets: np.ndarray, duration_sec: float):
+    stop_event = threading.Event()
+    values = np.clip(np.asarray(targets, dtype=np.float64).reshape(-1), 0.0, 1.0)
+    if len(values) == 0:
+        return stop_event, None
+    if len(values) == 1 or duration_sec <= 0.0:
+        command_times = np.asarray([0.0], dtype=np.float64)
+        command_values = np.asarray([values[-1]], dtype=np.float64)
+    else:
+        command_times = np.linspace(0.0, float(duration_sec), len(values))
+        command_values = values
+
+    def sync_loop():
+        start_time = time.monotonic()
+        for command_time, value in zip(command_times, command_values):
+            if stop_event.is_set():
+                break
+            wait_s = start_time + float(command_time) - time.monotonic()
+            if wait_s > 0.0 and stop_event.wait(wait_s):
+                break
+            if stop_event.is_set():
+                break
+            arm.setGripperPosition(float(value))
+
+    thread = threading.Thread(target=sync_loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def execute_single_joint_waypoints(
+    arm: SingleArm,
+    poses: np.ndarray,
+    grippers: np.ndarray,
+    *,
+    trajectory_time_sec: float,
+    joint_waypoint_speed_percent: float,
+    ik_retries: int,
+    ik_retry_sleep_s: float,
+) -> dict[str, object]:
+    joint_waypoints = _solve_joint_waypoints_from_poses(
+        arm,
+        poses,
+        "single",
+        ik_retries=ik_retries,
+        ik_retry_sleep_s=ik_retry_sleep_s,
+    )
+    stop, thread = _start_gripper_sync(arm, grippers, trajectory_time_sec)
+    try:
+        result = arm.move_joint_waypoints(
+            joint_waypoints.tolist(),
+            **_joint_waypoints_motion_kwargs(trajectory_time_sec, joint_waypoint_speed_percent),
+        )
+        return {"single move_joint_waypoints": result}
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=1.0)
+        if len(grippers):
+            arm.setGripperPosition(float(np.clip(grippers[-1], 0.0, 1.0)))
+
+
+def execute_dual_joint_waypoints(
+    arm0: SingleArm,
+    arm1: SingleArm,
+    left_poses: np.ndarray,
+    right_poses: np.ndarray,
+    left_grippers: np.ndarray,
+    right_grippers: np.ndarray,
+    *,
+    trajectory_time_sec: float,
+    joint_waypoint_speed_percent: float,
+    ik_retries: int,
+    ik_retry_sleep_s: float,
+) -> dict[str, object]:
+    left_joint_waypoints = _solve_joint_waypoints_from_poses(
+        arm0,
+        left_poses,
+        "left",
+        ik_retries=ik_retries,
+        ik_retry_sleep_s=ik_retry_sleep_s,
+    )
+    right_joint_waypoints = _solve_joint_waypoints_from_poses(
+        arm1,
+        right_poses,
+        "right",
+        ik_retries=ik_retries,
+        ik_retry_sleep_s=ik_retry_sleep_s,
+    )
+    stop0, thread0 = _start_gripper_sync(arm0, left_grippers, trajectory_time_sec)
+    stop1, thread1 = _start_gripper_sync(arm1, right_grippers, trajectory_time_sec)
+    try:
+        motion_kwargs = _joint_waypoints_motion_kwargs(trajectory_time_sec, joint_waypoint_speed_percent)
+        return _run_blocking_calls_concurrently(
+            [
+                ("left move_joint_waypoints", arm0.move_joint_waypoints, (left_joint_waypoints.tolist(),), motion_kwargs),
+                ("right move_joint_waypoints", arm1.move_joint_waypoints, (right_joint_waypoints.tolist(),), motion_kwargs),
+            ]
+        )
+    finally:
+        stop0.set()
+        stop1.set()
+        if thread0 is not None:
+            thread0.join(timeout=1.0)
+        if thread1 is not None:
+            thread1.join(timeout=1.0)
+        if len(left_grippers):
+            arm0.setGripperPosition(float(np.clip(left_grippers[-1], 0.0, 1.0)))
+        if len(right_grippers):
+            arm1.setGripperPosition(float(np.clip(right_grippers[-1], 0.0, 1.0)))
+
+
 def main():
     """主流程：连接设备，循环推理并下发动作。"""
     parser = argparse.ArgumentParser()
@@ -589,6 +836,16 @@ def main():
     parser.add_argument("--camera_dev1", type=int, default=DEV + 2, help="robot_1 图像对应的视频设备编号")
     parser.add_argument("--dt", type=float, default=0.025, help="插值每步的睡眠时间（秒）")
     parser.add_argument("--interp_step_size", type=float, default=0.0025, help="插值最大平移步长（米），超过此值时自动细分")
+    parser.add_argument(
+        "--execution_backend",
+        choices=("cartesian_raw", "joint_waypoints"),
+        default="cartesian_raw",
+        help="cartesian_raw=逐 action 下发 set_end_effector_pose_euler_raw；joint_waypoints=新版 SDK IK + move_joint_waypoints 整段执行",
+    )
+    parser.add_argument("--trajectory_dt", type=float, default=0.05, help="joint_waypoints 模式下每个 action waypoint 对应时长（秒）")
+    parser.add_argument("--joint_waypoint_speed_percent", type=float, default=-1.0, help="joint_waypoints 模式下 >0 时优先传 speed_percent，否则传 time_sec")
+    parser.add_argument("--ik_retries", type=int, default=5, help="joint_waypoints 模式下每个 waypoint 的 IK 额外重试次数")
+    parser.add_argument("--ik_retry_sleep_s", type=float, default=0.0, help="joint_waypoints 模式下 IK 失败重试间隔秒数")
     parser.add_argument("--init_pose_left", type=str, default="0.3,0.0,0.16,0.0,0.0,0.0", help="robot_0 初始位姿: x,y,z,roll,pitch,yaw（弧度）")
     parser.add_argument("--init_pose_right", type=str, default="0.3,0.0,0.16,0.0,0.0,0.0", help="robot_1 初始位姿: x,y,z,roll,pitch,yaw（弧度）")
     parser.add_argument(
@@ -622,6 +879,16 @@ def main():
         parser.error("--mask_track_between_actions 需要同时开启 --mask_overlay")
     if args.mask_track_every_n_actions < 1:
         parser.error("--mask_track_every_n_actions 必须 >= 1")
+    if args.trajectory_dt <= 0.0:
+        parser.error("--trajectory_dt 必须 > 0")
+    if args.joint_waypoint_speed_percent > 1.0:
+        parser.error("--joint_waypoint_speed_percent 必须 <= 1.0")
+    if args.ik_retries < 0:
+        parser.error("--ik_retries 不能为负数")
+    if args.ik_retry_sleep_s < 0.0:
+        parser.error("--ik_retry_sleep_s 不能为负数")
+    if args.execution_backend == "joint_waypoints" and args.mask_track_between_actions:
+        print("[WARN] joint_waypoints 模式整段执行 chunk，不支持 action 间 mask tracking-only；该参数会被忽略")
 
     single_arm = args.single_arm
     single_arm_index = _arm_index(single_arm) if single_arm is not None else 0
@@ -650,6 +917,14 @@ def main():
         arms["robot_0"] = SingleArm(can_interface_=args.left_can)
     if is_dual or single_arm == "robot_1":
         arms["robot_1"] = SingleArm(can_interface_=args.right_can)
+    if args.execution_backend == "joint_waypoints":
+        for arm_name, arm in arms.items():
+            missing = [name for name in ("solve_ik", "move_joint_waypoints", "get_joint_positions") if not hasattr(arm, name)]
+            if missing:
+                raise RuntimeError(
+                    f"{arm_name} 当前 Startouch SDK 缺少 {missing}，不能使用 --execution_backend joint_waypoints。"
+                    "请切到新版 SDK/interface_py 后重试。"
+                )
     time.sleep(2)
 
     def reset_active_arms() -> None:
@@ -858,6 +1133,79 @@ def main():
             if action_slice_result is None:
                 continue
             lo, action_slice = action_slice_result
+
+            if args.execution_backend == "joint_waypoints":
+                if _stdin_wants_reset_pause():
+                    reset_active_arms()
+                    paused = True
+                    print("[INFO] 已复位到初始位姿，推理已暂停；按 c 继续")
+                    continue
+                trajectory_time_sec = len(action_slice) * args.trajectory_dt
+                if is_dual:
+                    left_poses, right_poses, left_grippers, right_grippers = _build_dual_pose_trajectories(
+                        action_slice,
+                        tcp_off,
+                    )
+                    if args.tcp_debug:
+                        print(
+                            "[TCP DEBUG][joint_waypoints] action_slice=%d..%d duration=%.3fs | "
+                            "L first=%s last=%s | R first=%s last=%s"
+                            % (
+                                lo,
+                                lo + len(action_slice) - 1,
+                                trajectory_time_sec,
+                                np.asarray(left_poses[0]).round(4).tolist(),
+                                np.asarray(left_poses[-1]).round(4).tolist(),
+                                np.asarray(right_poses[0]).round(4).tolist(),
+                                np.asarray(right_poses[-1]).round(4).tolist(),
+                            )
+                        )
+                    print(
+                        "[INFO] joint_waypoints 执行双臂轨迹: "
+                        f"steps={len(action_slice)} duration={trajectory_time_sec:.3f}s"
+                    )
+                    results = execute_dual_joint_waypoints(
+                        arms["robot_0"],
+                        arms["robot_1"],
+                        left_poses,
+                        right_poses,
+                        left_grippers,
+                        right_grippers,
+                        trajectory_time_sec=trajectory_time_sec,
+                        joint_waypoint_speed_percent=args.joint_waypoint_speed_percent,
+                        ik_retries=args.ik_retries,
+                        ik_retry_sleep_s=args.ik_retry_sleep_s,
+                    )
+                else:
+                    assert single_arm is not None
+                    poses, grippers = _build_single_pose_trajectory(action_slice, tcp_off)
+                    if args.tcp_debug:
+                        print(
+                            "[TCP DEBUG][joint_waypoints] %s action_slice=%d..%d duration=%.3fs | first=%s last=%s"
+                            % (
+                                single_arm,
+                                lo,
+                                lo + len(action_slice) - 1,
+                                trajectory_time_sec,
+                                np.asarray(poses[0]).round(4).tolist(),
+                                np.asarray(poses[-1]).round(4).tolist(),
+                            )
+                        )
+                    print(
+                        "[INFO] joint_waypoints 执行单臂轨迹: "
+                        f"arm={single_arm} steps={len(action_slice)} duration={trajectory_time_sec:.3f}s"
+                    )
+                    results = execute_single_joint_waypoints(
+                        arms[single_arm],
+                        poses,
+                        grippers,
+                        trajectory_time_sec=trajectory_time_sec,
+                        joint_waypoint_speed_percent=args.joint_waypoint_speed_percent,
+                        ik_retries=args.ik_retries,
+                        ik_retry_sleep_s=args.ik_retry_sleep_s,
+                    )
+                print(f"[INFO] joint_waypoints 轨迹完成: {results}")
+                continue
 
             for step_idx, action in enumerate(action_slice, start=lo):
                 if _stdin_wants_reset_pause():
