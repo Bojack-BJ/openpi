@@ -998,6 +998,7 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --known-prior-advance-threshold 0.65 \
   --known-prior-match-threshold 0.62 \
   --known-prior-max-advance-steps 3 \
+  --known-prior-next-step-require-completion \
   --known-prior-safe-skip-mode \
   --known-prior-skip-match-threshold 0.95 \
   --known-prior-skip-min-progress 0.8 \
@@ -1039,6 +1040,7 @@ Input rules：
 | `--known-prior-advance-threshold` | 如果模型没有显式输出 `should_advance_objective=true`，则用 `subtask_progress >= threshold` 推进到下一 prior step，默认 `0.65`；当前模型常输出粗粒度 `0.33/0.66`，用 `0.95` 很容易永远不切。 |
 | `--known-prior-match-threshold` | 如果模型输出的 `current_objective/current_subtask/phase` 与后续 prior step 的文本相似度超过该阈值，则直接推进到该 step，默认 `0.62`。 |
 | `--known-prior-max-advance-steps` | 每轮 rollout 最多向后匹配/跳过多少个 prior steps，默认 `3`；如果 `--rollout-interval-sec` 大、subtask 很短，需要调大，否则 pointer 会追不上。 |
+| `--known-prior-next-step-require-completion` | 开启后，相邻 prior step 的文本匹配不能单独触发推进，还必须满足模型输出 `should_advance_objective=true` 或 `subtask_progress >= --known-prior-advance-threshold`。safe-skip 证据不足时也不会降级推进一步。默认关闭以兼容旧行为。 |
 | `--known-prior-safe-skip-mode` | 开启受限追赶模式：普通文本匹配最多推进一步；跨步跳转需要更强 match 和完成/卡住证据，避免从 step 5 直接跳到 step 7。 |
 | `--known-prior-skip-match-threshold` | safe-skip 模式下允许跨步追赶的更高文本匹配阈值，默认 `0.95`。 |
 | `--known-prior-skip-min-progress` | safe-skip 模式下允许跨步追赶的 progress 下限，默认 `0.8`；`should_advance_objective=true` 也会视作完成证据。 |
@@ -1075,7 +1077,7 @@ rollout 和调试参数：
 | `--rollout-start-sec` / `--rollout-end-sec` | rollout 起止时间；不填 end 时默认到视频末尾。 |
 | `--keyframe-merge-distance-sec` | 合并距离过近的 keyframe candidates，默认 `2.0` 秒。 |
 | `--language-memory` | 初始语言记忆；空字符串表示从默认初始状态开始。 |
-| `--output-json` | 保存最终 summary JSON。 |
+| `--output-json` | 保存 summary JSON。interval rollout 期间每完成一个推理 step 都会原子更新，结束后再写入包含 debug video 状态的最终版本。 |
 | `--rollout-jsonl` | rollout 模式下逐步保存 compact JSONL。 |
 | `--rollout-pretty-json` | rollout 模式下逐步保存可读 JSON。 |
 | `--debug-dir` | 保存输入帧、keyframe candidates、debug panel；排查模型预测时建议开启。 |

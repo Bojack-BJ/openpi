@@ -77,6 +77,7 @@ class ZeroShotArgs:
     known_prior_advance_threshold: float = 0.65
     known_prior_match_threshold: float = 0.62
     known_prior_max_advance_steps: int = 3
+    known_prior_next_step_require_completion: bool = False
     known_prior_safe_skip_mode: bool = False
     known_prior_skip_match_threshold: float = 0.95
     known_prior_skip_min_progress: float = 0.8
@@ -168,7 +169,7 @@ def main(args: ZeroShotArgs) -> None:
     if is_primary_process:
         print(rendered)
     if args.output_json is not None:
-        args.output_json.write_text(rendered + "\n")
+        _write_json_atomic(args.output_json, payload)
 
 
 def _run_single_prediction(
@@ -357,6 +358,7 @@ def _run_rollout(
                 advance_threshold=args.known_prior_advance_threshold,
                 match_threshold=args.known_prior_match_threshold,
                 max_advance_steps=args.known_prior_max_advance_steps,
+                next_step_require_completion=args.known_prior_next_step_require_completion,
                 safe_skip_mode=args.known_prior_safe_skip_mode,
                 skip_match_threshold=args.known_prior_skip_match_threshold,
                 skip_min_progress=args.known_prior_skip_min_progress,
@@ -455,6 +457,22 @@ def _run_rollout(
                 "embedding_debug": embedding_debug_payload,
             }
         )
+        _write_live_rollout_summary(
+            args.output_json,
+            _build_rollout_payload(
+                args,
+                config=config,
+                resolved_model_path=resolved_model_path,
+                duration_sec=duration_sec,
+                recent_step_sec=recent_step_sec,
+                known_prior_steps=known_prior_steps,
+                known_prior_index=known_prior_index,
+                language_memory=language_memory,
+                memory_seconds=memory_seconds,
+                steps=steps,
+                debug_dir=debug_dir,
+            ),
+        )
 
     debug_video_path: pathlib.Path | None = None
     debug_video_error: str | None = None
@@ -475,6 +493,39 @@ def _run_rollout(
     if args.rollout_pretty_json is not None:
         _write_pretty_json(args.rollout_pretty_json, steps)
 
+    return _build_rollout_payload(
+        args,
+        config=config,
+        resolved_model_path=resolved_model_path,
+        duration_sec=duration_sec,
+        recent_step_sec=recent_step_sec,
+        known_prior_steps=known_prior_steps,
+        known_prior_index=known_prior_index,
+        language_memory=language_memory,
+        memory_seconds=memory_seconds,
+        steps=steps,
+        debug_dir=debug_dir,
+        debug_video_path=debug_video_path,
+        debug_video_error=debug_video_error,
+    )
+
+
+def _build_rollout_payload(
+    args: ZeroShotArgs,
+    *,
+    config: HLMemoryConfig,
+    resolved_model_path: str | None,
+    duration_sec: float,
+    recent_step_sec: float,
+    known_prior_steps: tuple[str, ...],
+    known_prior_index: int,
+    language_memory: str,
+    memory_seconds: tuple[float, ...],
+    steps: list[dict[str, object]],
+    debug_dir: pathlib.Path | None,
+    debug_video_path: pathlib.Path | None = None,
+    debug_video_error: str | None = None,
+) -> dict[str, object]:
     return {
         "video_paths": _payload_video_paths_from_args(args),
         "model_path": args.model_path,
@@ -499,6 +550,7 @@ def _run_rollout(
         "known_prior_advance_threshold": args.known_prior_advance_threshold,
         "known_prior_match_threshold": args.known_prior_match_threshold,
         "known_prior_max_advance_steps": args.known_prior_max_advance_steps,
+        "known_prior_next_step_require_completion": args.known_prior_next_step_require_completion,
         "known_prior_safe_skip_mode": args.known_prior_safe_skip_mode,
         "known_prior_skip_match_threshold": args.known_prior_skip_match_threshold,
         "known_prior_skip_min_progress": args.known_prior_skip_min_progress,
@@ -692,6 +744,7 @@ def _apply_known_prior_rollout_state(
     advance_threshold: float,
     match_threshold: float,
     max_advance_steps: int,
+    next_step_require_completion: bool = False,
     safe_skip_mode: bool = False,
     skip_match_threshold: float = 0.95,
     skip_min_progress: float = 0.8,
@@ -714,11 +767,17 @@ def _apply_known_prior_rollout_state(
     matched_score = float(match["score"])
     if matched_index > current_index and matched_score >= match_threshold:
         if not safe_skip_mode:
-            next_index = matched_index
-            advance_reason = "matched_later_prior_step"
+            if matched_index == current_index + 1 and next_step_require_completion and not should_advance:
+                advance_reason = "matched_next_prior_step_waiting_for_completion"
+            else:
+                next_index = matched_index
+                advance_reason = "matched_later_prior_step"
         elif matched_index == current_index + 1:
-            next_index = matched_index
-            advance_reason = "matched_next_prior_step"
+            if next_step_require_completion and not should_advance:
+                advance_reason = "matched_next_prior_step_waiting_for_completion"
+            else:
+                next_index = matched_index
+                advance_reason = "matched_next_prior_step"
         elif _known_prior_can_safe_skip(
             prediction,
             should_advance=should_advance,
@@ -730,6 +789,8 @@ def _apply_known_prior_rollout_state(
         ):
             next_index = matched_index
             advance_reason = "safe_skip_matched_later_prior_step"
+        elif next_step_require_completion and not should_advance:
+            advance_reason = "safe_skip_waiting_for_completion"
         else:
             next_index = current_index + 1
             advance_reason = "safe_skip_clamped_to_next_step"
@@ -768,6 +829,7 @@ def _apply_known_prior_rollout_state(
             "advance_threshold": advance_threshold,
             "match_threshold": match_threshold,
             "max_advance_steps": max_advance_steps,
+            "next_step_require_completion": next_step_require_completion,
             "safe_skip_mode": safe_skip_mode,
             "skip_match_threshold": skip_match_threshold,
             "skip_min_progress": skip_min_progress,
@@ -1155,6 +1217,18 @@ def _write_jsonl(path: pathlib.Path, rows: list[dict[str, object]]) -> None:
 def _write_pretty_json(path: pathlib.Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(rows, indent=2, ensure_ascii=True) + "\n")
+
+
+def _write_live_rollout_summary(path: pathlib.Path | None, payload: dict[str, object]) -> None:
+    if path is not None:
+        _write_json_atomic(path, payload)
+
+
+def _write_json_atomic(path: pathlib.Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n")
+    temporary_path.replace(path)
 
 
 if __name__ == "__main__":
