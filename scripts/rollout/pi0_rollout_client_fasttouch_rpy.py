@@ -842,7 +842,14 @@ def main():
         default="cartesian_raw",
         help="cartesian_raw=逐 action 下发 set_end_effector_pose_euler_raw；joint_waypoints=新版 SDK IK + move_joint_waypoints 整段执行",
     )
-    parser.add_argument("--trajectory_dt", type=float, default=0.05, help="joint_waypoints 模式下每个 action waypoint 对应时长（秒）")
+    parser.add_argument(
+        "--model_infer_action_dt",
+        "--trajectory_dt",
+        dest="model_infer_action_dt",
+        type=float,
+        default=0.05,
+        help="joint_waypoints 模式下每个模型 action waypoint 对应的时间间隔（秒）；--trajectory_dt 是兼容旧参数名",
+    )
     parser.add_argument("--joint_waypoint_speed_percent", type=float, default=-1.0, help="joint_waypoints 模式下 >0 时优先传 speed_percent，否则传 time_sec")
     parser.add_argument("--ik_retries", type=int, default=5, help="joint_waypoints 模式下每个 waypoint 的 IK 额外重试次数")
     parser.add_argument("--ik_retry_sleep_s", type=float, default=0.0, help="joint_waypoints 模式下 IK 失败重试间隔秒数")
@@ -879,8 +886,8 @@ def main():
         parser.error("--mask_track_between_actions 需要同时开启 --mask_overlay")
     if args.mask_track_every_n_actions < 1:
         parser.error("--mask_track_every_n_actions 必须 >= 1")
-    if args.trajectory_dt <= 0.0:
-        parser.error("--trajectory_dt 必须 > 0")
+    if args.model_infer_action_dt <= 0.0:
+        parser.error("--model_infer_action_dt 必须 > 0")
     if args.joint_waypoint_speed_percent > 1.0:
         parser.error("--joint_waypoint_speed_percent 必须 <= 1.0")
     if args.ik_retries < 0:
@@ -1140,7 +1147,7 @@ def main():
                     paused = True
                     print("[INFO] 已复位到初始位姿，推理已暂停；按 c 继续")
                     continue
-                trajectory_time_sec = len(action_slice) * args.trajectory_dt
+                trajectory_time_sec = len(action_slice) * args.model_infer_action_dt
                 if is_dual:
                     left_poses, right_poses, left_grippers, right_grippers = _build_dual_pose_trajectories(
                         action_slice,
