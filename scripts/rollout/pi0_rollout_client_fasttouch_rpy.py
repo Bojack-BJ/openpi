@@ -77,6 +77,7 @@
 """
 
 import argparse
+import contextlib
 import pathlib
 import select
 import sys
@@ -667,14 +668,17 @@ def _solve_joint_waypoints_from_poses(
     *,
     ik_retries: int,
     ik_retry_sleep_s: float,
+    require_move_joint_waypoints: bool = True,
+    robot_lock: threading.Lock | None = None,
 ) -> np.ndarray:
     if not hasattr(arm, "solve_ik"):
         raise RuntimeError(f"{arm_name} arm 当前 SDK 没有 solve_ik()，无法使用 joint_waypoints mode")
-    if not hasattr(arm, "move_joint_waypoints"):
+    if require_move_joint_waypoints and not hasattr(arm, "move_joint_waypoints"):
         raise RuntimeError(f"{arm_name} arm 当前 SDK 没有 move_joint_waypoints()，无法使用 joint_waypoints mode")
 
     poses = np.asarray(poses, dtype=np.float64)
-    q_seed = list(np.asarray(arm.get_joint_positions(), dtype=np.float64))
+    with robot_lock if robot_lock is not None else contextlib.nullcontext():
+        q_seed = list(np.asarray(arm.get_joint_positions(), dtype=np.float64))
     joint_waypoints = []
     max_attempts = 1 + max(0, int(ik_retries))
     retry_sleep_s = max(0.0, float(ik_retry_sleep_s))
