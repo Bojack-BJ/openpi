@@ -53,6 +53,45 @@ def test_known_prior_next_step_advances_with_completion_evidence():
     assert match["advance_reason"] == "matched_next_prior_step"
 
 
+def test_known_prior_next_step_advances_after_consecutive_confirmations():
+    steps = ("approach cabinet", "grasp cabinet handle", "open cabinet")
+    prediction, next_index, match = _apply_known_prior_rollout_state(
+        _prediction(objective="grasp cabinet handle"),
+        known_prior_steps=steps,
+        current_index=0,
+        advance_threshold=0.7,
+        match_threshold=0.62,
+        max_advance_steps=3,
+        next_step_require_completion=True,
+        next_step_confirm_steps=2,
+        safe_skip_mode=True,
+    )
+
+    assert next_index == 0
+    assert match["next_step_confirmation_index"] == 1
+    assert match["next_step_confirmation_steps"] == 1
+    assert match["advance_reason"] == "matched_next_prior_step_waiting_for_completion"
+
+    prediction, next_index, match = _apply_known_prior_rollout_state(
+        _prediction(objective="grasp cabinet handle"),
+        known_prior_steps=steps,
+        current_index=0,
+        advance_threshold=0.7,
+        match_threshold=0.62,
+        max_advance_steps=3,
+        next_step_require_completion=True,
+        next_step_confirm_steps=2,
+        next_step_confirmation_index=int(match["next_step_confirmation_index"]),
+        next_step_confirmation_steps=int(match["next_step_confirmation_steps"]),
+        safe_skip_mode=True,
+    )
+
+    assert next_index == 1
+    assert prediction.current_objective == steps[1]
+    assert match["next_step_confirmed"]
+    assert match["advance_reason"] == "matched_next_prior_step_confirmed"
+
+
 def test_known_prior_safe_skip_does_not_clamp_forward_without_completion():
     steps = ("approach cabinet", "grasp cabinet handle", "open cabinet")
     prediction, next_index, match = _apply_known_prior_rollout_state(

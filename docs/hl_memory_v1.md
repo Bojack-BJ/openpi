@@ -999,6 +999,7 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --known-prior-match-threshold 0.62 \
   --known-prior-max-advance-steps 3 \
   --known-prior-next-step-require-completion \
+  --known-prior-next-step-confirm-steps 2 \
   --known-prior-safe-skip-mode \
   --known-prior-skip-match-threshold 0.95 \
   --known-prior-skip-min-progress 0.8 \
@@ -1041,6 +1042,7 @@ Input rules：
 | `--known-prior-match-threshold` | 如果模型输出的 `current_objective/current_subtask/phase` 与后续 prior step 的文本相似度超过该阈值，则直接推进到该 step，默认 `0.62`。 |
 | `--known-prior-max-advance-steps` | 每轮 rollout 最多向后匹配/跳过多少个 prior steps，默认 `3`；如果 `--rollout-interval-sec` 大、subtask 很短，需要调大，否则 pointer 会追不上。 |
 | `--known-prior-next-step-require-completion` | 开启后，相邻 prior step 的文本匹配不能单独触发推进，还必须满足模型输出 `should_advance_objective=true` 或 `subtask_progress >= --known-prior-advance-threshold`。safe-skip 证据不足时也不会降级推进一步。默认关闭以兼容旧行为。 |
+| `--known-prior-next-step-confirm-steps` | completion gate 开启后，如果模型连续 N 轮高置信匹配同一个相邻下一步，也允许推进，避免模型已经识别到新视觉状态但无法继续报告旧 step progress 时卡死。默认 `0` 表示禁用；建议先用 `2`。只作用于相邻步骤，不放宽跨多步 safe-skip。 |
 | `--known-prior-safe-skip-mode` | 开启受限追赶模式：普通文本匹配最多推进一步；跨步跳转需要更强 match 和完成/卡住证据，避免从 step 5 直接跳到 step 7。 |
 | `--known-prior-skip-match-threshold` | safe-skip 模式下允许跨步追赶的更高文本匹配阈值，默认 `0.95`。 |
 | `--known-prior-skip-min-progress` | safe-skip 模式下允许跨步追赶的 progress 下限，默认 `0.8`；`should_advance_objective=true` 也会视作完成证据。 |

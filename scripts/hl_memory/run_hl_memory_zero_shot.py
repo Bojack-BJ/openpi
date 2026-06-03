@@ -78,6 +78,7 @@ class ZeroShotArgs:
     known_prior_match_threshold: float = 0.62
     known_prior_max_advance_steps: int = 3
     known_prior_next_step_require_completion: bool = False
+    known_prior_next_step_confirm_steps: int = 0
     known_prior_safe_skip_mode: bool = False
     known_prior_skip_match_threshold: float = 0.95
     known_prior_skip_min_progress: float = 0.8
@@ -308,6 +309,8 @@ def _run_rollout(
     known_prior_steps = _known_prior_steps(args)
     known_prior_index = _initial_known_prior_index(args, known_prior_steps)
     known_prior_stall_steps = 0
+    known_prior_next_step_confirmation_index: int | None = None
+    known_prior_next_step_confirmation_steps = 0
     if known_prior_steps and not language_memory.strip():
         language_memory = _known_prior_language_memory(
             known_prior_steps,
@@ -359,13 +362,23 @@ def _run_rollout(
                 match_threshold=args.known_prior_match_threshold,
                 max_advance_steps=args.known_prior_max_advance_steps,
                 next_step_require_completion=args.known_prior_next_step_require_completion,
+                next_step_confirm_steps=args.known_prior_next_step_confirm_steps,
+                next_step_confirmation_index=known_prior_next_step_confirmation_index,
+                next_step_confirmation_steps=known_prior_next_step_confirmation_steps,
                 safe_skip_mode=args.known_prior_safe_skip_mode,
                 skip_match_threshold=args.known_prior_skip_match_threshold,
                 skip_min_progress=args.known_prior_skip_min_progress,
                 skip_min_stall_steps=args.known_prior_skip_min_stall_steps,
                 stall_steps=known_prior_stall_steps,
             )
-            known_prior_stall_steps = 0 if known_prior_index != known_prior_index_before else known_prior_stall_steps + 1
+            if known_prior_index != known_prior_index_before:
+                known_prior_stall_steps = 0
+                known_prior_next_step_confirmation_index = None
+                known_prior_next_step_confirmation_steps = 0
+            else:
+                known_prior_stall_steps += 1
+                known_prior_next_step_confirmation_index = known_prior_match["next_step_confirmation_index"]
+                known_prior_next_step_confirmation_steps = int(known_prior_match["next_step_confirmation_steps"])
         ground_truth_subtask = _task_config_subtask_at(args.task_config_path, end_sec)
         candidate_seconds = keyframe_candidate_seconds(
             prediction,
@@ -437,6 +450,12 @@ def _run_rollout(
                 "known_prior_index_after": known_prior_index if known_prior_steps else None,
                 "known_prior_current_step": known_prior_steps[known_prior_index] if known_prior_steps else None,
                 "known_prior_stall_steps": known_prior_stall_steps if known_prior_steps else None,
+                "known_prior_next_step_confirmation_index": (
+                    known_prior_next_step_confirmation_index if known_prior_steps else None
+                ),
+                "known_prior_next_step_confirmation_steps": (
+                    known_prior_next_step_confirmation_steps if known_prior_steps else None
+                ),
                 "known_prior_match": known_prior_match,
                 "memory_seconds_before": list(memory_before),
                 "memory_seconds_after": list(memory_seconds),
@@ -551,6 +570,7 @@ def _build_rollout_payload(
         "known_prior_match_threshold": args.known_prior_match_threshold,
         "known_prior_max_advance_steps": args.known_prior_max_advance_steps,
         "known_prior_next_step_require_completion": args.known_prior_next_step_require_completion,
+        "known_prior_next_step_confirm_steps": args.known_prior_next_step_confirm_steps,
         "known_prior_safe_skip_mode": args.known_prior_safe_skip_mode,
         "known_prior_skip_match_threshold": args.known_prior_skip_match_threshold,
         "known_prior_skip_min_progress": args.known_prior_skip_min_progress,
@@ -745,6 +765,9 @@ def _apply_known_prior_rollout_state(
     match_threshold: float,
     max_advance_steps: int,
     next_step_require_completion: bool = False,
+    next_step_confirm_steps: int = 0,
+    next_step_confirmation_index: int | None = None,
+    next_step_confirmation_steps: int = 0,
     safe_skip_mode: bool = False,
     skip_match_threshold: float = 0.95,
     skip_min_progress: float = 0.8,
@@ -765,19 +788,43 @@ def _apply_known_prior_rollout_state(
     advance_reason = "hold"
     matched_index = int(match["index"])
     matched_score = float(match["score"])
+    next_step_confirmation_index, next_step_confirmation_steps = _update_next_step_confirmation(
+        current_index=current_index,
+        matched_index=matched_index,
+        matched_score=matched_score,
+        match_threshold=match_threshold,
+        previous_index=next_step_confirmation_index,
+        previous_steps=next_step_confirmation_steps,
+    )
+    next_step_confirmed = (
+        next_step_confirm_steps > 0 and next_step_confirmation_steps >= next_step_confirm_steps
+    )
     if matched_index > current_index and matched_score >= match_threshold:
         if not safe_skip_mode:
-            if matched_index == current_index + 1 and next_step_require_completion and not should_advance:
+            if (
+                matched_index == current_index + 1
+                and next_step_require_completion
+                and not should_advance
+                and not next_step_confirmed
+            ):
                 advance_reason = "matched_next_prior_step_waiting_for_completion"
             else:
                 next_index = matched_index
-                advance_reason = "matched_later_prior_step"
+                advance_reason = (
+                    "matched_next_prior_step_confirmed"
+                    if matched_index == current_index + 1 and next_step_confirmed and not should_advance
+                    else "matched_later_prior_step"
+                )
         elif matched_index == current_index + 1:
-            if next_step_require_completion and not should_advance:
+            if next_step_require_completion and not should_advance and not next_step_confirmed:
                 advance_reason = "matched_next_prior_step_waiting_for_completion"
             else:
                 next_index = matched_index
-                advance_reason = "matched_next_prior_step"
+                advance_reason = (
+                    "matched_next_prior_step_confirmed"
+                    if next_step_confirmed and not should_advance
+                    else "matched_next_prior_step"
+                )
         elif _known_prior_can_safe_skip(
             prediction,
             should_advance=should_advance,
@@ -830,6 +877,10 @@ def _apply_known_prior_rollout_state(
             "match_threshold": match_threshold,
             "max_advance_steps": max_advance_steps,
             "next_step_require_completion": next_step_require_completion,
+            "next_step_confirm_steps": next_step_confirm_steps,
+            "next_step_confirmation_index": next_step_confirmation_index,
+            "next_step_confirmation_steps": next_step_confirmation_steps,
+            "next_step_confirmed": next_step_confirmed,
             "safe_skip_mode": safe_skip_mode,
             "skip_match_threshold": skip_match_threshold,
             "skip_min_progress": skip_min_progress,
@@ -838,6 +889,23 @@ def _apply_known_prior_rollout_state(
             "should_advance_by_progress": should_advance,
         },
     )
+
+
+def _update_next_step_confirmation(
+    *,
+    current_index: int,
+    matched_index: int,
+    matched_score: float,
+    match_threshold: float,
+    previous_index: int | None,
+    previous_steps: int,
+) -> tuple[int | None, int]:
+    expected_index = current_index + 1
+    if matched_index != expected_index or matched_score < match_threshold:
+        return None, 0
+    if previous_index == matched_index:
+        return matched_index, max(0, int(previous_steps)) + 1
+    return matched_index, 1
 
 
 def _known_prior_can_safe_skip(
