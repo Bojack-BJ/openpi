@@ -91,6 +91,7 @@ class TrainArgs:
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
     learning_rate: float = 5e-6
+    vision_tower_learning_rate: float | None = None
     weight_decay: float = 1e-4
     lora_enabled: bool = False
     lora_r: int = 8
@@ -230,11 +231,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     device_ids=[device.index] if device.type == "cuda" else None,
                 ),
             )
-    optimizer = torch.optim.AdamW(
-        (parameter for parameter in loaded.model.parameters() if parameter.requires_grad),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = _build_optimizer(loaded.model, args=args, is_main=is_main)
     scaler_enabled = (
         args.use_grad_scaler
         and args.precision == "float16"
@@ -340,7 +337,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                         "time/data_s_per_it": avg_data_time,
                         "time/step_s_per_it": avg_step_time,
                         "time/data_fraction": data_fraction,
-                        "train/lr": optimizer.param_groups[0]["lr"],
+                        **_optimizer_lr_metrics(optimizer),
                         "train/global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
                     },
                     step=step,
@@ -513,6 +510,65 @@ def _apply_lora(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> to
     return model
 
 
+def _build_optimizer(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> torch.optim.Optimizer:
+    if args.vision_tower_learning_rate is None:
+        return torch.optim.AdamW(
+            (parameter for parameter in model.parameters() if parameter.requires_grad),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+
+    vision_params: list[torch.nn.Parameter] = []
+    base_params: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        parameter_id = id(parameter)
+        if parameter_id in seen:
+            continue
+        seen.add(parameter_id)
+        is_vision_parameter = bool(getattr(parameter, "_hl_vision_tower_param", False)) or _is_vision_module_name(name)
+        if is_vision_parameter:
+            vision_params.append(parameter)
+        else:
+            base_params.append(parameter)
+
+    param_groups: list[dict[str, object]] = []
+    if base_params:
+        param_groups.append({"params": base_params, "lr": args.learning_rate, "name": "base"})
+    if vision_params:
+        param_groups.append({"params": vision_params, "lr": args.vision_tower_learning_rate, "name": "vision_tower"})
+    if not param_groups:
+        raise ValueError("No trainable parameters found for optimizer.")
+
+    if is_main:
+        logging.info(
+            "Optimizer param groups: base_params=%s lr=%g vision_params=%s lr=%g",
+            _format_count(sum(parameter.numel() for parameter in base_params)),
+            args.learning_rate,
+            _format_count(sum(parameter.numel() for parameter in vision_params)),
+            args.vision_tower_learning_rate,
+        )
+    return torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
+
+
+def _optimizer_lr_metrics(optimizer: torch.optim.Optimizer) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for index, group in enumerate(optimizer.param_groups):
+        name = str(group.get("name", f"group_{index}"))
+        lr = float(group["lr"])
+        if name == "base":
+            metrics["train/lr"] = lr
+        elif name == "vision_tower":
+            metrics["train/vision_lr"] = lr
+        else:
+            metrics[f"train/lr_{name}"] = lr
+    if "train/lr" not in metrics and optimizer.param_groups:
+        metrics["train/lr"] = float(optimizer.param_groups[0]["lr"])
+    return metrics
+
+
 def _configure_vision_tower_training(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> None:
     mode = args.vision_tower_train_mode
     if mode not in {"frozen", "last_n", "full"}:
@@ -560,6 +616,7 @@ def _configure_vision_tower_training(model: torch.nn.Module, *, args: TrainArgs,
 
     for _, parameter in vision_named_params:
         parameter.requires_grad = id(parameter) in trainable_param_ids
+        parameter._hl_vision_tower_param = parameter.requires_grad
 
     if is_main:
         trainable_params = sum(parameter.numel() for _, parameter in vision_named_params if parameter.requires_grad)

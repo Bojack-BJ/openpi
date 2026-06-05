@@ -809,7 +809,7 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \
   --wandb-run-name sponge-qwen35-2b-hl
 ```
 
-这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。开启 wandb 后 rank0 会记录 `train/loss`、`time/data_s_per_it`、`time/step_s_per_it`、`time/data_fraction`、`train/lr` 和 `train/global_batch_size`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
+这里 `--batch-size` 是每张卡的 micro batch；有效全局 batch 约等于 `batch_size * grad_accum_steps * nproc_per_node`。训练进度条会显示 ETA、`s/it` / `it/s`、`data_s/it` 和 `step_s/it`。开启 wandb 后 rank0 会记录 `train/loss`、`time/data_s_per_it`、`time/step_s_per_it`、`time/data_fraction`、`train/lr`、可选的 `train/vision_lr` 和 `train/global_batch_size`。`--frame-cache-size` 是每个 rank 缓存的 resized frame 数；如果 `data_s/it` 占比高，可以适当增大，前提是 CPU 内存足够。
 
 如果 full finetune 出现过度依赖 language memory 或通用视觉能力退化，优先尝试 LoRA + language memory dropout：
 
@@ -847,7 +847,7 @@ Vision tower 默认保持 frozen。Qwen3.5-VL 的视觉侧是 Qwen-style video v
 - `--vision-tower-train-mode last_n --vision-tower-unfreeze-last-n-layers N`：只解冻视觉 tower 最后 N 个 block，并解冻 `merger/patch_merger`；推荐先试 `N=2`，再试 `N=4`。
 - `--vision-tower-train-mode full`：解冻整个视觉 tower；显存和过拟合风险最高，只在 last_n 明显有收益且仍不够时试。
 
-推荐学习率：语言 LoRA 仍用 `5e-6` 起步；vision 解冻时先把全局 `--learning-rate` 降到 `1e-6 ~ 2e-6` 做稳定性测试。当前脚本还没有 vision/language 分组学习率，因此如果开 vision 解冻，LoRA 也会用同一个 learning rate；要精细调参时再加 param group。
+推荐学习率：语言 LoRA 仍用 `--learning-rate 5e-6` 起步；vision 解冻时用 `--vision-tower-learning-rate` 单独控制视觉侧，last-N 先试 `2e-6`，full vision 先试 `1e-6` 或更低。没有传 `--vision-tower-learning-rate` 时，所有 trainable 参数沿用 `--learning-rate`。
 
 视觉 frozen / last-N / full 对比建议固定 dropout，先去掉 text memory 和 step prior shortcut：
 
@@ -890,7 +890,8 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
   --precision bfloat16 \
-  --learning-rate 2e-6 \
+  --learning-rate 5e-6 \
+  --vision-tower-learning-rate 2e-6 \
   --lora-enabled \
   --lora-r 16 \
   --lora-alpha 32 \
@@ -918,7 +919,8 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --vlm-variant qwen3_5_4b \
   --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
   --precision bfloat16 \
-  --learning-rate 1e-6 \
+  --learning-rate 5e-6 \
+  --vision-tower-learning-rate 1e-6 \
   --lora-enabled \
   --lora-r 16 \
   --lora-alpha 32 \
