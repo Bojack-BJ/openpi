@@ -243,7 +243,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
   --sampling-mode dense-stride \
   --dense-sample-stride-frames 5 \
   --prediction-horizon-steps 2 \
-  --keyframe-label-mode memer_rules \
+  --keyframe-label-mode segment_end \
   --overwrite \
   --continue-on-error
 ```
@@ -260,9 +260,9 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
 }
 ```
 
-`--sampling-mode fraction-rules` 是当前默认路径：先生成 segment boundary/progress/success rows，再叠加 `--progress-sample-*`、short-segment 和 late-fraction 等规则。`--sampling-mode annotations` 只是兼容旧命令的 alias，行为等同于 `fraction-rules`。`--sampling-mode dense-stride` 会在每个 segment 内每 `--dense-sample-stride-frames` 帧生成一个 sample，并额外强制包含 MEMER keyframe rule 选中的帧。`--prediction-horizon-steps 2` 表示 horizon label 来自 `sample_frame + 2 * dense_sample_stride_frames` 所在 segment，超过 episode 末尾会 clip 到最后一帧；设为 `0` 就是 current-frame objective baseline。
+`--sampling-mode fraction-rules` 是当前默认路径：先生成 segment boundary/progress/success rows，再叠加 `--progress-sample-*`、short-segment 和 late-fraction 等规则。`--sampling-mode annotations` 只是兼容旧命令的 alias，行为等同于 `fraction-rules`。`--sampling-mode dense-stride` 会在每个 segment 内每 `--dense-sample-stride-frames` 帧生成一个 sample，并额外强制包含 `--keyframe-label-mode` 选中的显式 keyframe 帧。`--prediction-horizon-steps 2` 表示 horizon label 来自 `sample_frame + 2 * dense_sample_stride_frames` 所在 segment，超过 episode 末尾会 clip 到最后一帧；设为 `0` 就是 current-frame objective baseline。
 
-`--keyframe-label-mode event_boundary` 保持旧 keyframe 规则。`--keyframe-label-mode memer_rules` 会用文本规则把 state-changing segments 的代表帧写成显式 keyframe label：默认 `place/release/put/insert/stack/open/close/press/handover/pick up stack` 选 segment 最后一帧，approach/return/retreat/move back/observation 等默认不选。需要改规则时传 `--keyframe-rule-path rules.json`，格式为：
+`--keyframe-label-mode event_boundary` 保持旧 keyframe 规则。`--keyframe-label-mode segment_end` 会把每个 segment 的 `end_frame - 1` 标为显式 keyframe，是当前推荐 baseline：它比 `memer_rules` 稠密得多，避免模型在 `keyframe_candidate_positions` 上学成永远输出 `[]`。`--keyframe-label-mode memer_rules` 会用文本规则把 state-changing segments 的代表帧写成显式 keyframe label：默认 `place/release/put/insert/stack/open/close/press/handover/pick up stack` 选 segment 最后一帧，approach/return/retreat/move back/observation 等默认不选，适合作为更稀疏 keyframe 消融。需要改规则时传 `--keyframe-rule-path rules.json`，格式为：
 
 ```json
 {
@@ -282,10 +282,11 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
 | --- | --- | --- | --- |
 | `fraction-rules` | `event_boundary` | `hl_v1` | 当前完整 HL baseline，使用 boundary/progress/success + fraction/dynamic rules |
 | `dense-stride` | `event_boundary` | `hl_v1` | 单独验证 dense 采样是否解决节奏问题 |
-| `dense-stride` | `memer_rules` | `hl_v1` | 验证更干净的 keyframe label 是否帮助完整 HL |
-| `dense-stride` | `memer_rules` | `memer_objective` | MEMER-style 简化 objective + keyframe baseline |
-| `dense-stride`, horizon=0 | `memer_rules` | `memer_objective` | current-frame objective baseline |
-| `dense-stride`, horizon=2 | `memer_rules` | `memer_objective` | short-horizon objective baseline |
+| `dense-stride` | `segment_end` | `hl_v1` | 当前推荐 keyframe baseline，验证稠密 segment-end keyframe 是否帮助完整 HL |
+| `dense-stride` | `segment_end` | `memer_objective` | MEMER-style 简化 objective + keyframe baseline |
+| `dense-stride`, horizon=0 | `segment_end` | `memer_objective` | current-frame objective baseline |
+| `dense-stride`, horizon=2 | `segment_end` | `memer_objective` | short-horizon objective baseline |
+| `dense-stride` | `memer_rules` | `hl_v1` | 稀疏 keyframe 消融；如果 keyframe 非空比例过低，模型通常会输出空数组 |
 
 ### 3. LLM GT Normalization Before Dataset Export
 

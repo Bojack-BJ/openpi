@@ -118,7 +118,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dense-sample-stride-frames", type=int, default=5, help="Forward to annotation exporter.")
     parser.add_argument("--prediction-horizon-steps", type=int, default=2, help="Forward to annotation exporter.")
-    parser.add_argument("--keyframe-label-mode", choices=("event_boundary", "memer_rules"), default="event_boundary", help="Forward to annotation exporter.")
+    parser.add_argument(
+        "--keyframe-label-mode",
+        choices=("event_boundary", "memer_rules", "segment_end"),
+        default="event_boundary",
+        help="Forward to annotation exporter.",
+    )
     parser.add_argument("--keyframe-rule-path", type=Path, default=None, help="Forward to annotation exporter.")
     parser.add_argument("--progress-sample-stride", type=int, default=0, help="Forward to annotation exporter.")
     parser.add_argument("--progress-sample-fractions", default="", help="Forward to annotation exporter.")

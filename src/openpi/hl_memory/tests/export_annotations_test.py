@@ -63,3 +63,24 @@ def test_memer_rules_label_last_state_changing_keyframe_only():
     assert labels[0] is False
     assert labels[5] is False
     assert labels[19] is True
+
+
+def test_segment_end_labels_every_segment_end_as_keyframe():
+    rows = _segments_to_rows(
+        0,
+        [(0, 10, "approach cup"), (10, 20, "hold cup")],
+        _args(
+            sampling_mode="dense-stride",
+            dense_sample_stride_frames=5,
+            prediction_horizon_steps=0,
+            keyframe_label_mode="segment_end",
+        ),
+    )
+
+    labels = {int(row["frame_index"]): row.get("keyframe_label") for row in rows}
+    assert labels[0] is None
+    assert labels[5] is None
+    assert labels[9] is True
+    assert labels[10] is None
+    assert labels[15] is None
+    assert labels[19] is True

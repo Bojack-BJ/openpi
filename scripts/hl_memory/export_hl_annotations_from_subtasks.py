@@ -88,9 +88,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--keyframe-label-mode",
-        choices=("event_boundary", "memer_rules"),
+        choices=("event_boundary", "memer_rules", "segment_end"),
         default="event_boundary",
-        help="How to label keyframe supervision. `event_boundary` keeps legacy behavior; `memer_rules` writes explicit sparse keyframe labels.",
+        help=(
+            "How to label keyframe supervision. `event_boundary` keeps legacy behavior; "
+            "`memer_rules` writes explicit sparse keyframe labels; `segment_end` marks every segment end as a keyframe."
+        ),
     )
     parser.add_argument(
         "--keyframe-rule-path",
@@ -578,6 +581,8 @@ def _dense_stride_rows(
 def _build_keyframe_label_map(segments: list[Segment], args: argparse.Namespace) -> dict[int, bool]:
     if args.keyframe_label_mode == "event_boundary":
         return {}
+    if args.keyframe_label_mode == "segment_end":
+        return {end - 1: True for start, end, _subtask in segments if start < end}
     rules = _load_keyframe_rules(args.keyframe_rule_path)
     labels: dict[int, bool] = {}
     for start, end, subtask in segments:
