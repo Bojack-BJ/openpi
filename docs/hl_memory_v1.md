@@ -839,6 +839,108 @@ LoRA 需要安装 `peft`。默认 LoRA target modules 是 Qwen 常见 attention/
 
 当前脚本默认值已经偏保守：`--learning-rate 5e-6`、`--lora-r 8`、`--lora-alpha 16`、`--language-memory-dropout 0.3`、`--step-prior-dropout 0.3`。如果模型第一步就背出完整流程，优先检查 GT 是否泄漏未来，再降低 learning rate / 训练步数，而不是增大 LoRA rank。
 
+Vision tower 默认保持 frozen。Qwen3.5-VL 的视觉侧是 Qwen-style video vision tower：`Conv3D` patch embedding 把多帧视频切成时空 patch token，后面接 ViT block stack 和 rotary/position embedding，最后经过 spatial patch merger 把视觉 token 映射给语言模型。也就是说它不是简单“把多张图片拼成一张再当静态图”训练；但机器人鱼眼视角和手眼双视角仍然可能和预训练视频分布有 gap。
+
+视觉适配有三种模式：
+
+- `--vision-tower-train-mode frozen`：默认，显式冻结 vision tower；LoRA 训练时只训练语言侧 LoRA，full finetune 时也不会更新视觉侧，用作 baseline。
+- `--vision-tower-train-mode last_n --vision-tower-unfreeze-last-n-layers N`：只解冻视觉 tower 最后 N 个 block，并解冻 `merger/patch_merger`；推荐先试 `N=2`，再试 `N=4`。
+- `--vision-tower-train-mode full`：解冻整个视觉 tower；显存和过拟合风险最高，只在 last_n 明显有收益且仍不够时试。
+
+推荐学习率：语言 LoRA 仍用 `5e-6` 起步；vision 解冻时先把全局 `--learning-rate` 降到 `1e-6 ~ 2e-6` 做稳定性测试。当前脚本还没有 vision/language 分组学习率，因此如果开 vision 解冻，LoRA 也会用同一个 learning rate；要精细调参时再加 param group。
+
+视觉 frozen / last-N / full 对比建议固定 dropout，先去掉 text memory 和 step prior shortcut：
+
+```bash
+# A. Vision frozen baseline.
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
+  --dataset-root /root/Users/dataset/hl_memory/subtask \
+  --dataset-glob '*/train' \
+  --val-dataset-root /root/Users/dataset/hl_memory/subtask \
+  --val-dataset-glob '*/val' \
+  --output-dir /root/Users/checkpoints/hl_memory/subtask_qwen35_visual_ablation_frozen \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
+  --precision bfloat16 \
+  --learning-rate 5e-6 \
+  --lora-enabled \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --language-memory-dropout 1.0 \
+  --step-prior-dropout 1.0 \
+  --vision-tower-train-mode frozen \
+  --batch-size 1 \
+  --grad-accum-steps 8 \
+  --num-train-steps 6000 \
+  --val-interval 100 \
+  --val-batches 10
+```
+
+```bash
+# B. Unfreeze final vision blocks. Start with N=2; try N=4 if stable.
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
+  --dataset-root /root/Users/dataset/hl_memory/subtask \
+  --dataset-glob '*/train' \
+  --val-dataset-root /root/Users/dataset/hl_memory/subtask \
+  --val-dataset-glob '*/val' \
+  --output-dir /root/Users/checkpoints/hl_memory/subtask_qwen35_visual_ablation_last2 \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
+  --precision bfloat16 \
+  --learning-rate 2e-6 \
+  --lora-enabled \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --language-memory-dropout 1.0 \
+  --step-prior-dropout 1.0 \
+  --vision-tower-train-mode last_n \
+  --vision-tower-unfreeze-last-n-layers 2 \
+  --batch-size 1 \
+  --grad-accum-steps 8 \
+  --num-train-steps 6000 \
+  --val-interval 100 \
+  --val-batches 10
+```
+
+```bash
+# C. Full vision tower finetune. Use only if last_n helps but is not enough.
+torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
+  --dataset-root /root/Users/dataset/hl_memory/subtask \
+  --dataset-glob '*/train' \
+  --val-dataset-root /root/Users/dataset/hl_memory/subtask \
+  --val-dataset-glob '*/val' \
+  --output-dir /root/Users/checkpoints/hl_memory/subtask_qwen35_visual_ablation_full \
+  --vlm-backend qwen3_5_vl \
+  --vlm-variant qwen3_5_4b \
+  --local-vlm-ckpt-path /root/Users/lixiaotong/Qwen3.5-4B \
+  --precision bfloat16 \
+  --learning-rate 1e-6 \
+  --lora-enabled \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --language-memory-dropout 1.0 \
+  --step-prior-dropout 1.0 \
+  --vision-tower-train-mode full \
+  --batch-size 1 \
+  --grad-accum-steps 8 \
+  --num-train-steps 6000 \
+  --val-interval 100 \
+  --val-batches 10
+```
+
+当前推荐 ablation 顺序：
+
+1. `language_memory_dropout=1.0` + `step_prior_dropout=1.0`，分别跑 vision frozen / final 2 blocks / full vision。目的是确认模型是否能只靠 recent window + visual keyframes 学到进度。
+2. 在第 1 步表现最好的 vision setting 上，把 `--step-prior-dropout` 从 `1.0` 降到 `0.3` 或 `0.0`，看 known step prior 是否提供稳定增益，而不是重新制造 shortcut。
+3. 给 keyframe memory 加绝对时间戳，评估是否改善“短 subtask 一进入 memory 就过早切下一步”的时间感知问题。
+4. 额外建议固定 keyframe label 策略和训练步数做对照。不要同时改 keyframe、dropout、vision 解冻和 target protocol，否则很难判断收益来源。
+5. 额外建议保留一个 rollout-level 指标：advance precision/recall、平均提前/滞后秒数、空 keyframe 率。单看 val loss 很容易被 JSON/token 格式影响。
+
 可用 backend / variant：
 
 - `--vlm-backend qwen2_5_vl`

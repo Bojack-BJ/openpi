@@ -52,6 +52,8 @@ class TrainArgs:
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    vision_tower_train_mode: str = "frozen"
+    vision_tower_unfreeze_last_n_layers: int = 0
     language_memory_dropout: float = 0.3
     language_memory_dropout_value: str = "No progress has been recorded yet."
     step_prior_dropout: float = 0.3
@@ -130,6 +132,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     )
     if args.lora_enabled:
         loaded = dataclasses.replace(loaded, model=_apply_lora(loaded.model, args=args, is_main=is_main))
+    _configure_vision_tower_training(loaded.model, args=args, is_main=is_main)
     loaded.model.train()
     if distributed:
         loaded = dataclasses.replace(
@@ -290,6 +293,113 @@ def _apply_lora(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> to
     if is_main:
         model.print_trainable_parameters()
     return model
+
+
+def _configure_vision_tower_training(model: torch.nn.Module, *, args: TrainArgs, is_main: bool) -> None:
+    mode = args.vision_tower_train_mode
+    if mode not in {"frozen", "last_n", "full"}:
+        raise ValueError(f"--vision-tower-train-mode must be frozen|last_n|full, got {mode!r}")
+    if mode == "frozen":
+        if args.vision_tower_unfreeze_last_n_layers:
+            raise ValueError("--vision-tower-unfreeze-last-n-layers is only valid with --vision-tower-train-mode last_n")
+
+    vision_named_params = [(name, parameter) for name, parameter in model.named_parameters() if _is_vision_module_name(name)]
+    if not vision_named_params:
+        if mode == "frozen":
+            return
+        raise ValueError(
+            f"--vision-tower-train-mode {mode!r} was set, but no vision tower parameters were found. "
+            "Inspect model.named_parameters() for this VLM backend."
+        )
+
+    for _, parameter in vision_named_params:
+        parameter.requires_grad = False
+
+    trainable_param_ids: set[int]
+    trainable_module_names: list[str]
+    if mode == "frozen":
+        trainable_param_ids = set()
+        trainable_module_names = ["<none>"]
+    elif mode == "full":
+        trainable_param_ids = {id(parameter) for _, parameter in vision_named_params}
+        trainable_module_names = ["<entire vision tower>"]
+    else:
+        if args.vision_tower_unfreeze_last_n_layers <= 0:
+            raise ValueError("--vision-tower-unfreeze-last-n-layers must be > 0 with --vision-tower-train-mode last_n")
+        vision_blocks = _find_vision_block_modules(model)
+        if not vision_blocks:
+            raise ValueError(
+                "--vision-tower-train-mode last_n was set, but no vision block ModuleList/Sequential was found. "
+                "Use --vision-tower-train-mode full or update the block-name heuristics for this backend."
+            )
+        selected_blocks = vision_blocks[-args.vision_tower_unfreeze_last_n_layers :]
+        selected_tail_modules = _find_vision_tail_modules(model)
+        trainable_param_ids = set()
+        trainable_module_names = []
+        for name, module in selected_blocks + selected_tail_modules:
+            trainable_module_names.append(name)
+            trainable_param_ids.update(id(parameter) for parameter in module.parameters(recurse=True))
+
+    for _, parameter in vision_named_params:
+        parameter.requires_grad = id(parameter) in trainable_param_ids
+
+    if is_main:
+        trainable_params = sum(parameter.numel() for _, parameter in vision_named_params if parameter.requires_grad)
+        total_params = sum(parameter.numel() for _, parameter in vision_named_params)
+        preview = ", ".join(trainable_module_names[:8])
+        suffix = "" if len(trainable_module_names) <= 8 else f", ... +{len(trainable_module_names) - 8}"
+        logging.info(
+            "Vision tower train mode=%s trainable=%s/%s params modules=%s%s",
+            mode,
+            _format_count(trainable_params),
+            _format_count(total_params),
+            preview,
+            suffix,
+        )
+
+
+def _find_vision_block_modules(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
+    block_containers: list[tuple[str, torch.nn.Module]] = []
+    for name, module in model.named_modules():
+        if not _is_vision_module_name(name):
+            continue
+        if not isinstance(module, (torch.nn.ModuleList, torch.nn.Sequential)):
+            continue
+        if name.split(".")[-1] in {"blocks", "layers", "layer", "resblocks"}:
+            block_containers.append((name, module))
+    if not block_containers:
+        return []
+    container_name, container = max(block_containers, key=lambda item: len(item[1]))
+    return [(f"{container_name}.{index}", child) for index, child in enumerate(container)]
+
+
+def _find_vision_tail_modules(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
+    tail_modules: list[tuple[str, torch.nn.Module]] = []
+    tail_names = {"merger", "patch_merger"}
+    for name, module in model.named_modules():
+        if not _is_vision_module_name(name):
+            continue
+        if name.split(".")[-1] in tail_names:
+            tail_modules.append((name, module))
+    return tail_modules
+
+
+def _is_vision_module_name(name: str) -> bool:
+    components = name.split(".")
+    vision_components = {"visual", "vision_tower", "vision_model", "vision_encoder"}
+    if any(component in vision_components for component in components):
+        return True
+    return any(component.startswith("visual") or component.startswith("vision") for component in components)
+
+
+def _format_count(value: int) -> str:
+    if value >= 1_000_000_000:
+        return f"{value / 1_000_000_000:.3f}B"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.3f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.3f}K"
+    return str(value)
 
 
 def _maybe_apply_training_dropouts(sample, *, args: TrainArgs, rng: random.Random):
