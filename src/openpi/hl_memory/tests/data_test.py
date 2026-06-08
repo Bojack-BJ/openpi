@@ -63,6 +63,26 @@ def test_memer_objective_target_falls_back_to_current_objective():
     assert prediction.current_objective == "current objective"
 
 
+def test_subtask_keyframe_target_uses_only_subtask_and_keyframes():
+    sample = _sample(
+        current_objective="current objective",
+        current_subtask="current subtask",
+        horizon_frame_index=10,
+        horizon_current_objective="horizon objective",
+        horizon_current_subtask="horizon subtask",
+        horizon_phase="horizon phase",
+    )
+
+    prediction = sample.target_prediction(target_protocol="subtask_keyframe")
+
+    assert prediction.current_subtask == "horizon subtask"
+    assert prediction.current_objective == "horizon subtask"
+    assert prediction.phase == "horizon phase"
+    assert prediction.keyframe_candidate_positions == (1, 3)
+    assert prediction.subtask_progress is None
+    assert prediction.should_advance_objective is None
+
+
 def test_load_video_clips_for_sample_pads_and_tracks_valid_lengths():
     with tempfile.TemporaryDirectory() as tmp_dir:
         root = pathlib.Path(tmp_dir)

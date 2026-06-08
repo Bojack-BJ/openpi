@@ -173,6 +173,18 @@ class ExportedHLMemorySample:
                 goal_query="",
                 current_objective=objective,
             )
+        if target_protocol == "subtask_keyframe":
+            subtask = self.horizon_current_subtask or self.current_subtask or self.current_objective
+            phase = self.horizon_phase or self.phase or subtask
+            return HLMemoryPrediction(
+                updated_language_memory="",
+                current_subtask=subtask,
+                keyframe_candidate_positions=self.keyframe_candidate_positions,
+                phase=phase,
+                target_query="",
+                goal_query="",
+                current_objective=subtask,
+            )
         if target_protocol != "hl_v1":
             raise ValueError(f"Unsupported target_protocol: {target_protocol!r}")
         return HLMemoryPrediction(

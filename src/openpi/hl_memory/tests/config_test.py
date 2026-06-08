@@ -74,6 +74,12 @@ def test_target_protocol_accepts_memer_objective():
     assert config.target_protocol == "memer_objective"
 
 
+def test_target_protocol_accepts_subtask_keyframe():
+    config = HLMemoryConfig(target_protocol="subtask_keyframe")
+
+    assert config.target_protocol == "subtask_keyframe"
+
+
 def test_target_protocol_rejects_unknown_value():
     with pytest.raises(ValueError, match="target_protocol"):
         HLMemoryConfig(target_protocol="unknown")  # type: ignore[arg-type]

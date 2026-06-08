@@ -303,6 +303,8 @@ class BaseHLVLMAdapter:
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
         if self.config.target_protocol == "memer_objective":
             return self._build_memer_objective_prompt(sample, clips)
+        if self.config.target_protocol == "subtask_keyframe":
+            return self._build_subtask_keyframe_prompt(sample, clips)
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
         step_prior = _render_step_prior(sample.step_prior)
         current_width, current_height = _current_recent_frame_size(clips)
@@ -415,7 +417,7 @@ class BaseHLVLMAdapter:
         )
 
     def build_system_prompt(self) -> str:
-        if self.config.target_protocol == "memer_objective":
+        if self.config.target_protocol in {"memer_objective", "subtask_keyframe"}:
             thinking_instruction = (
                 f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
                 "valid JSON object after the thinking text."
@@ -438,7 +440,7 @@ class BaseHLVLMAdapter:
             "low-level robot controller and to select task-relevant keyframes for future memory. Be concise, "
             "ground decisions in the provided images, and output only valid JSON. The recent observation clip is "
             "a past-to-current sequence; the last valid recent frame is the current state that must determine "
-            f"`current_objective`. {thinking_instruction}"
+            f"`current_objective` or `current_subtask`. {thinking_instruction}"
         )
 
     def build_target_text(self, sample: ExportedHLMemorySample) -> str:
@@ -447,6 +449,15 @@ class BaseHLVLMAdapter:
             return json.dumps(
                 {
                     "current_objective": prediction.current_objective,
+                    "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        if self.config.target_protocol == "subtask_keyframe":
+            return json.dumps(
+                {
+                    "current_subtask": prediction.current_subtask,
                     "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
                 },
                 ensure_ascii=True,
@@ -486,6 +497,47 @@ class BaseHLVLMAdapter:
             "Do not include progress, language memory, notes, markdown, explanation text, or extra keys.\n"
             f"{thinking_instruction}"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
+        )
+
+    def _build_subtask_keyframe_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
+        thinking_instruction = (
+            "Thinking is enabled. If you produce private reasoning, keep it brief and finish with exactly one final "
+            "JSON object.\n"
+            if self.config.enable_thinking
+            else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
+        )
+        horizon_text = (
+            "Predict the short-horizon subtask a few frames after the current frame, using recent motion as context.\n"
+            if sample.horizon_frame_index is not None
+            else "Predict the current low-level subtask at the last valid recent frame.\n"
+        )
+        previous_memory = sample.language_memory.strip()
+        memory_text = f"Previous language memory: {previous_memory}\n" if previous_memory else ""
+        step_prior = _render_step_prior(sample.step_prior)
+        return (
+            "You receive two ordered video clips.\n"
+            "The first clip contains selected historical keyframes from earlier in the episode.\n"
+            "The second clip contains the recent observation window, ordered oldest to newest.\n"
+            f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
+            f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+            f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
+            "is the last/current valid frame.\n"
+            "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
+            f"{horizon_text}"
+            "Use visual evidence in the last valid recent frame as the primary signal. Language memory and step prior, "
+            "if provided, may be stale and should only be used as weak context.\n"
+            "Return exactly one JSON object with keys `current_subtask` and `keyframe_candidate_positions`.\n"
+            "`current_subtask` must be one short low-level robot primitive such as approach, grasp, transport above target, "
+            "place/release, return/retreat, or transition to the next object.\n"
+            "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
+            f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
+            "Select recent frames that should be kept as long-term visual memory for future decisions, especially completed "
+            "actions, object release/contact state, object locations, failures, or important state transitions. Return [] if none.\n"
+            "Do not include progress, should_advance_objective, updated_language_memory, notes, markdown, explanation text, or extra keys.\n"
+            f"{thinking_instruction}"
+            f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
+            f"{step_prior}"
+            f"{memory_text}"
         )
 
     def _fallback_prediction(self, sample: ExportedHLMemorySample) -> HLMemoryPrediction:

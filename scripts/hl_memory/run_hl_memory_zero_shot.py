@@ -59,6 +59,7 @@ class ZeroShotArgs:
 
     # Runtime memory and clip selection.
     language_memory: str = ""
+    memory_input_mode: str = "full"
     memory_seconds: str | None = None
     recent_seconds: str | None = None
     recent_end_sec: float | None = None
@@ -120,6 +121,8 @@ def main(args: ZeroShotArgs) -> None:
     _resolve_video_paths(args)
     if args.task_config_path is not None:
         _load_task_config(args.task_config_path)
+    if args.memory_input_mode not in {"full", "completed_only", "empty"}:
+        raise ValueError("`--memory-input-mode` must be one of `full`, `completed_only`, or `empty`.")
     if args.target_protocol == "memer_objective" and args.known_prior_mode:
         raise ValueError("`--target-protocol memer_objective` does not support `--known-prior-mode` in v1.")
     config = HLMemoryConfig(
@@ -193,7 +196,7 @@ def _run_single_prediction(
     sample = build_zero_shot_sample(
         video_path=_sample_video_path(args),
         instruction=_instruction_with_task_plan(args),
-        language_memory=args.language_memory,
+        language_memory=_language_memory_for_model(args.language_memory, args.memory_input_mode),
         step_prior=_task_config_steps(args.task_config_path),
         memory_seconds=selection.memory_seconds,
         recent_seconds=selection.recent_seconds,
@@ -221,6 +224,8 @@ def _run_single_prediction(
         "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
         "step_prior": list(sample.step_prior),
         "language_memory": args.language_memory,
+        "memory_input_mode": args.memory_input_mode,
+        "language_memory_input": sample.language_memory,
         "duration_sec": selection.duration_sec,
         "recent_step_sec": _resolved_recent_step_sec(args),
         "training_fps": args.training_fps,
@@ -255,7 +260,7 @@ def _run_single_prediction(
             selection=selection,
             prediction=prediction,
             recent_end_sec=recent_end_sec,
-            language_memory_before=args.language_memory,
+            language_memory_before=sample.language_memory,
             language_memory_after=prediction.updated_language_memory,
             memory_seconds_before=selection.memory_seconds,
             memory_seconds_after=selection.memory_seconds,
@@ -327,6 +332,7 @@ def _run_rollout(
         known_prior_index_before = known_prior_index
         known_prior_match: dict[str, object] | None = None
         language_memory_before = language_memory
+        language_memory_input = _language_memory_for_model(language_memory_before, args.memory_input_mode)
         clips, selection = _build_clips_from_args(
             args,
             config=config,
@@ -342,7 +348,7 @@ def _run_rollout(
                 known_prior_steps=known_prior_steps,
                 known_prior_index=known_prior_index if known_prior_steps else None,
             ),
-            language_memory=language_memory_before,
+            language_memory=language_memory_input,
             step_prior=known_prior_steps or _task_config_steps(args.task_config_path),
             memory_seconds=selection.memory_seconds,
             recent_seconds=selection.recent_seconds,
@@ -416,7 +422,7 @@ def _run_rollout(
                 prediction=prediction,
                 step_index=step_index,
                 recent_end_sec=end_sec,
-                language_memory_before=language_memory_before,
+                language_memory_before=language_memory_input,
                 language_memory_after=language_memory,
                 memory_seconds_before=memory_before,
                 memory_seconds_after=memory_seconds,
@@ -443,6 +449,7 @@ def _run_rollout(
                 "step_index": step_index,
                 "recent_end_sec": end_sec,
                 "language_memory_before": language_memory_before,
+                "language_memory_input": language_memory_input,
                 "language_memory_after": language_memory,
                 "known_prior_mode": bool(known_prior_steps),
                 "known_prior_steps": list(known_prior_steps),
@@ -564,6 +571,7 @@ def _build_rollout_payload(
         "target_protocol": config.target_protocol,
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
         "known_prior_mode": bool(known_prior_steps),
+        "memory_input_mode": args.memory_input_mode,
         "known_prior_steps": list(known_prior_steps),
         "step_prior": list(known_prior_steps or _task_config_steps(args.task_config_path)),
         "known_prior_advance_threshold": args.known_prior_advance_threshold,
@@ -1016,6 +1024,25 @@ def _known_prior_language_memory(
         relevant_objects=(),
         notes=notes,
     )
+
+
+def _language_memory_for_model(memory: str, mode: str) -> str:
+    memory = memory.strip()
+    if mode == "full":
+        return memory
+    if mode == "empty":
+        return ""
+    if mode != "completed_only":
+        raise ValueError(f"Unsupported memory input mode: {mode!r}")
+    progress = "No completed subtask yet."
+    for line in memory.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip().lower() == "task progress" and value.strip():
+            progress = value.strip()
+            break
+    return f"Task progress: {progress}"
 
 
 def _task_config_description(task_config: dict[str, object]) -> str:

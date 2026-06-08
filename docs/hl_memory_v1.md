@@ -733,6 +733,7 @@ Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 promp
 
 - `--target-protocol hl_v1`：默认完整 HL V1 target，监督 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/keyframes/...`。
 - `--target-protocol memer_objective`：MEMER-style 简化 target，只监督 `{"current_objective": "...", "keyframe_candidate_positions": [...]}`。如果 sample 有 `horizon_current_objective`，优先监督 horizon objective；否则 fallback 到当前帧 `current_objective`。
+- `--target-protocol subtask_keyframe`：更纯的视觉时序 baseline，只监督 `{"current_subtask": "...", "keyframe_candidate_positions": [...]}`。不监督 language memory、progress、advance、target/goal/notes；rollout 端用代码规则从预测 subtask 更新 memory。
 
 MEMER-style 训练示例：
 
@@ -1156,7 +1157,7 @@ Input rules：
 | `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
 | `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |
 | `--vlm-variant` | Qwen3.5 变体，例如 `qwen3_5_2b`，也可用短名 `2b` / `4b` / `27b`。 |
-| `--target-protocol` | 推理 prompt/输出协议，默认 `hl_v1`；`memer_objective` 只输出 objective + keyframes，不能和 `--known-prior-mode` 同时使用。 |
+| `--target-protocol` | 推理 prompt/输出协议，默认 `hl_v1`；`memer_objective` 只输出 objective + keyframes，`subtask_keyframe` 只输出 subtask + keyframes。 |
 | `--precision` | 推理精度，常用 `float16` 或 `bfloat16`；遇到 vision/cuDNN 问题先试 `float16`。 |
 | `--device` | 推理设备，通常是 `cuda`；CPU 只适合小模型/调试。 |
 
@@ -1184,6 +1185,7 @@ rollout 和调试参数：
 | `--rollout-start-sec` / `--rollout-end-sec` | rollout 起止时间；不填 end 时默认到视频末尾。 |
 | `--keyframe-merge-distance-sec` | 合并距离过近的 keyframe candidates，默认 `2.0` 秒。 |
 | `--language-memory` | 初始语言记忆；空字符串表示从默认初始状态开始。 |
+| `--memory-input-mode` | 控制模型实际看到的 language memory：`full` 完整输入；`completed_only` 只输入 `Task progress`，隐藏 `Current objective` 等强提示；`empty` 完全不输入 memory。summary 每步会记录 `language_memory_input` 便于核对。 |
 | `--output-json` | 保存 summary JSON。interval rollout 期间每完成一个推理 step 都会原子更新，结束后再写入包含 debug video 状态的最终版本。 |
 | `--rollout-jsonl` | rollout 模式下逐步保存 compact JSONL。 |
 | `--rollout-pretty-json` | rollout 模式下逐步保存可读 JSON。 |
