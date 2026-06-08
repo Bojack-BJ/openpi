@@ -31,6 +31,7 @@ class HLMemoryPrediction:
     subtask_progress: float | None = None
     should_advance_objective: bool | None = None
     active_hand: str = ""
+    horizon_current_objective: str = ""
     sam_text_prompt: str = ""
     sam_point_xy: tuple[int, int] | None = None
     target_bbox_xyxy: tuple[int, int, int, int] | None = None
@@ -88,6 +89,8 @@ class HLMemoryPrediction:
             result["should_advance_objective"] = bool(self.should_advance_objective)
         if self.active_hand:
             result["active_hand"] = self.active_hand
+        if self.horizon_current_objective:
+            result["horizon_current_objective"] = self.horizon_current_objective
         if self.sam_text_prompt:
             result["sam_text_prompt"] = self.sam_text_prompt
         if self.sam_point_xy is not None:
@@ -155,6 +158,7 @@ class HLMemoryPrediction:
             subtask_progress=_parse_optional_float(data.get("subtask_progress")),
             should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
             active_hand=str(data.get("active_hand", "")).strip(),
+            horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
             sam_text_prompt=str(data.get("sam_text_prompt", data.get("sam_prompt", ""))).strip(),
             sam_point_xy=_parse_optional_point(
                 data.get("sam_point_xy")

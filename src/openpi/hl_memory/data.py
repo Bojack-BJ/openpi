@@ -161,29 +161,28 @@ class ExportedHLMemorySample:
 
     def target_prediction(self, *, target_protocol: str = "hl_v1") -> HLMemoryPrediction:
         if target_protocol == "memer_objective":
-            objective = self.horizon_current_objective or self.current_objective or self.current_subtask
-            subtask = self.horizon_current_subtask or objective
-            phase = self.horizon_phase or subtask
+            objective = self.current_objective or self.current_subtask
+            horizon_objective = self.horizon_current_objective or objective
             return HLMemoryPrediction(
                 updated_language_memory="",
-                current_subtask=subtask,
+                current_subtask=objective,
                 keyframe_candidate_positions=self.keyframe_candidate_positions,
-                phase=phase,
+                phase=objective,
                 target_query="",
                 goal_query="",
                 current_objective=objective,
+                horizon_current_objective=horizon_objective,
             )
         if target_protocol == "subtask_keyframe":
-            subtask = self.horizon_current_subtask or self.current_subtask or self.current_objective
-            phase = self.horizon_phase or self.phase or subtask
+            objective = self.current_objective or self.current_subtask
             return HLMemoryPrediction(
                 updated_language_memory="",
-                current_subtask=subtask,
+                current_subtask=objective,
                 keyframe_candidate_positions=self.keyframe_candidate_positions,
-                phase=phase,
+                phase=objective,
                 target_query="",
                 goal_query="",
-                current_objective=subtask,
+                current_objective=objective,
             )
         if target_protocol != "hl_v1":
             raise ValueError(f"Unsupported target_protocol: {target_protocol!r}")

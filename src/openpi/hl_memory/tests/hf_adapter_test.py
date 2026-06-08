@@ -20,7 +20,7 @@ def test_qwen_video_metadata_uses_configured_effective_fps():
     ]
 
 
-def test_memer_objective_target_text_is_minimal_and_uses_horizon_label():
+def test_memer_objective_target_text_is_minimal_and_uses_current_and_horizon_labels():
     adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="memer_objective"))
     sample = ExportedHLMemorySample(
         sample_id="sample",
@@ -48,12 +48,13 @@ def test_memer_objective_target_text_is_minimal_and_uses_horizon_label():
     payload = json.loads(adapter.build_target_text(sample))
 
     assert payload == {
-        "current_objective": "horizon objective",
+        "current_objective": "current objective",
+        "horizon_current_objective": "horizon objective",
         "keyframe_candidate_positions": [2],
     }
 
 
-def test_subtask_keyframe_target_text_is_minimal_and_uses_horizon_subtask():
+def test_subtask_keyframe_target_text_is_minimal_and_uses_current_objective():
     adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="subtask_keyframe"))
     sample = ExportedHLMemorySample(
         sample_id="sample",
@@ -75,12 +76,13 @@ def test_subtask_keyframe_target_text_is_minimal_and_uses_horizon_subtask():
         recent_frame_indices=(0,),
         recent_valid_length=1,
         current_objective="current objective",
+        horizon_current_objective="horizon objective",
         horizon_current_subtask="horizon subtask",
     )
 
     payload = json.loads(adapter.build_target_text(sample))
 
     assert payload == {
-        "current_subtask": "horizon subtask",
+        "current_objective": "current objective",
         "keyframe_candidate_positions": [2],
     }

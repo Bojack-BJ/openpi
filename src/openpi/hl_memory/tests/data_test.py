@@ -36,7 +36,7 @@ def _sample(**overrides) -> ExportedHLMemorySample:
     return ExportedHLMemorySample(**values)
 
 
-def test_memer_objective_target_uses_horizon_objective_when_available():
+def test_memer_objective_target_uses_current_and_horizon_objectives():
     sample = _sample(
         current_objective="current objective",
         horizon_frame_index=10,
@@ -47,9 +47,10 @@ def test_memer_objective_target_uses_horizon_objective_when_available():
 
     prediction = sample.target_prediction(target_protocol="memer_objective")
 
-    assert prediction.current_objective == "horizon objective"
-    assert prediction.current_subtask == "horizon subtask"
-    assert prediction.phase == "horizon phase"
+    assert prediction.current_objective == "current objective"
+    assert prediction.horizon_current_objective == "horizon objective"
+    assert prediction.current_subtask == "current objective"
+    assert prediction.phase == "current objective"
     assert prediction.keyframe_candidate_positions == (1, 3)
     assert prediction.target_query == ""
     assert prediction.goal_query == ""
@@ -61,9 +62,10 @@ def test_memer_objective_target_falls_back_to_current_objective():
     prediction = sample.target_prediction(target_protocol="memer_objective")
 
     assert prediction.current_objective == "current objective"
+    assert prediction.horizon_current_objective == "current objective"
 
 
-def test_subtask_keyframe_target_uses_only_subtask_and_keyframes():
+def test_subtask_keyframe_target_uses_current_objective_and_keyframes():
     sample = _sample(
         current_objective="current objective",
         current_subtask="current subtask",
@@ -75,9 +77,9 @@ def test_subtask_keyframe_target_uses_only_subtask_and_keyframes():
 
     prediction = sample.target_prediction(target_protocol="subtask_keyframe")
 
-    assert prediction.current_subtask == "horizon subtask"
-    assert prediction.current_objective == "horizon subtask"
-    assert prediction.phase == "horizon phase"
+    assert prediction.current_subtask == "current objective"
+    assert prediction.current_objective == "current objective"
+    assert prediction.phase == "current objective"
     assert prediction.keyframe_candidate_positions == (1, 3)
     assert prediction.subtask_progress is None
     assert prediction.should_advance_objective is None

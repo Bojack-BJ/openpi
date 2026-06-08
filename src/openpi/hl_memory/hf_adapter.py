@@ -449,6 +449,7 @@ class BaseHLVLMAdapter:
             return json.dumps(
                 {
                     "current_objective": prediction.current_objective,
+                    "horizon_current_objective": prediction.horizon_current_objective,
                     "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
                 },
                 ensure_ascii=True,
@@ -457,7 +458,7 @@ class BaseHLVLMAdapter:
         if self.config.target_protocol == "subtask_keyframe":
             return json.dumps(
                 {
-                    "current_subtask": prediction.current_subtask,
+                    "current_objective": prediction.current_objective,
                     "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
                 },
                 ensure_ascii=True,
@@ -475,7 +476,8 @@ class BaseHLVLMAdapter:
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
         horizon_text = (
-            "Predict the short-horizon objective a few frames after the current frame, using recent motion as context.\n"
+            "Predict both the current executable objective at the last valid recent frame and the short-horizon "
+            "objective a few frames after it, using recent motion as context.\n"
             if sample.horizon_frame_index is not None
             else "Predict the current executable objective at the last valid recent frame.\n"
         )
@@ -489,8 +491,10 @@ class BaseHLVLMAdapter:
             "is the last/current valid frame.\n"
             "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
             f"{horizon_text}"
-            "Return exactly one JSON object with keys `current_objective` and `keyframe_candidate_positions`.\n"
+            "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, "
+            "and `keyframe_candidate_positions`.\n"
             "`current_objective` must be one short executable robot instruction.\n"
+            "`horizon_current_objective` must be the short executable robot instruction expected a few frames later.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
             "Select only recent frames that should be kept as long-term visual memory for future decisions; return [] if none.\n"
@@ -506,11 +510,7 @@ class BaseHLVLMAdapter:
             if self.config.enable_thinking
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
-        horizon_text = (
-            "Predict the short-horizon subtask a few frames after the current frame, using recent motion as context.\n"
-            if sample.horizon_frame_index is not None
-            else "Predict the current low-level subtask at the last valid recent frame.\n"
-        )
+        objective_text = "Predict the current executable objective at the last valid recent frame.\n"
         previous_memory = sample.language_memory.strip()
         memory_text = f"Previous language memory: {previous_memory}\n" if previous_memory else ""
         step_prior = _render_step_prior(sample.step_prior)
@@ -523,12 +523,11 @@ class BaseHLVLMAdapter:
             f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
             "is the last/current valid frame.\n"
             "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
-            f"{horizon_text}"
+            f"{objective_text}"
             "Use visual evidence in the last valid recent frame as the primary signal. Language memory and step prior, "
             "if provided, may be stale and should only be used as weak context.\n"
-            "Return exactly one JSON object with keys `current_subtask` and `keyframe_candidate_positions`.\n"
-            "`current_subtask` must be one short low-level robot primitive such as approach, grasp, transport above target, "
-            "place/release, return/retreat, or transition to the next object.\n"
+            "Return exactly one JSON object with keys `current_objective` and `keyframe_candidate_positions`.\n"
+            "`current_objective` must be one short executable robot instruction suitable for the low-level VLA.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
             "Select recent frames that should be kept as long-term visual memory for future decisions, especially completed "

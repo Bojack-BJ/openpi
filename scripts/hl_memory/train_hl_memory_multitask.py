@@ -65,11 +65,13 @@ class TrainArgs:
     dataset_dirs_json: pathlib.Path | None = None
     dataset_root: pathlib.Path | None = None
     dataset_glob: str = "*/train"
+    task_ids: tuple[str, ...] = ()
     val_dataset_dir: pathlib.Path | None = None
     val_dataset_dirs: tuple[pathlib.Path, ...] = ()
     val_dataset_dirs_json: pathlib.Path | None = None
     val_dataset_root: pathlib.Path | None = None
     val_dataset_glob: str = "*/val"
+    val_task_ids: tuple[str, ...] = ()
     val_interval: int = 0
     val_batches: int = 10
     val_seed: int = 12345
@@ -427,7 +429,10 @@ def _resolve_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
             raise ValueError("--dataset-dirs-json must contain a JSON list of dataset directories.")
         dirs.extend(pathlib.Path(str(item)) for item in payload)
     if args.dataset_root is not None:
-        dirs.extend(sorted(path for path in args.dataset_root.glob(args.dataset_glob) if (path / "samples.jsonl").is_file()))
+        if args.task_ids:
+            dirs.extend(_dataset_split_dirs_for_task_ids(args.dataset_root, args.task_ids, split_name="train"))
+        else:
+            dirs.extend(sorted(path for path in args.dataset_root.glob(args.dataset_glob) if (path / "samples.jsonl").is_file()))
     unique: list[pathlib.Path] = []
     seen: set[str] = set()
     for dataset_dir in dirs:
@@ -458,7 +463,11 @@ def _resolve_val_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
     if val_root is None and not dirs:
         val_root = args.dataset_root
     if val_root is not None:
-        dirs.extend(sorted(path for path in val_root.glob(args.val_dataset_glob) if (path / "samples.jsonl").is_file()))
+        val_task_ids = args.val_task_ids or args.task_ids
+        if val_task_ids:
+            dirs.extend(_dataset_split_dirs_for_task_ids(val_root, val_task_ids, split_name="val"))
+        else:
+            dirs.extend(sorted(path for path in val_root.glob(args.val_dataset_glob) if (path / "samples.jsonl").is_file()))
     unique: list[pathlib.Path] = []
     seen: set[str] = set()
     for dataset_dir in dirs:
@@ -476,6 +485,19 @@ def _resolve_val_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
             "--val-dataset-root when --val-interval > 0."
         )
     return unique
+
+
+def _dataset_split_dirs_for_task_ids(root: pathlib.Path, task_ids: tuple[str, ...], *, split_name: str) -> list[pathlib.Path]:
+    dirs: list[pathlib.Path] = []
+    for raw_task_id in task_ids:
+        for task_id in _split_task_id_arg(raw_task_id):
+            dirs.append(root / task_id / split_name)
+    return dirs
+
+
+def _split_task_id_arg(raw_value: str) -> list[str]:
+    task_ids = [item.strip() for item in str(raw_value).split(",")]
+    return [task_id for task_id in task_ids if task_id]
 
 
 def _load_multitask_samples(dataset_dirs: list[pathlib.Path]) -> list[RuntimeSample]:
