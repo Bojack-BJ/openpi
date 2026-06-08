@@ -10,6 +10,39 @@ def test_build_recent_context_indices():
     assert indices == [4, 9, 14, 19]
 
 
+def test_build_recent_context_indices_with_fixed_window():
+    indices = build_recent_context_indices(
+        timestep=40,
+        frame_subsample=5,
+        recent_frames_length=8,
+        recent_window_frames=40,
+    )
+
+    assert indices == [0, 6, 11, 17, 23, 29, 34, 40]
+
+
+def test_build_recent_context_indices_matches_default_two_hz_protocol():
+    indices = build_recent_context_indices(
+        timestep=70,
+        frame_subsample=5,
+        recent_frames_length=8,
+        recent_window_frames=70,
+    )
+
+    assert indices == [0, 10, 20, 30, 40, 50, 60, 70]
+
+
+def test_build_recent_context_indices_with_fixed_window_near_start():
+    indices = build_recent_context_indices(
+        timestep=20,
+        frame_subsample=5,
+        recent_frames_length=8,
+        recent_window_frames=40,
+    )
+
+    assert indices == [0, 3, 6, 9, 11, 14, 17, 20]
+
+
 def test_map_relative_positions_to_absolute():
     mapped, invalid = map_relative_positions_to_absolute([1, 3, 7], [10, 20, 30, 40])
 

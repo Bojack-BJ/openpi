@@ -42,7 +42,9 @@ class ExportCrossTaskArgs:
     val_videos_csv: str = "videos_val.csv"
     annotations_dir: str = "annotations"
     recent_frames_length: int = 8
+    training_fps: float = 20.0
     frame_subsample: int = 1
+    recent_sample_hz: float = 2.0
     memory_length: int = 8
     merge_distance: int = 1
     frame_height: int = 224
@@ -63,7 +65,9 @@ def main(args: ExportCrossTaskArgs) -> None:
 
     hl_config = HLMemoryConfig(
         recent_frames_length=args.recent_frames_length,
+        training_fps=args.training_fps,
         frame_subsample=args.frame_subsample,
+        recent_sample_hz=args.recent_sample_hz,
         memory_length=args.memory_length,
         merge_distance=args.merge_distance,
         frame_height=args.frame_height,
@@ -202,6 +206,7 @@ def _export_episode(
                 timestep=annotation.frame_index,
                 frame_subsample=hl_config.frame_subsample,
                 recent_frames_length=hl_config.recent_frames_length,
+                recent_window_frames=int(round(hl_config.recent_window_sec * hl_config.training_fps)),
             )
             recent_frame_paths = tuple(
                 _ensure_frame_saved(

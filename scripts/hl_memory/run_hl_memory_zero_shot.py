@@ -66,6 +66,7 @@ class ZeroShotArgs:
     recent_step_sec: float | None = None
     training_fps: float = 20.0
     frame_subsample: int = 5
+    recent_sample_hz: float = 2.0
 
     # If rollout_interval_sec is set, run recurrent HL memory rollout over the whole video range.
     rollout_interval_sec: float | None = None
@@ -133,6 +134,7 @@ def main(args: ZeroShotArgs) -> None:
         recent_frames_length=args.recent_frames_length,
         training_fps=args.training_fps,
         frame_subsample=args.frame_subsample,
+        recent_sample_hz=args.recent_sample_hz,
         memory_length=args.memory_length,
         frame_height=args.frame_height,
         frame_width=args.frame_width,
@@ -228,6 +230,8 @@ def _run_single_prediction(
         "language_memory_input": sample.language_memory,
         "duration_sec": selection.duration_sec,
         "recent_step_sec": _resolved_recent_step_sec(args),
+        "recent_sample_hz": args.recent_sample_hz,
+        "recent_window_sec": config.recent_window_sec,
         "training_fps": args.training_fps,
         "frame_subsample": args.frame_subsample,
         "video_fps": config.video_fps,
@@ -565,6 +569,8 @@ def _build_rollout_payload(
         "rollout_start_sec": args.rollout_start_sec,
         "rollout_end_sec": args.rollout_end_sec,
         "recent_step_sec": recent_step_sec,
+        "recent_sample_hz": args.recent_sample_hz,
+        "recent_window_sec": config.recent_window_sec,
         "training_fps": args.training_fps,
         "frame_subsample": args.frame_subsample,
         "video_fps": config.video_fps,
@@ -633,7 +639,9 @@ def _resolved_recent_step_sec(args: ZeroShotArgs) -> float:
         raise ValueError("--training-fps must be positive when --recent-step-sec is omitted.")
     if args.frame_subsample <= 0:
         raise ValueError("--frame-subsample must be positive when --recent-step-sec is omitted.")
-    return float(args.frame_subsample) / float(args.training_fps)
+    if args.recent_sample_hz <= 0.0:
+        raise ValueError("--recent-sample-hz must be positive when --recent-step-sec is omitted.")
+    return 1.0 / float(args.recent_sample_hz)
 
 
 def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:

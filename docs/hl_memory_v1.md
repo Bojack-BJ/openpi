@@ -554,7 +554,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subt
   --workers 4 \
   --overwrite \
   --continue-on-error \
-  -- --recent-frames-length 8 --training-fps 20 --frame-subsample 5 --frame-height 224 --frame-width 456 --subtask-progress-quantum 0.05 --memory-length 8 --merge-distance 5
+  -- --recent-frames-length 8 --training-fps 20 --frame-subsample 5 --recent-sample-hz 2.0 --frame-height 224 --frame-width 456 --subtask-progress-quantum 0.05 --memory-length 8 --merge-distance 5
 ```
 
 Subtask 数据 schema 基本统一时，batch export 推荐不传 `--source-config-name`，而是用 `--repo-prefix subtask/` 和每个 task 目录名组成 `repo_id=subtask/<task_id>`。脚本会直接读 `<HF_LEROBOT_HOME>/<repo_id>`，只加载 episode/frame/task/prompt/subtask 和 RGB image columns，不读 state/action/mask。
@@ -583,6 +583,7 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
   --recent-frames-length 8 \
   --training-fps 20 \
   --frame-subsample 5 \
+  --recent-sample-hz 2.0 \
   --frame-height 224 \
   --frame-width 456 \
   --subtask-progress-quantum 0.05 \
@@ -656,6 +657,7 @@ python scripts/hl_memory/export_hl_memory_dataset.py \
   --image-columns auto \
   --training-fps 20 \
   --frame-subsample 5 \
+  --recent-sample-hz 2.0 \
   --frame-height 224 \
   --frame-width 456 \
   --subtask-progress-quantum 0.05 \
@@ -687,6 +689,7 @@ torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multi
   --precision bfloat16 \
   --training-fps 20 \
   --frame-subsample 5 \
+  --recent-sample-hz 2.0 \
   --frame-height 224 \
   --frame-width 456 \
   --learning-rate 5e-6 \
@@ -1129,8 +1132,8 @@ Input rules：
 - HL frame 固定使用双槽画布，默认 `456x224`：每个视角槽位 `224x224`，中间 gap `8`。单视角放左槽，右槽为黑色 padding；双视角左右各一槽。
 - memory clip 和 recent clip 都按时间从旧到新排列。
 - recent clip 最后一张有效帧定义当前状态，`current_objective` 必须描述最后有效帧对应的当前低层目标。
-- 不传 `--recent-step-sec` 时，rollout 会按训练导出节奏自动取 `--frame-subsample / --training-fps` 秒；默认 `5 / 20 = 0.25s`，对应 LeRobot 20Hz 上每 5 帧取一帧。原始输入视频即使是 60Hz，也应按秒抽 `0.25s` 间隔来匹配训练时域。
-- Qwen video metadata 的 `fps` 同样按 `--training-fps / --frame-subsample` 推导，默认 `4.0Hz`；不要再把 HL clip 当作 1Hz 视频。
+- 不传 `--recent-step-sec` 时，rollout 会按固定采样频率抽 recent clip：`recent_step_sec = 1 / recent_sample_hz`。默认 `--recent-sample-hz 2.0 --recent-frames-length 8`，即包含当前帧并覆盖最近 `3.5s`。
+- Qwen video metadata 的 `fps` 同样按实际 recent clip 采样频率推导，默认 `2.0Hz`；不要再把 HL clip 当作 1Hz 视频。如果要严格 2Hz 覆盖 4 秒，用 `--recent-sample-hz 2.0 --recent-frames-length 9`。
 - rollout 会把上一轮四字段 language memory 和 keyframe candidates 带到下一轮，并在 `debug_dir/rollout_step_XXX/` 保存实际输入帧。
 - `known-prior` 会把 `task-config-path` 里的 `steps` 或 `segments[*].subtask` 当成固定 prior plan。模型判断当前 prior step 的进度/是否完成，也可以报告当前画面最接近的后续 prior step；rollout 侧维护单调 step pointer，并把最终 `current_objective` 重写成 pointer 对应的 prior step。
 
@@ -1166,9 +1169,10 @@ clip 和 memory 参数：
 | 参数 | 作用 |
 | --- | --- |
 | `--recent-end-sec` | 单次预测时 recent clip 的结束时间；不填时默认取视频末尾。 |
-| `--recent-step-sec` | recent clip 抽帧间隔；不传时由 `--frame-subsample / --training-fps` 推导，默认 `0.25s`。 |
+| `--recent-step-sec` | recent clip 抽帧间隔；最高优先级调试参数。不传时由 `1 / --recent-sample-hz` 推导。 |
+| `--recent-sample-hz` | recent clip 固定采样频率，默认 `2.0Hz`；export/train/eval/rollout 应保持一致。 |
 | `--training-fps` | HL 训练导出所基于的 LeRobot fps，默认 `20.0`。 |
-| `--frame-subsample` | HL 训练导出 recent clip 的帧间隔，默认 `5`。 |
+| `--frame-subsample` | 旧兼容参数；固定窗口模式下不决定 recent clip 总时长。 |
 | `--recent-seconds` | 手动指定 recent clip 秒数列表，例如 `10,12,14`；不能和 rollout interval 模式一起用。 |
 | `--memory-seconds` | 手动指定历史 memory keyframe 秒数列表，例如 `2,8,15`。 |
 | `--auto-memory` | 单次预测时自动从 recent 前面的时间段取 memory frames；rollout 模式会关闭它并使用上一步 keyframes。 |

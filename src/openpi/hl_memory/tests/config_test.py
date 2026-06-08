@@ -60,12 +60,23 @@ def test_parallel_mode_rejects_unknown_value():
         HLMemoryConfig(parallel_mode="fsdp")  # type: ignore[arg-type]
 
 
-def test_hl_memory_config_derives_video_fps_from_training_rate_and_subsample():
+def test_hl_memory_config_defaults_to_fixed_recent_sample_rate():
     config = HLMemoryConfig(training_fps=20.0, frame_subsample=5)
 
-    assert config.video_fps == 4.0
+    assert config.recent_sample_hz == 2.0
+    assert config.recent_step_sec == 0.5
+    assert config.recent_window_sec == 3.5
+    assert config.video_fps == 2.0
     assert config.frame_width == 456
     assert config.frame_height == 224
+
+
+def test_hl_memory_config_derives_window_from_recent_sample_rate():
+    config = HLMemoryConfig(training_fps=20.0, frame_subsample=2, recent_frames_length=9, recent_sample_hz=2.0)
+
+    assert config.recent_step_sec == 0.5
+    assert config.recent_window_sec == 4.0
+    assert config.video_fps == 2.0
 
 
 def test_target_protocol_accepts_memer_objective():

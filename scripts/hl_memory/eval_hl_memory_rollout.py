@@ -37,6 +37,7 @@ class EvalArgs:
     thinking_max_new_tokens: int = 1024
     training_fps: float = 20.0
     frame_subsample: int = 5
+    recent_sample_hz: float = 2.0
     frame_height: int = 224
     frame_width: int = 456
     parallel_mode: str = "none"
@@ -94,6 +95,7 @@ def main(args: EvalArgs) -> None:
         precision=args.precision,
         training_fps=args.training_fps,
         frame_subsample=args.frame_subsample,
+        recent_sample_hz=args.recent_sample_hz,
         frame_height=args.frame_height,
         frame_width=args.frame_width,
         enable_thinking=args.enable_thinking,

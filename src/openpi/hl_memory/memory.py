@@ -10,9 +10,28 @@ def build_recent_context_indices(
     timestep: int,
     frame_subsample: int,
     recent_frames_length: int,
+    recent_window_frames: int | None = None,
 ) -> list[int]:
     if timestep < 0:
         raise ValueError("timestep must be non-negative.")
+    if recent_frames_length <= 0:
+        raise ValueError("recent_frames_length must be positive.")
+    if recent_window_frames is not None:
+        if recent_window_frames <= 0:
+            raise ValueError("recent_window_frames must be positive.")
+        if recent_frames_length == 1:
+            return [timestep]
+        start = max(timestep - recent_window_frames, 0)
+        span = timestep - start
+        indices: list[int] = []
+        for position in range(recent_frames_length):
+            index = int(round(start + span * position / (recent_frames_length - 1)))
+            index = max(0, min(timestep, index))
+            if not indices or indices[-1] != index:
+                indices.append(index)
+        return indices
+    if frame_subsample <= 0:
+        raise ValueError("frame_subsample must be positive.")
     indices = list(range(timestep, -1, -frame_subsample))
     indices = list(reversed(indices[:recent_frames_length]))
     return indices

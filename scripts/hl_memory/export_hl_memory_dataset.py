@@ -7,6 +7,7 @@ import io
 import json
 import logging
 import pathlib
+import types
 import time
 from typing import Any
 from typing import Literal
@@ -33,7 +34,6 @@ from openpi.hl_memory.memory import EpisodicKeyframeMemory
 from openpi.hl_memory.memory import build_recent_context_indices
 from openpi.hl_memory.memory import map_relative_positions_to_absolute
 from openpi.hl_memory.frame_composer import compose_observation_frame
-import openpi.training.config as training_config
 import openpi.training.data_loader as data_loader
 import openpi.training.lerobot_dataset as openpi_lerobot_dataset
 import openpi.transforms as _transforms
@@ -62,6 +62,7 @@ class ExportArgs:
     recent_frames_length: int = 8
     training_fps: float = 20.0
     frame_subsample: int = 5
+    recent_sample_hz: float = 2.0
     memory_length: int = 8
     merge_distance: int = 5
     frame_height: int = 224
@@ -106,6 +107,7 @@ def main(args: ExportArgs) -> None:
         recent_frames_length=args.recent_frames_length,
         training_fps=args.training_fps,
         frame_subsample=args.frame_subsample,
+        recent_sample_hz=args.recent_sample_hz,
         memory_length=args.memory_length,
         merge_distance=args.merge_distance,
         frame_height=args.frame_height,
@@ -238,6 +240,7 @@ def _export_split(
 
 
 def _apply_export_overrides(config: Any, args: ExportArgs) -> Any:
+    training_config = _load_training_config()
     if (
         args.repo_id_override is None
         and args.asset_id_override is None
@@ -279,6 +282,9 @@ def _export_config_metadata(hl_config: HLMemoryConfig) -> dict[str, Any]:
         "recent_frames_length": hl_config.recent_frames_length,
         "training_fps": hl_config.training_fps,
         "frame_subsample": hl_config.frame_subsample,
+        "recent_sample_hz": hl_config.recent_sample_hz,
+        "recent_window_sec": hl_config.recent_window_sec,
+        "recent_step_sec": hl_config.recent_step_sec,
         "video_fps": hl_config.video_fps,
         "memory_length": hl_config.memory_length,
         "merge_distance": hl_config.merge_distance,
@@ -325,22 +331,30 @@ def _validate_output_dir(output_dir: pathlib.Path, *, overwrite: bool) -> None:
         raise FileExistsError(f"{output_dir} already exists and is not empty. Use --overwrite to replace it.")
 
 
-def _resolve_export_data_config(args: ExportArgs) -> training_config.DataConfig:
+def _resolve_export_data_config(args: ExportArgs) -> Any:
     if args.source_config_name is None:
         if args.repo_id_override is None:
             raise ValueError("Set --repo-id-override when exporting without --source-config-name.")
         logging.info("Using explicit HL subtask schema without an OpenPI training config.")
-        return training_config.DataConfig(
+        return types.SimpleNamespace(
             repo_id=args.repo_id_override,
             prompt_from_task=args.force_prompt_from_task,
             subtask_segments_path=args.subtask_segments_path_override or "subtask_segments.json",
+            dataset_columns=None,
         )
 
     logging.info("Resolving training config: %s", args.source_config_name)
+    training_config = _load_training_config()
     config = training_config.get_config(args.source_config_name)
     config = _apply_export_overrides(config, args)
     config = _resolve_hl_visual_config(config, visual_mode=args.visual_mode)
     return config.data.create(config.assets_dirs, config.model)
+
+
+def _load_training_config() -> Any:
+    import openpi.training.config as training_config  # pylint: disable=import-outside-toplevel
+
+    return training_config
 
 
 def _create_hl_export_dataset(data_config: Any, *, visual_mode: str, image_columns: str) -> data_loader.Dataset:
@@ -541,6 +555,7 @@ def _export_episode(
             timestep=annotation.frame_index,
             frame_subsample=hl_config.frame_subsample,
             recent_frames_length=hl_config.recent_frames_length,
+            recent_window_frames=int(round(hl_config.recent_window_sec * hl_config.training_fps)),
         )
         recent_global_indices = [global_indices[index] for index in recent_local_indices]
         recent_frame_paths = tuple(

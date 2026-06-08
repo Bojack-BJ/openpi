@@ -44,6 +44,7 @@ class HLMemoryConfig:
     recent_frames_length: int = 8
     training_fps: float = 20.0
     frame_subsample: int = 5
+    recent_sample_hz: float = 2.0
     memory_length: int = 8
     merge_distance: int = 5
     frame_height: int = 224
@@ -82,6 +83,8 @@ class HLMemoryConfig:
             raise ValueError("training_fps must be positive.")
         if self.frame_subsample <= 0:
             raise ValueError("frame_subsample must be positive.")
+        if self.recent_sample_hz <= 0.0:
+            raise ValueError("recent_sample_hz must be positive.")
         if self.memory_length <= 0:
             raise ValueError("memory_length must be positive.")
         if self.merge_distance < 0:
@@ -110,7 +113,15 @@ class HLMemoryConfig:
 
     @property
     def video_fps(self) -> float:
-        return float(self.training_fps) / float(self.frame_subsample)
+        return float(self.recent_sample_hz)
+
+    @property
+    def recent_step_sec(self) -> float:
+        return 1.0 / float(self.recent_sample_hz)
+
+    @property
+    def recent_window_sec(self) -> float:
+        return float(max(self.recent_frames_length - 1, 0)) / float(self.recent_sample_hz)
 
 
 def _resolve_variant(vlm_backend: HLVLMBackend, variant: str | None) -> str | None:
