@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         default="fraction-rules",
         help="Forward to exporter. `annotations` is a backward-compatible alias for `fraction-rules`.",
     )
-    parser.add_argument("--dense-sample-stride-frames", type=int, default=5, help="Forward to exporter.")
+    parser.add_argument("--dense-sample-stride-frames", type=int, default=2, help="Forward to exporter.")
     parser.add_argument("--prediction-horizon-steps", type=int, default=2, help="Forward to exporter.")
     parser.add_argument(
         "--keyframe-label-mode",

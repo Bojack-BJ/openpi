@@ -241,7 +241,7 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_annotations_from_subtask
   --subtask-root /root/Users/dataset/lerobot_home/subtask \
   --workers 8 \
   --sampling-mode dense-stride \
-  --dense-sample-stride-frames 5 \
+  --dense-sample-stride-frames 2 \
   --prediction-horizon-steps 2 \
   --keyframe-label-mode segment_end \
   --overwrite \

@@ -77,7 +77,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dense-sample-stride-frames",
         type=int,
-        default=5,
+        default=2,
         help="Frame stride for --sampling-mode dense-stride.",
     )
     parser.add_argument(
