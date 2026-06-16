@@ -151,6 +151,7 @@ def coarsen_file(
     short_run_merge_max_frames: int,
 ) -> dict[str, Any]:
     rows = load_jsonl(input_jsonl)
+    original_rows = [dict(row) for row in rows]
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[int(row.get("episode_index", 0))].append(row)
@@ -203,10 +204,6 @@ def coarsen_file(
             new_row["coarse_horizon_merge_reason"] = horizon["merge_reason"]
             new_row["coarse_horizon_source_objective"] = horizon["source_objective"]
             if replace_target_fields:
-                old_current = str(new_row.get("current_objective") or new_row.get("current_subtask") or "").strip()
-                old_horizon = str(
-                    new_row.get("horizon_current_objective") or new_row.get("horizon_current_subtask") or ""
-                ).strip()
                 new_row["current_objective"] = current["objective"]
                 new_row["current_subtask"] = current["objective"]
                 new_row["phase"] = current["objective"]
@@ -214,8 +211,6 @@ def coarsen_file(
                     new_row["horizon_current_objective"] = horizon["objective"]
                     new_row["horizon_current_subtask"] = horizon["objective"]
                     new_row["horizon_phase"] = horizon["objective"]
-                changed_current += int(normalize_text(old_current) != normalize_text(current["objective"]))
-                changed_horizon += int(bool(old_horizon) and normalize_text(old_horizon) != normalize_text(horizon["objective"]))
             action_counts[current["action_type"]] += 1
             episode_processed.append(new_row)
 
@@ -229,6 +224,8 @@ def coarsen_file(
         processed.extend(episode_processed)
 
     processed.sort(key=lambda row: (int(row.get("episode_index", 0)), int(row.get("frame_index", 0))))
+    if replace_target_fields:
+        changed_current, changed_horizon = _count_final_field_changes(original_rows, processed)
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     write_jsonl(output_jsonl, processed)
     return {
@@ -243,6 +240,30 @@ def coarsen_file(
         "short_run_merge_counts": dict(short_run_merge_counts.most_common()),
         "action_counts": dict(action_counts.most_common()),
     }
+
+
+def _count_final_field_changes(
+    original_rows: list[dict[str, Any]],
+    processed_rows: list[dict[str, Any]],
+) -> tuple[int, int]:
+    original_sorted = sorted(
+        original_rows,
+        key=lambda row: (int(row.get("episode_index", 0)), int(row.get("frame_index", 0)), str(row.get("event_type", ""))),
+    )
+    processed_sorted = sorted(
+        processed_rows,
+        key=lambda row: (int(row.get("episode_index", 0)), int(row.get("frame_index", 0)), str(row.get("event_type", ""))),
+    )
+    changed_current = 0
+    changed_horizon = 0
+    for original, processed in zip(original_sorted, processed_sorted, strict=True):
+        old_current = str(original.get("current_objective") or original.get("current_subtask") or "").strip()
+        new_current = str(processed.get("current_objective") or processed.get("current_subtask") or "").strip()
+        changed_current += int(normalize_text(old_current) != normalize_text(new_current))
+        old_horizon = str(original.get("horizon_current_objective") or original.get("horizon_current_subtask") or "").strip()
+        new_horizon = str(processed.get("horizon_current_objective") or processed.get("horizon_current_subtask") or "").strip()
+        changed_horizon += int(bool(old_horizon) and normalize_text(old_horizon) != normalize_text(new_horizon))
+    return changed_current, changed_horizon
 
 
 def _preserve_fine_fields(row: dict[str, Any]) -> None:
@@ -443,33 +464,75 @@ def merge_short_current_objective_runs(
     while True:
         runs = _current_objective_runs(rows)
         merged_any = False
+        if _merge_short_bottle_cap_sequence(
+            rows,
+            runs=runs,
+            max_span_frames=max_span_frames,
+            replace_target_fields=replace_target_fields,
+            counts=counts,
+        ):
+            merged_any = True
+        elif _merge_short_place_into_transport(
+            rows,
+            runs=runs,
+            max_span_frames=max_span_frames,
+            replace_target_fields=replace_target_fields,
+            counts=counts,
+        ):
+            merged_any = True
+        elif _merge_terminal_release_into_reset(
+            rows,
+            runs=runs,
+            max_span_frames=max_span_frames,
+            replace_target_fields=replace_target_fields,
+            counts=counts,
+        ):
+            merged_any = True
+        if merged_any:
+            continue
         for run_index, run in enumerate(runs):
             if run["span_frames"] > max_span_frames:
                 continue
             if run["action_type"] in {"reset_hand", "post_action_reset", "wait_or_verify"}:
                 continue
-            target = _choose_short_run_merge_target(runs, run_index)
-            if target is None:
+            merge = _special_short_run_merge(runs, run_index, max_span_frames=max_span_frames)
+            if merge is None:
+                target = _choose_short_run_merge_target(runs, run_index)
+                if target is None:
+                    continue
+                target_run = runs[target]
+                merged_objective = _short_run_merged_objective(run, target_run)
+                action_type = target_run["action_type"]
+                reason = f"short_run_merged_into_{'next' if target > run_index else 'previous'}"
+                target_indices = [target]
+            else:
+                target_run = runs[merge["target_indices"][0]]
+                merged_objective = merge["objective"]
+                action_type = merge["action_type"]
+                reason = merge["reason"]
+                target_indices = merge["target_indices"]
+
+            if not target_indices:
                 continue
-            target_run = runs[target]
-            merged_objective = _short_run_merged_objective(run, target_run)
-            reason = f"short_run_merged_into_{'next' if target > run_index else 'previous'}"
             for row_index in range(run["start_row"], run["end_row"] + 1):
                 _rewrite_current_objective(
                     rows[row_index],
                     objective=merged_objective,
-                    action_type=target_run["action_type"],
+                    action_type=action_type,
                     reason=reason,
                     source_objective=run["objective"],
                     replace_target_fields=replace_target_fields,
                 )
-            if merged_objective != target_run["objective"]:
+            for target in target_indices:
+                target_run = runs[target]
+                if merged_objective == target_run["objective"]:
+                    continue
                 for row_index in range(target_run["start_row"], target_run["end_row"] + 1):
                     _rewrite_current_objective(
                         rows[row_index],
                         objective=merged_objective,
-                        action_type=target_run["action_type"],
-                        reason="short_run_generalized_with_neighbor",
+                        action_type=action_type,
+                        reason=reason,
                         source_objective=target_run["objective"],
                         replace_target_fields=replace_target_fields,
                     )
@@ -479,6 +542,116 @@ def merge_short_current_objective_runs(
         if not merged_any:
             break
     return counts
+
+
+def _merge_short_bottle_cap_sequence(
+    rows: list[dict[str, Any]],
+    *,
+    runs: list[dict[str, Any]],
+    max_span_frames: int,
+    replace_target_fields: bool,
+    counts: Counter[str],
+) -> bool:
+    for run_index, run in enumerate(runs):
+        if run["span_frames"] > max_span_frames:
+            continue
+        if not _is_bottle_cap_run(run):
+            continue
+        if not _is_bottle_rotate_run(run):
+            continue
+        end_index = run_index
+        seen_remove = False
+        while end_index + 1 < len(runs):
+            next_run = runs[end_index + 1]
+            if next_run["span_frames"] > max_span_frames or not _is_bottle_cap_run(next_run):
+                break
+            if next_run["action_type"] not in {"operate_articulated_object", "grasp_object"}:
+                break
+            end_index += 1
+            seen_remove = seen_remove or _is_bottle_remove_run(next_run)
+            if seen_remove:
+                break
+        if end_index == run_index or not seen_remove:
+            continue
+        merged_objective = _bottle_cap_completion_label(runs[run_index : end_index + 1])
+        for merge_run in runs[run_index : end_index + 1]:
+            for row_index in range(merge_run["start_row"], merge_run["end_row"] + 1):
+                _rewrite_current_objective(
+                    rows[row_index],
+                    objective=merged_objective,
+                    action_type="operate_articulated_object",
+                    reason="short_bottle_cap_sequence_merged",
+                    source_objective=merge_run["objective"],
+                    replace_target_fields=replace_target_fields,
+                )
+        counts["short_bottle_cap_sequence_merged"] += 1
+        return True
+    return False
+
+
+def _merge_short_place_into_transport(
+    rows: list[dict[str, Any]],
+    *,
+    runs: list[dict[str, Any]],
+    max_span_frames: int,
+    replace_target_fields: bool,
+    counts: Counter[str],
+) -> bool:
+    for run_index in range(1, len(runs)):
+        run = runs[run_index]
+        previous = runs[run_index - 1]
+        if run["span_frames"] > max_span_frames:
+            continue
+        if run["action_type"] != "place_object" or previous["action_type"] != "transport_object":
+            continue
+        if previous["span_frames"] <= 0:
+            continue
+        if not _object_overlap(run["objective"], previous["objective"]):
+            continue
+        for merge_run in (previous, run):
+            for row_index in range(merge_run["start_row"], merge_run["end_row"] + 1):
+                _rewrite_current_objective(
+                    rows[row_index],
+                    objective=run["objective"],
+                    action_type="place_object",
+                    reason="short_place_merged_with_transport",
+                    source_objective=merge_run["objective"],
+                    replace_target_fields=replace_target_fields,
+                )
+        counts["short_place_merged_with_transport"] += 1
+        return True
+    return False
+
+
+def _merge_terminal_release_into_reset(
+    rows: list[dict[str, Any]],
+    *,
+    runs: list[dict[str, Any]],
+    max_span_frames: int,
+    replace_target_fields: bool,
+    counts: Counter[str],
+) -> bool:
+    for run_index in range(len(runs) - 1):
+        run = runs[run_index]
+        next_run = runs[run_index + 1]
+        if run["span_frames"] > max_span_frames:
+            continue
+        if next_run["action_type"] != "reset_hand":
+            continue
+        if not _is_terminal_release_objective(run["objective"]):
+            continue
+        for row_index in range(run["start_row"], run["end_row"] + 1):
+            _rewrite_current_objective(
+                rows[row_index],
+                objective=next_run["objective"],
+                action_type="reset_hand",
+                reason="terminal_release_merged_into_reset",
+                source_objective=run["objective"],
+                replace_target_fields=replace_target_fields,
+            )
+        counts["terminal_release_merged_into_reset"] += 1
+        return True
+    return False
 
 
 def _current_objective_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -534,6 +707,82 @@ def _choose_short_run_merge_target(runs: list[dict[str, Any]], run_index: int) -
     if not candidates:
         return None
     return max(candidates)[-1]
+
+
+def _special_short_run_merge(
+    runs: list[dict[str, Any]],
+    run_index: int,
+    *,
+    max_span_frames: int,
+) -> dict[str, Any] | None:
+    """Return conservative task-specific short-run merges.
+
+    These rules intentionally apply only to very short fragments. They cover
+    common annotation artifacts where the segment boundary is finer than the
+    useful HL objective, while keeping long phases and reset boundaries intact.
+    """
+
+    current = runs[run_index]
+    previous = runs[run_index - 1] if run_index > 0 else None
+    next_run = runs[run_index + 1] if run_index + 1 < len(runs) else None
+
+    if _is_bottle_cap_rotation_or_removal(current["objective"]):
+        chain_indices = _short_bottle_cap_chain(runs, run_index, max_span_frames=max_span_frames)
+        if len(chain_indices) >= 2 and any(_is_bottle_cap_removal(runs[index]["objective"]) for index in chain_indices):
+            return {
+                "objective": "Loosen and remove the bottle cap",
+                "action_type": "operate_articulated_object",
+                "reason": "short_bottle_cap_chain_merged",
+                "target_indices": [index for index in chain_indices if index != run_index],
+            }
+
+    if (
+        current["action_type"] == "place_object"
+        and _is_release_objective(current["objective"])
+        and next_run is not None
+        and next_run["action_type"] == "reset_hand"
+    ):
+        return {
+            "objective": next_run["objective"],
+            "action_type": next_run["action_type"],
+            "reason": "short_terminal_release_merged_into_reset",
+            "target_indices": [run_index + 1],
+        }
+
+    if (
+        current["action_type"] == "place_object"
+        and not _is_release_objective(current["objective"])
+        and previous is not None
+        and previous["action_type"] == "transport_object"
+        and _object_overlap(previous["objective"], current["objective"])
+    ):
+        return {
+            "objective": current["objective"],
+            "action_type": current["action_type"],
+            "reason": "short_place_merged_into_previous_transport",
+            "target_indices": [run_index - 1],
+        }
+
+    return None
+
+
+def _short_bottle_cap_chain(
+    runs: list[dict[str, Any]],
+    run_index: int,
+    *,
+    max_span_frames: int,
+) -> list[int]:
+    indices: list[int] = []
+    index = run_index
+    while index < len(runs):
+        run = runs[index]
+        if run["span_frames"] > max_span_frames:
+            break
+        if not _is_bottle_cap_rotation_or_removal(run["objective"]):
+            break
+        indices.append(index)
+        index += 1
+    return indices
 
 
 def _short_run_merged_objective(short_run: dict[str, Any], target_run: dict[str, Any]) -> str:
@@ -621,6 +870,31 @@ def _run_has_source_action(run: dict[str, Any], action_types: set[str]) -> bool:
     return any(classify_action(text) in action_types for text in run.get("source_objectives", []))
 
 
+def _is_bottle_cap_run(run: dict[str, Any]) -> bool:
+    tokens = _content_tokens(run["objective"])
+    return "bottle" in tokens and bool({"cap", "lid"} & tokens)
+
+
+def _is_bottle_rotate_run(run: dict[str, Any]) -> bool:
+    normalized = normalize_text(run["objective"])
+    return run["action_type"] == "operate_articulated_object" and any(
+        token in normalized for token in ("rotate", "twist", "clockwise", "counterclockwise", "anticlockwise")
+    )
+
+
+def _is_bottle_remove_run(run: dict[str, Any]) -> bool:
+    normalized = normalize_text(run["objective"])
+    return any(token in normalized for token in ("remove", "take off", "take out", "unscrew"))
+
+
+def _bottle_cap_completion_label(runs: list[dict[str, Any]]) -> str:
+    tokens = set()
+    for run in runs:
+        tokens.update(_content_tokens(run["objective"]))
+    cover = "lid" if "lid" in tokens and "cap" not in tokens else "cap"
+    return f"Loosen and remove the bottle {cover}"
+
+
 def _has_direction_conflict(left: str, right: str) -> bool:
     left_norm = normalize_text(left)
     right_norm = normalize_text(right)
@@ -645,6 +919,33 @@ def _is_preparatory_objective(objective: str, action_type: str) -> bool:
 def _is_delicate_directional_operation(objective: str) -> bool:
     normalized = normalize_text(objective)
     return any(token in normalized for token in ("rotate", "twist", "clockwise", "counterclockwise", "anticlockwise", "cap", "bottle"))
+
+
+def _is_terminal_release_objective(objective: str) -> bool:
+    normalized = normalize_text(objective)
+    if any(token in normalized for token in ("release", "drop", "let go")):
+        return True
+    return normalized.startswith("set ")
+
+
+def _is_bottle_cap_rotation_or_removal(objective: str) -> bool:
+    normalized = normalize_text(objective)
+    has_bottle_lid_or_cap = "bottle" in normalized and ("cap" in normalized or "lid" in normalized)
+    if not has_bottle_lid_or_cap:
+        return False
+    return any(token in normalized for token in ("rotate", "twist", "unscrew", "remove", "take off"))
+
+
+def _is_bottle_cap_removal(objective: str) -> bool:
+    normalized = normalize_text(objective)
+    return _is_bottle_cap_rotation_or_removal(objective) and any(
+        token in normalized for token in ("unscrew", "remove", "take off")
+    )
+
+
+def _is_release_objective(objective: str) -> bool:
+    normalized = normalize_text(objective)
+    return any(token in normalized for token in ("release", "drop", "let go"))
 
 
 def _rewrite_current_objective(

@@ -126,22 +126,25 @@ After the row-level pass, `--short-run-merge-max-frames 20` merges only compatib
 | Case | Behavior |
 | --- | --- |
 | Same action/object wording variants | Merge and prefer the shorter/general label, e.g. `Fold packaging box sides` -> `Fold packaging box` |
+| Very short `transport -> place` | Rewrite the combined run to the place objective |
+| Very short terminal `release -> reset` | Rewrite the release frames to the reset objective |
+| Very short bottle-cap `rotate/twist -> remove` tail | Rewrite the tail to `Loosen and remove the bottle cap/lid` |
 | Reset/wait/retract | Preserve |
-| Bottle/cap rotate/twist | Preserve because direction and cap-removal order matter |
+| Directional bottle/cap rotate/twist without a remove step | Preserve because direction still matters |
 | Fine source is grasp/place but coarse text looks like move/approach | Preserve the acquisition/place label rather than merging backward into preparation |
 
 Current conservative coarse statistics on the 87-task normalized annotations:
 
 | Statistic | Fine normalized | Coarse normalized |
 | --- | ---: | ---: |
-| Runs | 14,792 | 12,618 |
+| Runs | 14,792 | 12,081 |
 | Segment duration min | 0 | 0 |
-| Segment duration p10 | 16 | 18 |
-| Segment duration median | 50 | 59 |
-| Segment duration p90 | 106 | 123 |
-| Short runs at p10 threshold | 2,521 at <=20 frames | 1,272 at <=18 frames |
+| Segment duration p10 | 16 | 23 |
+| Segment duration median | 50 | 62 |
+| Segment duration p90 | 106 | 124 |
+| Short runs at p10 threshold | 2,521 at <=20 frames | 1,345 at <=23 frames |
 
-The remaining shortest coarse runs are mostly reset/release boundary frames and directional bottle-cap fragments. These should be inspected before any more aggressive merge rule; they are not obviously safe to collapse automatically.
+The remaining shortest coarse runs are mostly reset/retract frames, isolated pull/open snippets, and directional bottle-cap fragments that do not yet complete a remove step. These should still be inspected before any more aggressive merge rule.
 
 ## Evaluation Recommendation
 

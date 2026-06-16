@@ -27,8 +27,11 @@ After row-level coarsening, the default pass also merges compatible short adjace
 
 - The merge requires overlapping object tokens and compatible action semantics.
 - Same-action short fragments with equivalent object tokens prefer the shorter/general wording, e.g. `Fold packaging box sides` becomes `Fold packaging box`.
+- Very short `transport -> place` pairs are collapsed into a single place intent, e.g. `Move to above the blue box` + short `Place large toy 2 into the blue box`.
+- Very short terminal `release -> reset` pairs are collapsed into reset, e.g. short `Release shoebox` + `Move back to observation region`.
+- Very short bottle-cap rotate/remove tails are collapsed into `Loosen and remove the bottle cap` or `... lid`.
 - Reset/wait phases are preserved.
-- Delicate directional operations such as bottle-cap rotate/twist are not short-run merged, because clockwise/counterclockwise boundaries are semantically important.
+- Directional bottle-cap fragments that do not yet complete a remove sequence are still preserved.
 - Fine/source labels are checked before merging, so acquisition labels are not collapsed backward into preparatory `move/approach` labels.
 
 ## Command
@@ -82,12 +85,18 @@ Latest full run on `/root/Users/dataset/lerobot_home/subtask` with `hl_annotatio
 
 | Metric | Value |
 | --- | ---: |
-| Coarse runs | 12,618 |
-| Short-run p10 threshold | 18 frames |
-| Runs at or below p10 | 1,272 |
+| Coarse runs | 12,081 |
+| Short-run p10 threshold | 23 frames |
+| Runs at or below p10 | 1,345 |
 | Segment duration min | 0 frames |
-| Segment duration median | 59 frames |
-| Segment duration p90 | 123 frames |
+| Segment duration median | 62 frames |
+| Segment duration p90 | 124 frames |
 | Segment duration max | 312 frames |
 
-The shortest remaining runs are mostly true edge cases: reset/retract phases, release frames at episode boundaries, or directional bottle-cap rotation fragments. These are left unmerged because merging them would either erase useful reset objectives or collapse semantically different directions.
+Targeted checks after the latest pass:
+
+- `20260309H068F`: short `rotate/twist -> remove` bottle-cap tail becomes `Loosen and remove the bottle cap`.
+- `20260310H076A`: final short `Release shoebox` now merges into `Move back to observation region`, while earlier `Release left side of shoebox` stays separate.
+- `20260319H107A`: short `Place large toy ... into the blue box` now absorbs the preceding `Move to above the blue box`.
+
+The shortest remaining runs are now mostly true edge cases: reset/retract phases, isolated pull/open snippets, or directional bottle-cap fragments that do not yet complete a remove step.
