@@ -72,6 +72,7 @@ PYTHONPATH=src python scripts/hl_memory/coarsen_hl_annotations.py \
   --input-name hl_annotations_llm_normalized.jsonl \
   --output-name hl_annotations_llm_normalized_coarse.jsonl \
   --merge-mode conservative \
+  --short-run-merge-max-frames 20 \
   --overwrite \
   --summary-json /root/Users/dataset/lerobot_home/subtask/batch_coarse_hl_annotations_summary.json
 ```
@@ -102,11 +103,15 @@ Default merge behavior:
 | --- | --- |
 | approach -> grasp | approach rows are relabeled toward acquire/grasp |
 | approach/grasp handle -> open/close | handle acquisition is relabeled toward the articulation objective |
+| same-object short wording variants | compatible short runs are merged and prefer the shorter/general label, e.g. `Fold packaging box sides` -> `Fold packaging box` |
+| bottle/cap rotate/twist | preserved; do not short-run merge directional operation fragments |
 | return/retreat | preserved as executable reset objectives; add `--merge-return-into-previous` only for a special ablation |
 
 Use `--merge-mode aggressive` for the extra `grasp/transport -> place` rule. It reduces phase fragmentation more aggressively, but can over-label intermediate transport as final placement. The default `conservative` mode is the recommended first run.
 
 This is intentionally heuristic. Inspect a few generated JSONL rows before launching a full run. The output keeps object grounding in `current_objective`; `coarse_action_type` is metadata, not the text target.
+
+Latest conservative coarse stats: 12,618 runs, p10 18 frames, median 59 frames, p90 123 frames. The remaining p10 short runs are mostly reset/release boundaries and directional bottle/cap operations, which are deliberately left unmerged.
 
 ## Architecture Additions To Consider
 

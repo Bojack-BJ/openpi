@@ -121,6 +121,28 @@ Two merge modes are available:
 
 `horizon_current_objective` is classified but does not use lookahead merge. It is already a future label, and applying another future lookahead can double-advance the target.
 
+After the row-level pass, `--short-run-merge-max-frames 20` merges only compatible adjacent short runs. The second pass is source-aware:
+
+| Case | Behavior |
+| --- | --- |
+| Same action/object wording variants | Merge and prefer the shorter/general label, e.g. `Fold packaging box sides` -> `Fold packaging box` |
+| Reset/wait/retract | Preserve |
+| Bottle/cap rotate/twist | Preserve because direction and cap-removal order matter |
+| Fine source is grasp/place but coarse text looks like move/approach | Preserve the acquisition/place label rather than merging backward into preparation |
+
+Current conservative coarse statistics on the 87-task normalized annotations:
+
+| Statistic | Fine normalized | Coarse normalized |
+| --- | ---: | ---: |
+| Runs | 14,792 | 12,618 |
+| Segment duration min | 0 | 0 |
+| Segment duration p10 | 16 | 18 |
+| Segment duration median | 50 | 59 |
+| Segment duration p90 | 106 | 123 |
+| Short runs at p10 threshold | 2,521 at <=20 frames | 1,272 at <=18 frames |
+
+The remaining shortest coarse runs are mostly reset/release boundary frames and directional bottle-cap fragments. These should be inspected before any more aggressive merge rule; they are not obviously safe to collapse automatically.
+
 ## Evaluation Recommendation
 
 Report both fine and coarse metrics:

@@ -21,6 +21,7 @@ from typing import Any
 DEFAULT_INPUT_NAME = "hl_annotations_llm_normalized.jsonl"
 DEFAULT_OUTPUT_NAME = "hl_annotations_llm_normalized_coarse.jsonl"
 MERGE_MODES = ("conservative", "aggressive")
+DEFAULT_SHORT_RUN_MERGE_MAX_FRAMES = 20
 
 
 def main() -> None:
@@ -42,6 +43,7 @@ def main() -> None:
             merge_return_into_previous=args.merge_return_into_previous,
             merge_mode=args.merge_mode,
             lookahead_window=args.lookahead_window,
+            short_run_merge_max_frames=args.short_run_merge_max_frames,
         )
         summaries.append(summary)
         print(
@@ -99,6 +101,15 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Number of future distinct objectives considered by rule-based lookahead merges.",
     )
+    parser.add_argument(
+        "--short-run-merge-max-frames",
+        type=int,
+        default=DEFAULT_SHORT_RUN_MERGE_MAX_FRAMES,
+        help=(
+            "After row-level coarsening, merge compatible adjacent current-objective runs whose sampled frame span "
+            "is <= this threshold. Set to 0 to disable."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--summary-json", type=Path, default=None)
     return parser.parse_args()
@@ -137,6 +148,7 @@ def coarsen_file(
     merge_return_into_previous: bool,
     merge_mode: str,
     lookahead_window: int,
+    short_run_merge_max_frames: int,
 ) -> dict[str, Any]:
     rows = load_jsonl(input_jsonl)
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -147,8 +159,10 @@ def coarsen_file(
     action_counts: Counter[str] = Counter()
     changed_current = 0
     changed_horizon = 0
+    short_run_merge_counts: Counter[str] = Counter()
     for episode_rows in grouped.values():
         episode_rows.sort(key=lambda row: (int(row.get("frame_index", 0)), str(row.get("event_type", ""))))
+        episode_processed: list[dict[str, Any]] = []
         for index, row in enumerate(episode_rows):
             current = coarsen_row(
                 row,
@@ -203,7 +217,16 @@ def coarsen_file(
                 changed_current += int(normalize_text(old_current) != normalize_text(current["objective"]))
                 changed_horizon += int(bool(old_horizon) and normalize_text(old_horizon) != normalize_text(horizon["objective"]))
             action_counts[current["action_type"]] += 1
-            processed.append(new_row)
+            episode_processed.append(new_row)
+
+        if short_run_merge_max_frames > 0:
+            merge_count = merge_short_current_objective_runs(
+                episode_processed,
+                max_span_frames=short_run_merge_max_frames,
+                replace_target_fields=replace_target_fields,
+            )
+            short_run_merge_counts.update(merge_count)
+        processed.extend(episode_processed)
 
     processed.sort(key=lambda row: (int(row.get("episode_index", 0)), int(row.get("frame_index", 0))))
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
@@ -216,6 +239,8 @@ def coarsen_file(
         "changed_horizon_current_objective": changed_horizon,
         "merge_mode": merge_mode,
         "lookahead_window": lookahead_window,
+        "short_run_merge_max_frames": short_run_merge_max_frames,
+        "short_run_merge_counts": dict(short_run_merge_counts.most_common()),
         "action_counts": dict(action_counts.most_common()),
     }
 
@@ -293,7 +318,11 @@ def _lookahead_merge_objective(
     if action_type in {"approach_object", "grasp_object"}:
         for candidate in lookahead:
             candidate_type = classify_action(candidate)
-            if candidate_type == "operate_articulated_object" and _mentions_articulated_target(text):
+            if (
+                candidate_type == "operate_articulated_object"
+                and _mentions_articulated_target(text)
+                and _object_overlap(text, candidate)
+            ):
                 return {
                     "action_type": "operate_articulated_object",
                     "objective": normalize_objective_text(candidate, action_type=candidate_type),
@@ -303,7 +332,7 @@ def _lookahead_merge_objective(
         if action_type == "approach_object":
             for candidate in lookahead:
                 candidate_type = classify_action(candidate)
-                if candidate_type == "grasp_object":
+                if candidate_type == "grasp_object" and _object_overlap(text, candidate):
                     return {
                         "action_type": "acquire_object",
                         "objective": normalize_objective_text(candidate, action_type="acquire_object"),
@@ -313,7 +342,7 @@ def _lookahead_merge_objective(
     if merge_mode == "aggressive" and action_type in {"grasp_object", "transport_object"}:
         for candidate in lookahead:
             candidate_type = classify_action(candidate)
-            if candidate_type == "place_object":
+            if candidate_type == "place_object" and _object_overlap(text, candidate):
                 return {
                     "action_type": "place_object",
                     "objective": normalize_objective_text(candidate, action_type=candidate_type),
@@ -362,19 +391,20 @@ def classify_action(text: str) -> str:
         return "place_object"
     if any(token in normalized for token in ("handover", "hand over", "transfer")):
         return "handover_or_transfer"
-    if any(token in normalized for token in ("move", "carry", "bring", "transport", "align", "lift", "raise", "lower")):
-        return "transport_object"
-    if any(token in normalized for token in ("grasp", "grab", "pick up", "hold", "take off", "take out")):
+    if any(token in normalized for token in ("grasp", "grab", "grip", "pick up", "hold", "remove", "take off", "take out")):
         return "grasp_object"
     if any(token in normalized for token in ("approach", "move to right end", "move to left end")):
         return "approach_object"
+    if any(token in normalized for token in ("move", "carry", "bring", "transport", "align", "lift", "raise", "lower")):
+        return "transport_object"
     if any(token in normalized for token in ("verify", "check", "observe", "wait")):
         return "wait_or_verify"
     return "other"
 
 
 def normalize_objective_text(text: str, *, action_type: str) -> str:
-    stripped = re.sub(r"\s+", " ", text.strip()).rstrip(".")
+    stripped = text.strip().replace("_", " ")
+    stripped = re.sub(r"\s+", " ", stripped).rstrip(".")
     if not stripped:
         return "continue the observed manipulation step"
     if stripped.lower().startswith("the "):
@@ -385,7 +415,7 @@ def normalize_objective_text(text: str, *, action_type: str) -> str:
 
 
 def normalize_text(text: str) -> str:
-    normalized = text.strip().lower().rstrip(".")
+    normalized = text.strip().lower().replace("_", " ").rstrip(".")
     normalized = re.sub(r"\s+", " ", normalized)
     normalized = normalized.replace("the ", "")
     return normalized
@@ -394,6 +424,324 @@ def normalize_text(text: str) -> str:
 def _mentions_articulated_target(text: str) -> bool:
     normalized = normalize_text(text)
     return any(token in normalized for token in ("door", "drawer", "cabinet", "handle", "lid", "cap", "button", "switch"))
+
+
+def merge_short_current_objective_runs(
+    rows: list[dict[str, Any]],
+    *,
+    max_span_frames: int,
+    replace_target_fields: bool,
+) -> Counter[str]:
+    """Merge very short compatible runs into adjacent runs.
+
+    This is a second-stage cleanup after per-row semantic normalization. It is
+    intentionally conservative: reset/return runs are kept, and a short run only
+    merges when adjacent action/object semantics are compatible.
+    """
+
+    counts: Counter[str] = Counter()
+    while True:
+        runs = _current_objective_runs(rows)
+        merged_any = False
+        for run_index, run in enumerate(runs):
+            if run["span_frames"] > max_span_frames:
+                continue
+            if run["action_type"] in {"reset_hand", "post_action_reset", "wait_or_verify"}:
+                continue
+            target = _choose_short_run_merge_target(runs, run_index)
+            if target is None:
+                continue
+            target_run = runs[target]
+            merged_objective = _short_run_merged_objective(run, target_run)
+            reason = f"short_run_merged_into_{'next' if target > run_index else 'previous'}"
+            for row_index in range(run["start_row"], run["end_row"] + 1):
+                _rewrite_current_objective(
+                    rows[row_index],
+                    objective=merged_objective,
+                    action_type=target_run["action_type"],
+                    reason=reason,
+                    source_objective=run["objective"],
+                    replace_target_fields=replace_target_fields,
+                )
+            if merged_objective != target_run["objective"]:
+                for row_index in range(target_run["start_row"], target_run["end_row"] + 1):
+                    _rewrite_current_objective(
+                        rows[row_index],
+                        objective=merged_objective,
+                        action_type=target_run["action_type"],
+                        reason="short_run_generalized_with_neighbor",
+                        source_objective=target_run["objective"],
+                        replace_target_fields=replace_target_fields,
+                    )
+            counts[reason] += 1
+            merged_any = True
+            break
+        if not merged_any:
+            break
+    return counts
+
+
+def _current_objective_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    for row_index, row in enumerate(rows):
+        objective = str(row.get("coarse_current_objective") or row.get("current_objective") or row.get("current_subtask") or "")
+        key = normalize_text(objective)
+        if current is None or current["key"] != key:
+            if current is not None:
+                _finish_run(current)
+                runs.append(current)
+            current = {
+                "key": key,
+                "objective": objective,
+                "action_type": str(row.get("coarse_action_type") or classify_action(objective)),
+                "start_row": row_index,
+                "end_row": row_index,
+                "frames": [int(row.get("frame_index", 0))],
+                "source_objectives": _row_source_objectives(row),
+            }
+        else:
+            current["end_row"] = row_index
+            current["frames"].append(int(row.get("frame_index", 0)))
+            current["source_objectives"].extend(_row_source_objectives(row))
+    if current is not None:
+        _finish_run(current)
+        runs.append(current)
+    return runs
+
+
+def _finish_run(run: dict[str, Any]) -> None:
+    frames = run["frames"]
+    run["start_frame"] = min(frames)
+    run["end_frame"] = max(frames)
+    run["span_frames"] = max(frames) - min(frames)
+
+
+def _choose_short_run_merge_target(runs: list[dict[str, Any]], run_index: int) -> int | None:
+    candidates: list[tuple[int, int, int]] = []
+    current = runs[run_index]
+    for neighbor_index in (run_index + 1, run_index - 1):
+        if neighbor_index < 0 or neighbor_index >= len(runs):
+            continue
+        neighbor = runs[neighbor_index]
+        if not _compatible_adjacent_runs(current, neighbor):
+            continue
+        # Prefer next run for preparatory/fragment rows, then the longer neighbor,
+        # then the richer natural-language objective.
+        direction_score = 1 if neighbor_index > run_index else 0
+        rich_score = len(_content_tokens(neighbor["objective"]))
+        candidates.append((direction_score, int(neighbor["span_frames"]), rich_score, neighbor_index))
+    if not candidates:
+        return None
+    return max(candidates)[-1]
+
+
+def _short_run_merged_objective(short_run: dict[str, Any], target_run: dict[str, Any]) -> str:
+    """Pick the train-facing label for a compatible short-run merge.
+
+    When two adjacent runs have the same action semantics and equivalent object
+    tokens, prefer the shorter wording. This converts labels such as
+    "Fold packaging box sides" back to the more general "Fold packaging box"
+    without dropping important goal/location tokens from place/transport rows.
+    """
+
+    short_objective = str(short_run["objective"])
+    target_objective = str(target_run["objective"])
+    if short_run["action_type"] != target_run["action_type"]:
+        return target_objective
+    short_tokens = _content_tokens(short_objective)
+    target_tokens = _content_tokens(target_objective)
+    if not short_tokens or short_tokens != target_tokens:
+        return target_objective
+    return min(
+        (short_objective, target_objective),
+        key=lambda text: (len(_surface_tokens(text)), len(text)),
+    )
+
+
+def _compatible_adjacent_runs(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_type = left["action_type"]
+    right_type = right["action_type"]
+    if left_type in {"reset_hand", "post_action_reset", "wait_or_verify"}:
+        return False
+    if right_type in {"reset_hand", "post_action_reset", "wait_or_verify"}:
+        return False
+    if _has_direction_conflict(left["objective"], right["objective"]):
+        return False
+    if not _object_overlap(left["objective"], right["objective"]):
+        return False
+    if _is_delicate_directional_operation(left["objective"]) or _is_delicate_directional_operation(right["objective"]):
+        return False
+    if left_type in {"grasp_object", "acquire_object", "place_object"} and _is_preparatory_objective(
+        right["objective"], right_type
+    ):
+        return False
+    if _run_has_source_action(left, {"grasp_object", "acquire_object", "place_object"}) and _is_preparatory_objective(
+        right["objective"], right_type
+    ):
+        return False
+    if {
+        left_type,
+        right_type,
+    }.intersection({"approach_object", "grasp_object"}) and "operate_articulated_object" in {left_type, right_type}:
+        return _mentions_articulated_target(left["objective"]) or _mentions_articulated_target(right["objective"])
+    if left_type == right_type:
+        return True
+    return (left_type, right_type) in {
+        ("approach_object", "grasp_object"),
+        ("approach_object", "acquire_object"),
+        ("grasp_object", "acquire_object"),
+        ("approach_object", "operate_articulated_object"),
+        ("grasp_object", "operate_articulated_object"),
+        ("transport_object", "place_object"),
+        ("grasp_object", "transport_object"),
+    }
+
+
+def _row_source_objectives(row: dict[str, Any]) -> list[str]:
+    values = [
+        row.get("fine_current_objective"),
+        row.get("fine_current_subtask"),
+        row.get("coarse_source_objective"),
+        row.get("current_objective"),
+        row.get("current_subtask"),
+    ]
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        key = normalize_text(text)
+        if text and key not in seen:
+            result.append(text)
+            seen.add(key)
+    return result
+
+
+def _run_has_source_action(run: dict[str, Any], action_types: set[str]) -> bool:
+    return any(classify_action(text) in action_types for text in run.get("source_objectives", []))
+
+
+def _has_direction_conflict(left: str, right: str) -> bool:
+    left_norm = normalize_text(left)
+    right_norm = normalize_text(right)
+    left_clockwise = "clockwise" in left_norm and "counterclockwise" not in left_norm and "anticlockwise" not in left_norm
+    right_clockwise = (
+        "clockwise" in right_norm and "counterclockwise" not in right_norm and "anticlockwise" not in right_norm
+    )
+    left_counter = "counterclockwise" in left_norm or "anticlockwise" in left_norm
+    right_counter = "counterclockwise" in right_norm or "anticlockwise" in right_norm
+    return (left_clockwise and right_counter) or (left_counter and right_clockwise)
+
+
+def _is_preparatory_objective(objective: str, action_type: str) -> bool:
+    normalized = normalize_text(objective)
+    if "move right gripper" in normalized or "move left gripper" in normalized:
+        return True
+    if action_type == "approach_object":
+        return True
+    return action_type == "transport_object" and "move to" in normalized
+
+
+def _is_delicate_directional_operation(objective: str) -> bool:
+    normalized = normalize_text(objective)
+    return any(token in normalized for token in ("rotate", "twist", "clockwise", "counterclockwise", "anticlockwise", "cap", "bottle"))
+
+
+def _rewrite_current_objective(
+    row: dict[str, Any],
+    *,
+    objective: str,
+    action_type: str,
+    reason: str,
+    source_objective: str,
+    replace_target_fields: bool,
+) -> None:
+    row["coarse_action_type"] = action_type
+    row["coarse_current_objective"] = objective
+    row["coarse_current_subtask"] = objective
+    row["coarse_phase"] = objective
+    row["coarse_merge_reason"] = reason
+    row["coarse_source_objective"] = source_objective
+    if replace_target_fields:
+        row["current_objective"] = objective
+        row["current_subtask"] = objective
+        row["phase"] = objective
+
+
+def _object_overlap(left: str, right: str) -> bool:
+    left_tokens = _object_tokens(left)
+    right_tokens = _object_tokens(right)
+    return bool(left_tokens and right_tokens and left_tokens.intersection(right_tokens))
+
+
+def _object_tokens(text: str) -> set[str]:
+    return _content_tokens(text)
+
+
+def _content_tokens(text: str) -> set[str]:
+    normalized = normalize_text(text)
+    return {token for token in re.findall(r"[a-z0-9]+", normalized) if token not in _STOPWORDS and len(token) > 1}
+
+
+def _surface_tokens(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", normalize_text(text))
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "both",
+    "current",
+    "down",
+    "for",
+    "from",
+    "hand",
+    "hands",
+    "in",
+    "into",
+    "left",
+    "middle",
+    "of",
+    "on",
+    "onto",
+    "position",
+    "right",
+    "side",
+    "sides",
+    "target",
+    "to",
+    "up",
+    "with",
+    # Verbs / phase words.
+    "approach",
+    "approaches",
+    "bring",
+    "carry",
+    "close",
+    "cover",
+    "fold",
+    "folds",
+    "grasp",
+    "grasps",
+    "hold",
+    "insert",
+    "lift",
+    "move",
+    "moves",
+    "open",
+    "pick",
+    "place",
+    "places",
+    "pull",
+    "push",
+    "release",
+    "return",
+    "returns",
+    "set",
+    "stack",
+    "transport",
+}
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
