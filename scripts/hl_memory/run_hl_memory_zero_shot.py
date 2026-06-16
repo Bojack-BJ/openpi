@@ -6,6 +6,8 @@ import json
 import logging
 import os
 import pathlib
+import re
+import sys
 
 import numpy as np
 from PIL import Image
@@ -15,6 +17,7 @@ import tyro
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.proprio import PROPRIO_CONFIG_FILENAME
 from openpi.hl_memory.schema import HLMemoryPrediction
 from openpi.hl_memory.schema import render_language_memory_fields
 from openpi.hl_memory.zero_shot import apply_rollout_language_memory_rule
@@ -41,6 +44,7 @@ class ZeroShotArgs:
     video_path: pathlib.Path | None = None
     left_video_path: pathlib.Path | None = None
     right_video_path: pathlib.Path | None = None
+    session_path: pathlib.Path | None = None
     task_config_path: pathlib.Path | None = None
 
     # Optional YAML config and model checkpoint/source.
@@ -106,6 +110,13 @@ class ZeroShotArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    proprio_enabled: bool = False
+    proprio_token_mode: str = "per_frame_plus_summary"
+    proprio_state_dim: int = 14
+    proprio_hidden_dim: int = 512
+    proprio_dropout: float = 0.0
+    proprio_noise_std: float = 0.0
+    proprio_norm_stats_path: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -119,6 +130,8 @@ def main(args: ZeroShotArgs) -> None:
             rollout_pretty_json=None,
             debug_dir=None,
         )
+    args = _resolve_checkpoint_proprio_args(args)
+    _resolve_session_paths(args)
     _resolve_video_paths(args)
     if args.task_config_path is not None:
         _load_task_config(args.task_config_path)
@@ -126,6 +139,8 @@ def main(args: ZeroShotArgs) -> None:
         raise ValueError("`--memory-input-mode` must be one of `full`, `completed_only`, or `empty`.")
     if args.target_protocol == "memer_objective" and args.known_prior_mode:
         raise ValueError("`--target-protocol memer_objective` does not support `--known-prior-mode` in v1.")
+    if args.proprio_enabled and args.session_path is None:
+        raise ValueError("Zero-shot proprio input requires `--session-path` for RGB/trajectory alignment.")
     config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -147,6 +162,12 @@ def main(args: ZeroShotArgs) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        proprio_enabled=args.proprio_enabled,
+        proprio_token_mode=args.proprio_token_mode,
+        proprio_state_dim=args.proprio_state_dim,
+        proprio_hidden_dim=args.proprio_hidden_dim,
+        proprio_dropout=args.proprio_dropout,
+        proprio_noise_std=args.proprio_noise_std,
     )
     adapter = create_hf_adapter(config)
     resolved_model_path = args.model_path
@@ -178,6 +199,111 @@ def main(args: ZeroShotArgs) -> None:
         _write_json_atomic(args.output_json, payload)
 
 
+def _resolve_checkpoint_proprio_args(args: ZeroShotArgs) -> ZeroShotArgs:
+    checkpoint_dir = _local_checkpoint_dir(args)
+    if checkpoint_dir is None:
+        return args
+    config_path = checkpoint_dir / PROPRIO_CONFIG_FILENAME
+    if not config_path.is_file():
+        return args
+    payload = json.loads(config_path.read_text())
+    updates: dict[str, object] = {}
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_enabled",
+        cli_names=("--proprio-enabled", "--no-proprio-enabled"),
+        cast=bool,
+    )
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_token_mode",
+        cli_names=("--proprio-token-mode",),
+        cast=str,
+    )
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_state_dim",
+        cli_names=("--proprio-state-dim",),
+        cast=int,
+    )
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_hidden_dim",
+        cli_names=("--proprio-hidden-dim",),
+        cast=int,
+    )
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_dropout",
+        cli_names=("--proprio-dropout",),
+        cast=float,
+    )
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_noise_std",
+        cli_names=("--proprio-noise-std",),
+        cast=float,
+    )
+    if updates:
+        logging.info("Loaded proprio runtime config from %s: %s", config_path, updates)
+        return dataclasses.replace(args, **updates)
+    return args
+
+
+def _local_checkpoint_dir(args: ZeroShotArgs) -> pathlib.Path | None:
+    if args.local_vlm_ckpt_path is not None:
+        return args.local_vlm_ckpt_path
+    if args.model_path is None:
+        return None
+    path = pathlib.Path(args.model_path)
+    return path if path.exists() else None
+
+
+def _maybe_set_checkpoint_arg(
+    args: ZeroShotArgs,
+    updates: dict[str, object],
+    payload: dict[str, object],
+    *,
+    field_name: str,
+    cli_names: tuple[str, ...],
+    cast,
+) -> None:
+    if field_name not in payload:
+        return
+    checkpoint_value = cast(payload[field_name])
+    current_value = getattr(args, field_name)
+    if _cli_option_was_set(*cli_names):
+        if current_value != checkpoint_value:
+            names = "/".join(cli_names)
+            raise ValueError(
+                f"{names}={current_value!r} conflicts with checkpoint {PROPRIO_CONFIG_FILENAME} "
+                f"{field_name}={checkpoint_value!r}. Use the checkpoint value or a matching checkpoint."
+            )
+        return
+    if current_value != checkpoint_value:
+        updates[field_name] = checkpoint_value
+
+
+def _cli_option_was_set(*option_names: str) -> bool:
+    for arg in sys.argv[1:]:
+        for option_name in option_names:
+            if arg == option_name or arg.startswith(f"{option_name}="):
+                return True
+    return False
+
+
 def _run_single_prediction(
     args: ZeroShotArgs,
     *,
@@ -203,6 +329,7 @@ def _run_single_prediction(
         memory_seconds=selection.memory_seconds,
         recent_seconds=selection.recent_seconds,
     )
+    sample = _attach_runtime_proprio(sample, args=args, config=config, recent_seconds=selection.recent_seconds)
     generation = adapter.generate_prediction(loaded, sample, clips, device=args.device)
     recent_end_sec = selection.recent_seconds[-1] if selection.recent_seconds else 0.0
     prediction, memory_rule_applied = apply_rollout_language_memory_rule(
@@ -219,6 +346,7 @@ def _run_single_prediction(
 
     payload = {
         "video_paths": _payload_video_paths_from_args(args),
+        "session_path": None if args.session_path is None else str(args.session_path),
         "model_path": args.model_path,
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
@@ -240,6 +368,8 @@ def _run_single_prediction(
         "recent_seconds": list(selection.recent_seconds),
         "memory_valid_length": clips.memory_valid_length,
         "recent_valid_length": clips.recent_valid_length,
+        "proprio_enabled": config.proprio_enabled,
+        "proprio_norm_stats_path": _payload_proprio_norm_stats_path(args),
         "raw_model_output": generation.raw_output,
         "parse_error": generation.parse_error,
         "model_prediction": generation.prediction.to_dict(),
@@ -357,6 +487,7 @@ def _run_rollout(
             memory_seconds=selection.memory_seconds,
             recent_seconds=selection.recent_seconds,
         )
+        sample = _attach_runtime_proprio(sample, args=args, config=config, recent_seconds=selection.recent_seconds)
         generation = adapter.generate_prediction(loaded, sample, clips, device=args.device)
         prediction, memory_rule_applied = apply_rollout_language_memory_rule(
             generation.prediction,
@@ -474,6 +605,7 @@ def _run_rollout(
                 "recent_seconds": list(selection.recent_seconds),
                 "memory_valid_length": clips.memory_valid_length,
                 "recent_valid_length": clips.recent_valid_length,
+                "proprio_enabled": config.proprio_enabled,
                 "raw_model_output": generation.raw_output,
                 "parse_error": generation.parse_error,
                 "model_prediction": generation.prediction.to_dict(),
@@ -558,6 +690,7 @@ def _build_rollout_payload(
 ) -> dict[str, object]:
     return {
         "video_paths": _payload_video_paths_from_args(args),
+        "session_path": None if args.session_path is None else str(args.session_path),
         "model_path": args.model_path,
         "local_vlm_ckpt_path": None if args.local_vlm_ckpt_path is None else str(args.local_vlm_ckpt_path),
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
@@ -575,6 +708,8 @@ def _build_rollout_payload(
         "frame_subsample": args.frame_subsample,
         "video_fps": config.video_fps,
         "target_protocol": config.target_protocol,
+        "proprio_enabled": config.proprio_enabled,
+        "proprio_norm_stats_path": _payload_proprio_norm_stats_path(args),
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
         "known_prior_mode": bool(known_prior_steps),
         "memory_input_mode": args.memory_input_mode,
@@ -644,6 +779,56 @@ def _resolved_recent_step_sec(args: ZeroShotArgs) -> float:
     return 1.0 / float(args.recent_sample_hz)
 
 
+def _resolve_session_paths(args: ZeroShotArgs) -> None:
+    if args.session_path is None:
+        return
+    session_path = args.session_path
+    if not session_path.is_dir():
+        raise FileNotFoundError(f"Session path does not exist: {session_path}")
+
+    if args.task_config_path is None:
+        task_config_path = session_path / "subtask.json"
+        if task_config_path.is_file():
+            args.task_config_path = task_config_path
+
+    if args.video_path is not None or args.left_video_path is not None or args.right_video_path is not None:
+        return
+
+    hand_dirs = _session_hand_dirs(session_path)
+    left_dir = next((path for path in hand_dirs if path.name.startswith("left_hand_")), None)
+    right_dir = next((path for path in hand_dirs if path.name.startswith("right_hand_")), None)
+    if left_dir is not None and right_dir is not None:
+        args.left_video_path = _required_session_file(left_dir / "RGB_Images" / "video.mp4")
+        args.right_video_path = _required_session_file(right_dir / "RGB_Images" / "video.mp4")
+        return
+    if len(hand_dirs) == 1:
+        args.video_path = _required_session_file(hand_dirs[0] / "RGB_Images" / "video.mp4")
+        return
+
+    root_video_path = session_path / "RGB_Images" / "video.mp4"
+    if root_video_path.is_file():
+        args.video_path = root_video_path
+        return
+    raise ValueError(
+        f"Could not resolve video input from session path {session_path}. Expected left/right hand subdirs "
+        "or root RGB_Images/video.mp4."
+    )
+
+
+def _required_session_file(path: pathlib.Path) -> pathlib.Path:
+    if not path.is_file():
+        raise FileNotFoundError(f"Expected session file does not exist: {path}")
+    return path
+
+
+def _session_hand_dirs(session_path: pathlib.Path) -> list[pathlib.Path]:
+    return sorted(
+        path
+        for path in session_path.iterdir()
+        if path.is_dir() and (path.name.startswith("left_hand_") or path.name.startswith("right_hand_"))
+    )
+
+
 def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
     has_single_video = args.video_path is not None
     has_left_video = args.left_video_path is not None
@@ -671,6 +856,187 @@ def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
 
 def _payload_video_paths_from_args(args: ZeroShotArgs) -> dict[str, str]:
     return {view_name: str(path) for view_name, path in _resolve_video_paths(args).items()}
+
+
+def _attach_runtime_proprio(
+    sample,
+    *,
+    args: ZeroShotArgs,
+    config: HLMemoryConfig,
+    recent_seconds: tuple[float, ...] | list[float],
+):
+    if not config.proprio_enabled:
+        return sample
+    if args.session_path is None:
+        raise ValueError("Runtime proprio requires --session-path.")
+    states, masks = _build_runtime_proprio_states(args, config=config, recent_seconds=recent_seconds)
+    return dataclasses.replace(
+        sample,
+        recent_robot_states=tuple(tuple(float(value) for value in row) for row in states),
+        recent_robot_state_masks=tuple(tuple(float(value) for value in row) for row in masks),
+        robot_state_dim_names=tuple(f"fastumi14drpy_{index}" for index in range(config.proprio_state_dim)),
+    )
+
+
+def _build_runtime_proprio_states(
+    args: ZeroShotArgs,
+    *,
+    config: HLMemoryConfig,
+    recent_seconds: tuple[float, ...] | list[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    if config.proprio_state_dim != 14:
+        raise ValueError("Runtime trajectory proprio currently expects proprio_state_dim=14.")
+    session_path = pathlib.Path(args.session_path) if args.session_path is not None else None
+    if session_path is None:
+        raise ValueError("Runtime proprio requires --session-path.")
+
+    hand_sources = _resolve_session_proprio_sources(session_path)
+    raw_states = np.zeros((len(recent_seconds), config.proprio_state_dim), dtype=np.float64)
+    masks = np.zeros_like(raw_states)
+    if set(hand_sources) >= {"left", "right"}:
+        _fill_hand_runtime_states(raw_states, masks, seconds=recent_seconds, source=hand_sources["left"], offset=0)
+        _fill_hand_runtime_states(raw_states, masks, seconds=recent_seconds, source=hand_sources["right"], offset=7)
+    elif "single" in hand_sources:
+        _fill_hand_runtime_states(raw_states, masks, seconds=recent_seconds, source=hand_sources["single"], offset=0)
+    elif "left" in hand_sources:
+        _fill_hand_runtime_states(raw_states, masks, seconds=recent_seconds, source=hand_sources["left"], offset=0)
+    elif "right" in hand_sources:
+        # Single-arm runs always occupy the first 7 fastumi dims.
+        _fill_hand_runtime_states(raw_states, masks, seconds=recent_seconds, source=hand_sources["right"], offset=0)
+    else:
+        raise ValueError(f"No runtime proprio source found under {session_path}")
+
+    stats = _load_runtime_proprio_norm_stats(args)
+    mean = np.asarray(stats["mean"], dtype=np.float64)
+    std = np.asarray(stats["std"], dtype=np.float64)
+    if mean.shape[0] != config.proprio_state_dim or std.shape[0] != config.proprio_state_dim:
+        raise ValueError(
+            f"Proprio norm stats dim mismatch: expected {config.proprio_state_dim}, got {mean.shape[0]}/{std.shape[0]}."
+        )
+    normalized = ((raw_states - mean) / std) * masks
+    return normalized, masks
+
+
+@dataclasses.dataclass(frozen=True)
+class _RuntimeProprioSource:
+    timestamps_path: pathlib.Path
+    trajectory_path: pathlib.Path
+
+
+def _resolve_session_proprio_sources(session_path: pathlib.Path) -> dict[str, _RuntimeProprioSource]:
+    sources: dict[str, _RuntimeProprioSource] = {}
+    for hand_dir in _session_hand_dirs(session_path):
+        if hand_dir.name.startswith("left_hand_"):
+            key = "left"
+        elif hand_dir.name.startswith("right_hand_"):
+            key = "right"
+        else:
+            continue
+        sources[key] = _runtime_source_from_dir(hand_dir)
+    if not sources and (session_path / "RGB_Images" / "timestamps.csv").is_file():
+        sources["single"] = _runtime_source_from_dir(session_path)
+    return sources
+
+
+def _runtime_source_from_dir(directory: pathlib.Path) -> _RuntimeProprioSource:
+    return _RuntimeProprioSource(
+        timestamps_path=_required_session_file(directory / "RGB_Images" / "timestamps.csv"),
+        trajectory_path=_required_session_file(directory / "Merged_Trajectory" / "merged_trajectory.txt"),
+    )
+
+
+def _fill_hand_runtime_states(
+    raw_states: np.ndarray,
+    masks: np.ndarray,
+    *,
+    seconds: tuple[float, ...] | list[float],
+    source: _RuntimeProprioSource,
+    offset: int,
+) -> None:
+    video_start_stamp = _read_first_video_timestamp(source.timestamps_path)
+    trajectory = _read_merged_trajectory(source.trajectory_path)
+    for index, second in enumerate(seconds):
+        pose = _nearest_trajectory_pose(trajectory, video_start_stamp + float(second))
+        raw_states[index, offset : offset + 7] = pose
+        masks[index, offset : offset + 7] = 1.0
+
+
+def _read_first_video_timestamp(path: pathlib.Path) -> float:
+    with path.open() as handle:
+        header = next(handle, None)
+        line = next(handle, None)
+    if line is None:
+        raise ValueError(f"Video timestamps CSV is empty: {path}")
+    parts = [part.strip() for part in line.strip().split(",")]
+    if len(parts) < 3:
+        raise ValueError(f"Expected frame_index,seq,header_stamp columns in {path}, got: {line!r}")
+    return float(parts[2])
+
+
+def _read_merged_trajectory(path: pathlib.Path) -> np.ndarray:
+    rows: list[list[float]] = []
+    with path.open() as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            values = [float(value) for value in stripped.split()]
+            if len(values) < 8:
+                continue
+            rows.append(values[:8])
+    if not rows:
+        raise ValueError(f"Merged trajectory is empty or malformed: {path}")
+    trajectory = np.asarray(rows, dtype=np.float64)
+    order = np.argsort(trajectory[:, 0])
+    return trajectory[order]
+
+
+def _nearest_trajectory_pose(trajectory: np.ndarray, timestamp: float) -> np.ndarray:
+    stamps = trajectory[:, 0]
+    index = int(np.searchsorted(stamps, timestamp))
+    if index <= 0:
+        nearest = 0
+    elif index >= len(stamps):
+        nearest = len(stamps) - 1
+    else:
+        previous_index = index - 1
+        nearest = previous_index if abs(stamps[previous_index] - timestamp) <= abs(stamps[index] - timestamp) else index
+    return trajectory[nearest, 1:8]
+
+
+def _load_runtime_proprio_norm_stats(args: ZeroShotArgs) -> dict[str, object]:
+    path = _resolved_proprio_norm_stats_path(args)
+    if path is None:
+        raise ValueError(
+            "Runtime proprio requires --proprio-norm-stats-path or a session path containing a task id "
+            "with /root/Users/dataset/hl_memory/subtask/<task_id>/train/proprio_norm_stats.json."
+        )
+    with path.open() as handle:
+        return json.load(handle)
+
+
+def _resolved_proprio_norm_stats_path(args: ZeroShotArgs) -> pathlib.Path | None:
+    if args.proprio_norm_stats_path is not None:
+        return args.proprio_norm_stats_path
+    if args.session_path is None:
+        return None
+    task_id = _task_id_from_session_path(args.session_path)
+    if task_id is None:
+        return None
+    path = pathlib.Path("/root/Users/dataset/hl_memory/subtask") / task_id / "train" / "proprio_norm_stats.json"
+    return path if path.is_file() else None
+
+
+def _payload_proprio_norm_stats_path(args: ZeroShotArgs) -> str | None:
+    path = _resolved_proprio_norm_stats_path(args)
+    return None if path is None else str(path)
+
+
+def _task_id_from_session_path(path: pathlib.Path) -> str | None:
+    for part in path.parts:
+        if re.fullmatch(r"\d{8}[A-Z]\d{3}[A-Z]?", part):
+            return part
+    return None
 
 
 def _is_primary_process() -> bool:

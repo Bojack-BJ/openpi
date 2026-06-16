@@ -143,6 +143,9 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Forward to export_hl_memory_dataset.py. Use 0 to keep raw progress floats.",
     )
+    parser.add_argument("--proprio-enabled", action="store_true", help="Forward to export_hl_memory_dataset.py.")
+    parser.add_argument("--proprio-state-columns", default="auto", help="Forward to export_hl_memory_dataset.py.")
+    parser.add_argument("--proprio-state-dim", type=int, default=14, help="Forward to export_hl_memory_dataset.py.")
     parser.add_argument("--export-script", type=Path, default=DEFAULT_EXPORT_SCRIPT)
     parser.add_argument("--annotation-script", type=Path, default=DEFAULT_ANNOTATION_SCRIPT)
     parser.add_argument("--summary-json", type=Path, default=None)
@@ -313,6 +316,10 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             "--subtask-progress-quantum",
             str(args.subtask_progress_quantum),
         ]
+        if args.proprio_enabled:
+            cmd.append("--proprio-enabled")
+            cmd.extend(["--proprio-state-columns", args.proprio_state_columns])
+            cmd.extend(["--proprio-state-dim", str(args.proprio_state_dim)])
         if args.source_config_name:
             cmd[2:2] = ["--source-config-name", args.source_config_name]
         if args.overwrite:

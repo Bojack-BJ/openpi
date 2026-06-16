@@ -8,6 +8,7 @@ HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl"]
 Precision = Literal["bfloat16", "float16", "float32"]
 HLVLMParallelMode = Literal["none", "device_map", "tensor_parallel"]
 HLTargetProtocol = Literal["hl_v1", "memer_objective", "subtask_keyframe"]
+HLProprioTokenMode = Literal["per_frame", "summary", "per_frame_plus_summary"]
 
 _DEFAULT_VARIANTS: dict[HLVLMBackend, str | None] = {
     "paligemma": None,
@@ -58,6 +59,12 @@ class HLMemoryConfig:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: HLTargetProtocol = "hl_v1"
+    proprio_enabled: bool = False
+    proprio_token_mode: HLProprioTokenMode = "per_frame_plus_summary"
+    proprio_state_dim: int = 14
+    proprio_hidden_dim: int = 512
+    proprio_dropout: float = 0.0
+    proprio_noise_std: float = 0.0
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
@@ -68,6 +75,16 @@ class HLMemoryConfig:
             raise ValueError("`parallel_mode` must be one of `none`, `device_map`, or `tensor_parallel`.")
         if self.target_protocol not in {"hl_v1", "memer_objective", "subtask_keyframe"}:
             raise ValueError("`target_protocol` must be one of `hl_v1`, `memer_objective`, or `subtask_keyframe`.")
+        if self.proprio_token_mode not in {"per_frame", "summary", "per_frame_plus_summary"}:
+            raise ValueError("`proprio_token_mode` must be one of `per_frame`, `summary`, or `per_frame_plus_summary`.")
+        if self.proprio_state_dim <= 0:
+            raise ValueError("proprio_state_dim must be positive.")
+        if self.proprio_hidden_dim <= 0:
+            raise ValueError("proprio_hidden_dim must be positive.")
+        if not 0.0 <= self.proprio_dropout <= 1.0:
+            raise ValueError("proprio_dropout must be in [0, 1].")
+        if self.proprio_noise_std < 0.0:
+            raise ValueError("proprio_noise_std must be non-negative.")
         if not self.device_map.strip():
             raise ValueError("device_map must be non-empty.")
         if not self.tensor_parallel_plan.strip():

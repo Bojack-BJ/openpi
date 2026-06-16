@@ -22,6 +22,8 @@ from openpi.hl_memory.data import FrameCache
 from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.proprio import save_proprio_state_if_available
+from openpi.hl_memory.proprio import temporarily_unwrap_proprio_embeddings
 
 
 @dataclasses.dataclass
@@ -46,6 +48,12 @@ class TrainArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    proprio_enabled: bool = False
+    proprio_token_mode: str = "per_frame_plus_summary"
+    proprio_state_dim: int = 14
+    proprio_hidden_dim: int = 512
+    proprio_dropout: float = 0.0
+    proprio_noise_std: float = 0.0
     learning_rate: float = 5e-6
     vision_tower_learning_rate: float | None = None
     weight_decay: float = 1e-4
@@ -126,6 +134,12 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        proprio_enabled=args.proprio_enabled,
+        proprio_token_mode=args.proprio_token_mode,
+        proprio_state_dim=args.proprio_state_dim,
+        proprio_hidden_dim=args.proprio_hidden_dim,
+        proprio_dropout=args.proprio_dropout,
+        proprio_noise_std=args.proprio_noise_std,
     )
     adapter = create_hf_adapter(hl_config)
     device = _resolve_training_device(args, distributed=distributed)
@@ -553,7 +567,9 @@ def _sample_batch(samples, batch_size: int, rng: random.Random):
 def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryConfig, train_args: TrainArgs) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     model = loaded.model.module if isinstance(loaded.model, torch.nn.parallel.DistributedDataParallel) else loaded.model
-    model.save_pretrained(output_dir)
+    with temporarily_unwrap_proprio_embeddings(model):
+        model.save_pretrained(output_dir)
+    save_proprio_state_if_available(model, output_dir, hl_config)
     loaded.processor.save_pretrained(output_dir)
     metadata = {
         "hl_memory_config": dataclasses.asdict(hl_config),

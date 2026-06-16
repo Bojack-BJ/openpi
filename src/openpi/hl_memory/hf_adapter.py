@@ -13,6 +13,10 @@ import torch
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
+from openpi.hl_memory.proprio import configure_model_for_proprio
+from openpi.hl_memory.proprio import load_proprio_state_if_available
+from openpi.hl_memory.proprio import render_proprio_token_text
+from openpi.hl_memory.proprio import set_model_proprio_batch
 from openpi.hl_memory.schema import HLMemoryPrediction
 from openpi.hl_memory.schema import render_language_memory_fields
 
@@ -71,6 +75,8 @@ class BaseHLVLMAdapter:
             model = self._load_model(transformers, pretrained_path, torch_dtype=torch_dtype)
         else:
             model = self._load_peft_model(transformers, peft_adapter_path, torch_dtype=torch_dtype)
+        configure_model_for_proprio(model, processor, self.config)
+        load_proprio_state_if_available(model, pathlib.Path(pretrained_path))
         logging.info("[stage] model weights loaded in %.1fs", time.perf_counter() - model_started_at)
         if self._uses_parallel_model_loading():
             logging.info(
@@ -108,6 +114,7 @@ class BaseHLVLMAdapter:
             if isinstance(value, torch.Tensor)
         }
         tensors["labels"] = labels.to(input_device)
+        set_model_proprio_batch(loaded.model, [sample], self.config, device=input_device)
         return tensors
 
     def prepare_training_batch_inputs(
@@ -137,6 +144,7 @@ class BaseHLVLMAdapter:
             if isinstance(value, torch.Tensor)
         }
         tensors["labels"] = labels.to(input_device)
+        set_model_proprio_batch(loaded.model, samples, self.config, device=input_device)
         return tensors
 
     def predict(
@@ -175,6 +183,7 @@ class BaseHLVLMAdapter:
             for key, value in inputs.items()
             if isinstance(value, torch.Tensor)
         }
+        set_model_proprio_batch(loaded.model, [sample], self.config, device=input_device)
         tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         generation_kwargs: dict[str, Any] = {}
         pad_token_id = getattr(tokenizer, "pad_token_id", None)
@@ -225,6 +234,7 @@ class BaseHLVLMAdapter:
             for key, value in inputs.items()
             if isinstance(value, torch.Tensor)
         }
+        set_model_proprio_batch(loaded.model, samples, self.config, device=input_device)
         tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         generation_kwargs: dict[str, Any] = {}
         pad_token_id = getattr(tokenizer, "pad_token_id", None)
@@ -301,10 +311,11 @@ class BaseHLVLMAdapter:
         return tokenizer.decode(generated_suffix[0], skip_special_tokens=True)
 
     def build_prompt(self, sample: ExportedHLMemorySample, clips: LoadedVideoClips) -> str:
+        proprio_prefix = render_proprio_token_text(sample, self.config)
         if self.config.target_protocol == "memer_objective":
-            return self._build_memer_objective_prompt(sample, clips)
+            return proprio_prefix + self._build_memer_objective_prompt(sample, clips)
         if self.config.target_protocol == "subtask_keyframe":
-            return self._build_subtask_keyframe_prompt(sample, clips)
+            return proprio_prefix + self._build_subtask_keyframe_prompt(sample, clips)
         previous_memory = sample.language_memory.strip() or "No progress has been recorded yet."
         step_prior = _render_step_prior(sample.step_prior)
         current_width, current_height = _current_recent_frame_size(clips)
@@ -316,6 +327,8 @@ class BaseHLVLMAdapter:
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
         return (
+            proprio_prefix
+            +
             "You receive two ordered video clips.\n"
             "The first clip contains selected historical keyframes: sparse frames of particular importance from "
             "earlier actions the robot has executed.\n"

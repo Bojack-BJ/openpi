@@ -10,6 +10,7 @@ import os
 import pathlib
 import random
 import time
+from contextlib import contextmanager
 from contextlib import nullcontext
 from typing import NamedTuple
 
@@ -24,6 +25,9 @@ from openpi.hl_memory.data import FrameCache
 from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.proprio import proprio_base_embedding_modules
+from openpi.hl_memory.proprio import save_proprio_state_if_available
+from openpi.hl_memory.proprio import temporarily_unwrap_proprio_embeddings
 
 
 
@@ -93,6 +97,12 @@ class TrainArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    proprio_enabled: bool = False
+    proprio_token_mode: str = "per_frame_plus_summary"
+    proprio_state_dim: int = 14
+    proprio_hidden_dim: int = 512
+    proprio_dropout: float = 0.0
+    proprio_noise_std: float = 0.0
     learning_rate: float = 5e-6
     vision_tower_learning_rate: float | None = None
     weight_decay: float = 1e-4
@@ -124,6 +134,10 @@ class TrainArgs:
     wandb_project: str = "openpi-hl-memory"
     wandb_run_name: str | None = None
     wandb_entity: str | None = None
+    profile_steps: int = 0
+    profile_start_step: int = 1
+    profile_trace_dir: pathlib.Path | None = None
+    profile_record_shapes: bool = False
 
 
 def main(args: TrainArgs) -> None:
@@ -200,6 +214,12 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        proprio_enabled=args.proprio_enabled,
+        proprio_token_mode=args.proprio_token_mode,
+        proprio_state_dim=args.proprio_state_dim,
+        proprio_hidden_dim=args.proprio_hidden_dim,
+        proprio_dropout=args.proprio_dropout,
+        proprio_noise_std=args.proprio_noise_std,
     )
     adapter = create_hf_adapter(hl_config)
     device = _resolve_training_device(args, distributed=distributed)
@@ -251,6 +271,9 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     running_loss = 0.0
     running_data_time = 0.0
     running_step_time = 0.0
+    running_forward_time = 0.0
+    running_backward_time = 0.0
+    running_optim_time = 0.0
 
     progress = tqdm(
         range(1, args.num_train_steps + 1),
@@ -261,65 +284,107 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     )
     try:
         for step in progress:
+            profile_step = _should_profile_step(args, step)
+            if profile_step and device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
             step_start_time = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             step_loss = 0.0
             step_data_time = 0.0
-            for accum_index in range(args.grad_accum_steps):
-                batch = _sample_batch(samples, args.batch_size, rng)
-                micro_loss = 0.0
-                sync_gradients = accum_index == args.grad_accum_steps - 1
-                sync_context = (
-                    loaded.model.no_sync()
-                    if _should_use_no_sync(loaded.model, sync_gradients=sync_gradients)
-                    else nullcontext()
-                )
-                with sync_context:
-                    batch_samples = [_maybe_apply_training_dropouts(item.sample, args=args, rng=rng) for item in batch]
-                    data_start_time = time.perf_counter()
-                    batch_clips = [
-                        load_video_clips_for_sample(sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
-                        for item, sample in zip(batch, batch_samples, strict=True)
-                    ]
-                    inputs = adapter.prepare_training_batch_inputs(loaded, batch_samples, batch_clips, device=device)
-                    supervised_tokens = (inputs["labels"] != -100).sum(dim=1).detach().cpu().tolist()
-                    bad_indices = [index for index, count in enumerate(supervised_tokens) if int(count) <= 0]
-                    if bad_indices:
-                        bad_sample = batch_samples[bad_indices[0]]
-                        raise ValueError(
-                            f"HL sample {bad_sample.sample_id} produced zero supervised target tokens after label masking. "
-                            "This would make the language-model loss NaN."
-                        )
-                    step_data_time += time.perf_counter() - data_start_time
-                    loss = _compute_target_loss(loaded.model, inputs)
-                    loss_value = float(loss.detach().cpu())
-                    if not math.isfinite(loss_value):
-                        sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
-                        raise FloatingPointError(
-                            f"Non-finite HL loss for batch sample_ids={sample_ids}: loss={loss_value} "
-                            f"input_shape={tuple(inputs['input_ids'].shape)}. "
-                            "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
-                        )
-                    micro_loss += loss_value / args.grad_accum_steps
-                    grad_scaler.scale(loss / args.grad_accum_steps).backward()
-                step_loss += micro_loss
+            step_forward_time = 0.0
+            step_backward_time = 0.0
+            step_optim_time = 0.0
+            with _torch_profiler_context(args, step, is_main=is_main, device=device) as torch_prof:
+                for accum_index in range(args.grad_accum_steps):
+                    batch = _sample_batch(samples, args.batch_size, rng)
+                    micro_loss = 0.0
+                    sync_gradients = accum_index == args.grad_accum_steps - 1
+                    sync_context = (
+                        loaded.model.no_sync()
+                        if _should_use_no_sync(loaded.model, sync_gradients=sync_gradients)
+                        else nullcontext()
+                    )
+                    with sync_context:
+                        batch_samples = [_maybe_apply_training_dropouts(item.sample, args=args, rng=rng) for item in batch]
+                        _maybe_cuda_synchronize(device, enabled=profile_step)
+                        data_start_time = time.perf_counter()
+                        batch_clips = [
+                            load_video_clips_for_sample(sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
+                            for item, sample in zip(batch, batch_samples, strict=True)
+                        ]
+                        inputs = adapter.prepare_training_batch_inputs(loaded, batch_samples, batch_clips, device=device)
+                        _maybe_cuda_synchronize(device, enabled=profile_step)
+                        step_data_time += time.perf_counter() - data_start_time
+                        supervised_tokens = (inputs["labels"] != -100).sum(dim=1).detach().cpu().tolist()
+                        bad_indices = [index for index, count in enumerate(supervised_tokens) if int(count) <= 0]
+                        if bad_indices:
+                            bad_sample = batch_samples[bad_indices[0]]
+                            raise ValueError(
+                                f"HL sample {bad_sample.sample_id} produced zero supervised target tokens after label masking. "
+                                "This would make the language-model loss NaN."
+                            )
+                        forward_start_time = time.perf_counter()
+                        loss = _compute_target_loss(loaded.model, inputs)
+                        _maybe_cuda_synchronize(device, enabled=profile_step)
+                        step_forward_time += time.perf_counter() - forward_start_time
+                        loss_value = float(loss.detach().cpu())
+                        if not math.isfinite(loss_value):
+                            sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
+                            raise FloatingPointError(
+                                f"Non-finite HL loss for batch sample_ids={sample_ids}: loss={loss_value} "
+                                f"input_shape={tuple(inputs['input_ids'].shape)}. "
+                                "Try --precision bfloat16 on bf16-capable GPUs, or reduce learning rate."
+                            )
+                        micro_loss += loss_value / args.grad_accum_steps
+                        backward_start_time = time.perf_counter()
+                        grad_scaler.scale(loss / args.grad_accum_steps).backward()
+                        _maybe_cuda_synchronize(device, enabled=profile_step)
+                        step_backward_time += time.perf_counter() - backward_start_time
+                    step_loss += micro_loss
+                    if torch_prof is not None:
+                        torch_prof.step()
 
-            grad_scaler.unscale_(optimizer)
-            _clip_grad_norm(loaded.model, args.max_grad_norm)
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
+                _maybe_cuda_synchronize(device, enabled=profile_step)
+                optim_start_time = time.perf_counter()
+                grad_scaler.unscale_(optimizer)
+                _clip_grad_norm(loaded.model, args.max_grad_norm)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+                _maybe_cuda_synchronize(device, enabled=profile_step)
+                step_optim_time += time.perf_counter() - optim_start_time
             step_elapsed = time.perf_counter() - step_start_time
             logged_step_loss = _mean_across_ranks(step_loss, device=device) if distributed else step_loss
             running_loss += logged_step_loss
             logged_data_time = _mean_across_ranks(step_data_time, device=device) if distributed else step_data_time
             logged_step_time = _mean_across_ranks(step_elapsed, device=device) if distributed else step_elapsed
+            logged_forward_time = _mean_across_ranks(step_forward_time, device=device) if distributed else step_forward_time
+            logged_backward_time = _mean_across_ranks(step_backward_time, device=device) if distributed else step_backward_time
+            logged_optim_time = _mean_across_ranks(step_optim_time, device=device) if distributed else step_optim_time
             running_data_time += logged_data_time
             running_step_time += logged_step_time
+            running_forward_time += logged_forward_time
+            running_backward_time += logged_backward_time
+            running_optim_time += logged_optim_time
+            if profile_step and is_main:
+                logging.info(
+                    "profile step=%d data=%.3fs forward=%.3fs backward=%.3fs optim=%.3fs total=%.3fs mem_alloc=%s mem_reserved=%s",
+                    step,
+                    logged_data_time,
+                    logged_forward_time,
+                    logged_backward_time,
+                    logged_optim_time,
+                    logged_step_time,
+                    _format_cuda_memory(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else "n/a",
+                    _format_cuda_memory(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else "n/a",
+                )
 
             if is_main and step % args.log_interval == 0:
                 avg_loss = running_loss / args.log_interval
                 avg_data_time = running_data_time / args.log_interval
                 avg_step_time = running_step_time / args.log_interval
+                avg_forward_time = running_forward_time / args.log_interval
+                avg_backward_time = running_backward_time / args.log_interval
+                avg_optim_time = running_optim_time / args.log_interval
                 data_fraction = avg_data_time / max(avg_step_time, 1e-6)
                 progress.set_postfix(
                     loss=f"{avg_loss:.6f}",
@@ -339,8 +404,14 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     {
                         "train/loss": avg_loss,
                         "time/data_s_per_it": avg_data_time,
+                        "time/forward_s_per_it": avg_forward_time,
+                        "time/backward_s_per_it": avg_backward_time,
+                        "time/optim_s_per_it": avg_optim_time,
                         "time/step_s_per_it": avg_step_time,
                         "time/data_fraction": data_fraction,
+                        "time/forward_fraction": avg_forward_time / max(avg_step_time, 1e-6),
+                        "time/backward_fraction": avg_backward_time / max(avg_step_time, 1e-6),
+                        "time/optim_fraction": avg_optim_time / max(avg_step_time, 1e-6),
                         **_optimizer_lr_metrics(optimizer),
                         "train/global_batch_size": args.batch_size * args.grad_accum_steps * world_size,
                     },
@@ -349,6 +420,9 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                 running_loss = 0.0
                 running_data_time = 0.0
                 running_step_time = 0.0
+                running_forward_time = 0.0
+                running_backward_time = 0.0
+                running_optim_time = 0.0
             if val_samples and step % args.val_interval == 0:
                 val_started_at = time.perf_counter()
                 val_loss = _evaluate_loss(
@@ -416,6 +490,8 @@ class FSDPReport(NamedTuple):
     ignored_modules: tuple[torch.nn.Module, ...]
     candidate_wrap_count: int
     candidate_wrap_params: int
+    vision_candidate_wrap_count: int
+    vision_candidate_wrap_params: int
 
 
 def _resolve_dataset_dirs(args: TrainArgs) -> list[pathlib.Path]:
@@ -655,6 +731,10 @@ def _configure_vision_tower_training(model: torch.nn.Module, *, args: TrainArgs,
             preview,
             suffix,
         )
+        if mode == "frozen":
+            logging.info(
+                "Frozen vision tower is not explicitly wrapped in torch.no_grad(); forward still runs and FSDP may still all-gather wrapped vision parameters."
+            )
 
 
 def _find_vision_block_modules(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
@@ -764,7 +844,10 @@ def _build_fsdp_report(model: torch.nn.Module, *, args: TrainArgs, world_size: i
     ignored_params = _unique_module_param_count(ignored_modules)
     candidate_wrap_count = 0
     candidate_wrap_params = 0
+    vision_candidate_wrap_count = 0
+    vision_candidate_wrap_params = 0
     ignored_ids = {id(module) for module in ignored_modules}
+    module_names = {id(module): name for name, module in model.named_modules()}
     for module in model.modules():
         if id(module) in ignored_ids:
             continue
@@ -772,6 +855,9 @@ def _build_fsdp_report(model: torch.nn.Module, *, args: TrainArgs, world_size: i
         if module_params >= args.fsdp_min_num_params:
             candidate_wrap_count += 1
             candidate_wrap_params += module_params
+            if _is_vision_module_name(module_names.get(id(module), "")):
+                vision_candidate_wrap_count += 1
+                vision_candidate_wrap_params += module_params
     return FSDPReport(
         total_params=total_params,
         trainable_params=trainable_params,
@@ -783,6 +869,8 @@ def _build_fsdp_report(model: torch.nn.Module, *, args: TrainArgs, world_size: i
         ignored_modules=ignored_modules,
         candidate_wrap_count=candidate_wrap_count,
         candidate_wrap_params=candidate_wrap_params,
+        vision_candidate_wrap_count=vision_candidate_wrap_count,
+        vision_candidate_wrap_params=vision_candidate_wrap_params,
     )
 
 
@@ -791,7 +879,8 @@ def _log_fsdp_report(report: FSDPReport) -> None:
     logging.info(
         "FSDP report: total_params=%s trainable_params=%s ignored_replicated_params=%s "
         "estimated_sharded_params=%s estimated_params_per_rank=%s world_size=%d fsdp_min_num_params=%d "
-        "candidate_direct_wrap_modules=%d candidate_direct_wrap_params=%s",
+        "candidate_direct_wrap_modules=%d candidate_direct_wrap_params=%s "
+        "vision_candidate_direct_wrap_modules=%d vision_candidate_direct_wrap_params=%s",
         _format_count(report.total_params),
         _format_count(report.trainable_params),
         _format_count(report.ignored_params),
@@ -801,6 +890,8 @@ def _log_fsdp_report(report: FSDPReport) -> None:
         report.min_num_params,
         report.candidate_wrap_count,
         _format_count(report.candidate_wrap_params),
+        report.vision_candidate_wrap_count,
+        _format_count(report.vision_candidate_wrap_params),
     )
     logging.info("FSDP ignored replicated modules: %s", ", ".join(report.ignored_module_names) or "none")
 
@@ -812,6 +903,13 @@ def _fsdp_ignored_named_modules(model: torch.nn.Module) -> list[tuple[str, torch
     ignored: list[tuple[str, torch.nn.Module]] = []
     seen: set[int] = set()
     module_names = {id(module): name for name, module in model.named_modules()}
+    for module in proprio_base_embedding_modules(model):
+        if id(module) in seen:
+            continue
+        parameters = list(module.parameters(recurse=True))
+        if parameters and not any(parameter.requires_grad for parameter in parameters):
+            ignored.append((module_names.get(id(module), "proprio_base_embedding"), module))
+            seen.add(id(module))
     for accessor_name in ("get_input_embeddings", "get_output_embeddings"):
         accessor = getattr(model, accessor_name, None)
         if not callable(accessor):
@@ -994,6 +1092,48 @@ def _mean_across_ranks(value: float, *, device: torch.device) -> float:
     return float(tensor.detach().cpu())
 
 
+def _should_profile_step(args: TrainArgs, step: int) -> bool:
+    if args.profile_steps <= 0:
+        return False
+    return args.profile_start_step <= step < args.profile_start_step + args.profile_steps
+
+
+def _maybe_cuda_synchronize(device: torch.device, *, enabled: bool) -> None:
+    if enabled and device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _format_cuda_memory(num_bytes: int) -> str:
+    return f"{num_bytes / (1024**3):.2f}GiB"
+
+
+@contextmanager
+def _torch_profiler_context(args: TrainArgs, step: int, *, is_main: bool, device: torch.device):
+    if not is_main or args.profile_trace_dir is None or not _should_profile_step(args, step):
+        yield None
+        return
+    try:
+        from torch.profiler import ProfilerActivity
+        from torch.profiler import profile
+    except ImportError as exc:
+        raise ImportError("Torch profiler is unavailable in this PyTorch build.") from exc
+
+    activities = [ProfilerActivity.CPU]
+    if device.type == "cuda":
+        activities.append(ProfilerActivity.CUDA)
+    args.profile_trace_dir.mkdir(parents=True, exist_ok=True)
+    trace_path = args.profile_trace_dir / f"hl_train_step_{step:06d}.json"
+    with profile(
+        activities=activities,
+        record_shapes=args.profile_record_shapes,
+        profile_memory=True,
+        with_stack=False,
+    ) as torch_prof:
+        yield torch_prof
+    torch_prof.export_chrome_trace(str(trace_path))
+    logging.info("Exported torch profiler trace: %s", trace_path)
+
+
 def _init_wandb(args: TrainArgs, *, sample_count: int, val_sample_count: int, world_size: int):
     if not args.wandb_enabled:
         return None
@@ -1048,20 +1188,24 @@ def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryCon
             from torch.distributed.fsdp import StateDictType
         except ImportError as exc:
             raise ImportError("Saving FSDP checkpoints requires torch.distributed.fsdp support.") from exc
-        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FullyShardedDataParallel.state_dict_type(loaded.model, StateDictType.FULL_STATE_DICT, save_policy):
-            state_dict = loaded.model.state_dict()
         model = loaded.model.module
-        if not is_main:
-            return
-        output_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(output_dir, state_dict=state_dict)
+        with temporarily_unwrap_proprio_embeddings(model):
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FullyShardedDataParallel.state_dict_type(loaded.model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = loaded.model.state_dict()
+            if not is_main:
+                return
+            output_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(output_dir, state_dict=state_dict)
+        save_proprio_state_if_available(model, output_dir, hl_config)
     else:
         if not is_main:
             return
         output_dir.mkdir(parents=True, exist_ok=True)
         model = loaded.model.module if isinstance(loaded.model, torch.nn.parallel.DistributedDataParallel) else loaded.model
-        model.save_pretrained(output_dir)
+        with temporarily_unwrap_proprio_embeddings(model):
+            model.save_pretrained(output_dir)
+        save_proprio_state_if_available(model, output_dir, hl_config)
     loaded.processor.save_pretrained(output_dir)
     metadata = {
         "hl_memory_config": dataclasses.asdict(hl_config),

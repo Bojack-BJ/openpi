@@ -85,6 +85,20 @@ def test_subtask_keyframe_target_uses_current_objective_and_keyframes():
     assert prediction.should_advance_objective is None
 
 
+def test_sample_round_trips_proprio_fields():
+    sample = _sample(
+        recent_robot_states=((0.1, 0.2), (0.3, 0.4)),
+        recent_robot_state_masks=((1.0, 0.0), (1.0, 1.0)),
+        robot_state_dim_names=("joint_0", "joint_1"),
+    )
+
+    loaded = ExportedHLMemorySample.from_dict(sample.to_dict())
+
+    assert loaded.recent_robot_states == ((0.1, 0.2), (0.3, 0.4))
+    assert loaded.recent_robot_state_masks == ((1.0, 0.0), (1.0, 1.0))
+    assert loaded.robot_state_dim_names == ("joint_0", "joint_1")
+
+
 def test_load_video_clips_for_sample_pads_and_tracks_valid_lengths():
     with tempfile.TemporaryDirectory() as tmp_dir:
         root = pathlib.Path(tmp_dir)

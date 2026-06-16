@@ -94,3 +94,16 @@ def test_target_protocol_accepts_subtask_keyframe():
 def test_target_protocol_rejects_unknown_value():
     with pytest.raises(ValueError, match="target_protocol"):
         HLMemoryConfig(target_protocol="unknown")  # type: ignore[arg-type]
+
+
+def test_proprio_config_accepts_soft_token_modes():
+    config = HLMemoryConfig(proprio_enabled=True, proprio_token_mode="per_frame_plus_summary")
+
+    assert config.proprio_enabled is True
+    assert config.proprio_state_dim == 14
+    assert config.proprio_hidden_dim == 512
+
+
+def test_proprio_config_rejects_unknown_token_mode():
+    with pytest.raises(ValueError, match="proprio_token_mode"):
+        HLMemoryConfig(proprio_enabled=True, proprio_token_mode="none")  # type: ignore[arg-type]

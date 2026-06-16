@@ -44,6 +44,12 @@ class EvalArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    proprio_enabled: bool = False
+    proprio_token_mode: str = "per_frame_plus_summary"
+    proprio_state_dim: int = 14
+    proprio_hidden_dim: int = 512
+    proprio_dropout: float = 0.0
+    proprio_noise_std: float = 0.0
     output_json: pathlib.Path | None = None
     prediction_jsonl: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,6 +111,12 @@ def main(args: EvalArgs) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        proprio_enabled=args.proprio_enabled,
+        proprio_token_mode=args.proprio_token_mode,
+        proprio_state_dim=args.proprio_state_dim,
+        proprio_hidden_dim=args.proprio_hidden_dim,
+        proprio_dropout=args.proprio_dropout,
+        proprio_noise_std=args.proprio_noise_std,
     )
     logging.info("[stage] creating adapter")
     adapter = create_hf_adapter(hl_config)

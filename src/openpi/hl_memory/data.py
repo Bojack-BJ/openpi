@@ -81,6 +81,9 @@ class ExportedHLMemorySample:
     horizon_current_objective: str = ""
     horizon_current_subtask: str = ""
     horizon_phase: str = ""
+    recent_robot_states: tuple[tuple[float, ...], ...] = ()
+    recent_robot_state_masks: tuple[tuple[float, ...], ...] = ()
+    robot_state_dim_names: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ExportedHLMemorySample":
@@ -120,6 +123,9 @@ class ExportedHLMemorySample:
             horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
             horizon_current_subtask=str(data.get("horizon_current_subtask", "")).strip(),
             horizon_phase=str(data.get("horizon_phase", "")).strip(),
+            recent_robot_states=_parse_float_matrix(data.get("recent_robot_states", ())),
+            recent_robot_state_masks=_parse_float_matrix(data.get("recent_robot_state_masks", ())),
+            robot_state_dim_names=tuple(str(value) for value in data.get("robot_state_dim_names", ())),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -157,6 +163,9 @@ class ExportedHLMemorySample:
             "horizon_current_objective": self.horizon_current_objective,
             "horizon_current_subtask": self.horizon_current_subtask,
             "horizon_phase": self.horizon_phase,
+            "recent_robot_states": [list(row) for row in self.recent_robot_states],
+            "recent_robot_state_masks": [list(row) for row in self.recent_robot_state_masks],
+            "robot_state_dim_names": list(self.robot_state_dim_names),
         }
 
     def target_prediction(self, *, target_protocol: str = "hl_v1") -> HLMemoryPrediction:
@@ -372,6 +381,19 @@ def _parse_optional_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_float_matrix(value: object) -> tuple[tuple[float, ...], ...]:
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, list | tuple):
+        return ()
+    rows: list[tuple[float, ...]] = []
+    for row in value:
+        if not isinstance(row, list | tuple):
+            continue
+        rows.append(tuple(float(item) for item in row))
+    return tuple(rows)
 
 
 def build_loaded_video_clips_from_frames(

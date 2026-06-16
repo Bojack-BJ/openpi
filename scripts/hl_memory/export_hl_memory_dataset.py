@@ -68,6 +68,9 @@ class ExportArgs:
     frame_height: int = 224
     frame_width: int = 456
     subtask_progress_quantum: float = 0.05
+    proprio_enabled: bool = False
+    proprio_state_columns: str = "auto"
+    proprio_state_dim: int = 14
     overwrite: bool = False
 
 
@@ -85,7 +88,13 @@ def main(args: ExportArgs) -> None:
         args.visual_mode,
         args.image_columns,
     )
-    raw_dataset = _create_hl_export_dataset(data_config, visual_mode=args.visual_mode, image_columns=args.image_columns)
+    raw_dataset, proprio_state_columns = _create_hl_export_dataset(
+        data_config,
+        visual_mode=args.visual_mode,
+        image_columns=args.image_columns,
+        proprio_enabled=args.proprio_enabled,
+        proprio_state_columns=args.proprio_state_columns,
+    )
     logging.info("HL export dataset ready in %.1fs; len=%d", time.perf_counter() - start_time, len(raw_dataset))
     export_dataset = data_loader.TransformedDataset(
         raw_dataset,
@@ -115,6 +124,7 @@ def main(args: ExportArgs) -> None:
     )
 
     all_episode_items = sorted(episode_to_annotations.items())
+    shared_proprio_norm_stats: dict[str, Any] | None = None
     for split_name, output_dir in export_targets:
         split_start_time = time.perf_counter()
         sorted_episode_items = _filter_episode_items(
@@ -135,7 +145,7 @@ def main(args: ExportArgs) -> None:
             args.split_seed,
             output_dir,
         )
-        _export_split(
+        split_proprio_norm_stats = _export_split(
             split_name=split_name,
             output_dir=output_dir,
             sorted_episode_items=sorted_episode_items,
@@ -144,8 +154,12 @@ def main(args: ExportArgs) -> None:
             export_dataset=export_dataset,
             episode_to_indices=episode_to_indices,
             hl_config=hl_config,
+            proprio_state_columns=proprio_state_columns,
+            proprio_norm_stats=shared_proprio_norm_stats,
             elapsed_start_time=split_start_time,
         )
+        if args.proprio_enabled and split_name == "train":
+            shared_proprio_norm_stats = split_proprio_norm_stats
 
     logging.info("HL export complete for %d output target(s) in %.1fs", len(export_targets), time.perf_counter() - start_time)
 
@@ -160,8 +174,10 @@ def _export_split(
     export_dataset: data_loader.Dataset,
     episode_to_indices: dict[int, list[int]],
     hl_config: HLMemoryConfig,
+    proprio_state_columns: tuple[str, ...],
+    proprio_norm_stats: dict[str, Any] | None,
     elapsed_start_time: float,
-) -> None:
+) -> dict[str, Any] | None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "frames").mkdir(exist_ok=True)
     frame_cache: dict[int, str] = {}
@@ -201,15 +217,26 @@ def _export_split(
                 episode_annotations=episode_annotations,
                 global_indices=episode_to_indices[episode_index],
                 dataset=export_dataset,
+                raw_dataset=raw_dataset,
                 output_dir=output_dir,
                 frame_cache=frame_cache,
                 hl_config=hl_config,
                 subtask_progress_quantum=args.subtask_progress_quantum,
+                proprio_state_columns=proprio_state_columns,
+                proprio_state_dim=args.proprio_state_dim,
             )
         )
 
     if skipped_episodes:
         logging.warning("Skipped %d annotation episodes missing from dataset: %s", len(skipped_episodes), skipped_episodes[:20])
+
+    active_proprio_norm_stats: dict[str, Any] | None = None
+    if args.proprio_enabled:
+        active_proprio_norm_stats = proprio_norm_stats or _compute_proprio_norm_stats(samples, state_dim=args.proprio_state_dim)
+        samples = _apply_proprio_norm_stats(samples, active_proprio_norm_stats)
+        (output_dir / "proprio_norm_stats.json").write_text(
+            json.dumps(active_proprio_norm_stats, indent=2, ensure_ascii=True) + "\n"
+        )
 
     _write_jsonl(output_dir / "samples.jsonl", [sample.to_dict() for sample in samples])
     metadata = {
@@ -227,6 +254,10 @@ def _export_split(
         "selected_episode_indices": [episode_index for episode_index, _ in sorted_episode_items],
         "num_samples": len(samples),
         "skipped_missing_episode_indices": skipped_episodes,
+        "proprio_enabled": args.proprio_enabled,
+        "proprio_state_columns": list(proprio_state_columns),
+        "proprio_state_dim": args.proprio_state_dim,
+        "proprio_norm_stats": None if active_proprio_norm_stats is None else "proprio_norm_stats.json",
         "export_config": _export_config_metadata(hl_config),
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
@@ -237,6 +268,7 @@ def _export_split(
         output_dir,
         time.perf_counter() - elapsed_start_time,
     )
+    return active_proprio_norm_stats
 
 
 def _apply_export_overrides(config: Any, args: ExportArgs) -> Any:
@@ -357,7 +389,14 @@ def _load_training_config() -> Any:
     return training_config
 
 
-def _create_hl_export_dataset(data_config: Any, *, visual_mode: str, image_columns: str) -> data_loader.Dataset:
+def _create_hl_export_dataset(
+    data_config: Any,
+    *,
+    visual_mode: str,
+    image_columns: str,
+    proprio_enabled: bool,
+    proprio_state_columns: str,
+) -> tuple[data_loader.Dataset, tuple[str, ...]]:
     repo_id = data_config.repo_id
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create HL export dataset.")
@@ -366,7 +405,13 @@ def _create_hl_export_dataset(data_config: Any, *, visual_mode: str, image_colum
 
     dataset_root = openpi_lerobot_dataset.HF_LEROBOT_HOME / repo_id
     dataset_meta = _load_lerobot_metadata(repo_id, dataset_root)
-    selected_columns = _resolve_hl_export_columns(data_config, dataset_meta, image_columns=image_columns)
+    selected_columns, resolved_proprio_state_columns = _resolve_hl_export_columns(
+        data_config,
+        dataset_meta,
+        image_columns=image_columns,
+        proprio_enabled=proprio_enabled,
+        proprio_state_columns=proprio_state_columns,
+    )
     parquet_files = sorted((dataset_root / "data").glob("**/*.parquet"))
     if not parquet_files:
         raise FileNotFoundError(f"No parquet files found under {dataset_root / 'data'}")
@@ -390,7 +435,7 @@ def _create_hl_export_dataset(data_config: Any, *, visual_mode: str, image_colum
                 )
             ],
         )
-    return dataset
+    return dataset, resolved_proprio_state_columns
 
 
 @dataclasses.dataclass(frozen=True)
@@ -421,7 +466,14 @@ def _load_lerobot_metadata(repo_id: str, dataset_root: pathlib.Path) -> Any:
         return _LocalLeRobotMetadata(features=dict(info.get("features", {})), tasks=tasks)
 
 
-def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any, *, image_columns: str) -> tuple[str, ...]:
+def _resolve_hl_export_columns(
+    data_config: Any,
+    dataset_meta: Any,
+    *,
+    image_columns: str,
+    proprio_enabled: bool,
+    proprio_state_columns: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
     features = dict(getattr(dataset_meta, "features", {}) or {})
     existing_columns = set(features)
     selected: list[str] = []
@@ -465,7 +517,14 @@ def _resolve_hl_export_columns(data_config: Any, dataset_meta: Any, *, image_col
             "Could not resolve any image columns for HL export. "
             f"image_columns={image_columns!r}, available={_available_image_columns(existing_columns)}"
         )
-    return tuple(selected)
+    resolved_proprio_state_columns = _resolve_proprio_state_columns(
+        existing_columns,
+        enabled=proprio_enabled,
+        mode_or_columns=proprio_state_columns,
+    )
+    for column in resolved_proprio_state_columns:
+        _append_existing_column(selected, column, existing_columns)
+    return tuple(selected), resolved_proprio_state_columns
 
 
 def _parse_image_columns(value: str) -> tuple[str, ...]:
@@ -480,6 +539,34 @@ def _parse_image_columns(value: str) -> tuple[str, ...]:
     if not columns:
         raise ValueError("--image-columns must be `auto`, `config`, or a comma-separated image column list.")
     return tuple(columns)
+
+
+def _resolve_proprio_state_columns(
+    existing_columns: set[str],
+    *,
+    enabled: bool,
+    mode_or_columns: str,
+) -> tuple[str, ...]:
+    if not enabled:
+        return ()
+    mode_or_columns = (mode_or_columns or "auto").strip()
+    if mode_or_columns == "auto":
+        if "observation.state" in existing_columns:
+            return ("observation.state",)
+        columns = tuple(sorted(column for column in existing_columns if column.startswith("observation.state.")))
+        if columns:
+            return columns
+        raise ValueError(
+            "Could not resolve proprio state columns automatically. Expected `observation.state` or "
+            "`observation.state.*`; pass --proprio-state-columns explicitly."
+        )
+    columns = tuple(column.strip() for column in mode_or_columns.split(",") if column.strip())
+    if not columns:
+        raise ValueError("--proprio-state-columns must be `auto` or a comma-separated column list.")
+    missing = [column for column in columns if column not in existing_columns]
+    if missing:
+        raise ValueError(f"Requested proprio state columns are missing from LeRobot metadata: {missing}")
+    return columns
 
 
 def _available_image_columns(existing_columns: set[str]) -> list[str]:
@@ -523,10 +610,13 @@ def _export_episode(
     episode_annotations: list[Any],
     global_indices: list[int],
     dataset: data_loader.Dataset,
+    raw_dataset: data_loader.Dataset,
     output_dir: pathlib.Path,
     frame_cache: dict[int, str],
     hl_config: HLMemoryConfig,
     subtask_progress_quantum: float,
+    proprio_state_columns: tuple[str, ...],
+    proprio_state_dim: int,
 ) -> list[ExportedHLMemorySample]:
     episode_start_time = time.perf_counter()
     progress_state = TaskProgressState()
@@ -562,6 +652,17 @@ def _export_episode(
             _ensure_frame_saved(global_index, dataset[global_index], output_dir=output_dir, cache=frame_cache, hl_config=hl_config)
             for global_index in recent_global_indices
         )
+        recent_robot_states: tuple[tuple[float, ...], ...] = ()
+        recent_robot_state_masks: tuple[tuple[float, ...], ...] = ()
+        robot_state_dim_names: tuple[str, ...] = ()
+        if proprio_state_columns:
+            extracted_states = [
+                _extract_robot_state(raw_dataset[global_index], proprio_state_columns, state_dim=proprio_state_dim)
+                for global_index in recent_global_indices
+            ]
+            recent_robot_states = tuple(state for state, _ in extracted_states)
+            recent_robot_state_masks = tuple(mask for _, mask in extracted_states)
+            robot_state_dim_names = _fastumi_state_dim_names(proprio_state_dim)
         memory_frame_indices = tuple(
             index for index in keyframe_memory.visible_indices(recent_local_indices) if global_indices[index] in frame_cache
         )
@@ -607,6 +708,9 @@ def _export_episode(
             horizon_current_objective=annotation.horizon_current_objective,
             horizon_current_subtask=annotation.horizon_current_subtask,
             horizon_phase=annotation.horizon_phase,
+            recent_robot_states=recent_robot_states,
+            recent_robot_state_masks=recent_robot_state_masks,
+            robot_state_dim_names=robot_state_dim_names,
         )
         samples.append(sample)
 
@@ -839,6 +943,111 @@ def _extract_instruction(sample: Mapping[str, Any]) -> str:
             if nested:
                 return nested
     return ""
+
+
+def _extract_robot_state(
+    sample: Mapping[str, Any],
+    state_columns: tuple[str, ...],
+    *,
+    state_dim: int,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    values: list[float] = []
+    for column in state_columns:
+        values.extend(_flatten_numeric_value(_lookup_column(sample, column)))
+    if not values:
+        raise ValueError(f"Could not extract any proprio values from columns={state_columns}")
+    if len(values) > state_dim:
+        values = values[:state_dim]
+    state = [0.0] * state_dim
+    mask = [0.0] * state_dim
+    for index, value in enumerate(values):
+        state[index] = float(value)
+        mask[index] = 1.0
+    return tuple(state), tuple(mask)
+
+
+def _lookup_column(sample: Mapping[str, Any], column: str) -> Any:
+    if column in sample:
+        return sample[column]
+    current: Any = sample
+    for part in column.split("."):
+        if not isinstance(current, Mapping) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _flatten_numeric_value(value: Any) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        return [float(item) for item in value.detach().cpu().reshape(-1).tolist()]
+    if isinstance(value, np.ndarray):
+        return [float(item) for item in value.reshape(-1).tolist()]
+    if isinstance(value, bytes):
+        return []
+    if isinstance(value, int | float | np.number):
+        return [float(value)]
+    if isinstance(value, list | tuple):
+        result: list[float] = []
+        for item in value:
+            result.extend(_flatten_numeric_value(item))
+        return result
+    return []
+
+
+def _fastumi_state_dim_names(state_dim: int) -> tuple[str, ...]:
+    return tuple(f"fastumi14drpy_{index}" for index in range(state_dim))
+
+
+def _compute_proprio_norm_stats(samples: list[ExportedHLMemorySample], *, state_dim: int) -> dict[str, Any]:
+    sum_values = np.zeros((state_dim,), dtype=np.float64)
+    sum_sq_values = np.zeros((state_dim,), dtype=np.float64)
+    counts = np.zeros((state_dim,), dtype=np.float64)
+    dim_names: tuple[str, ...] = _fastumi_state_dim_names(state_dim)
+    for sample in samples:
+        if sample.robot_state_dim_names:
+            dim_names = sample.robot_state_dim_names
+        for state, mask in zip(sample.recent_robot_states, sample.recent_robot_state_masks, strict=True):
+            state_array = np.asarray(state, dtype=np.float64)
+            mask_array = np.asarray(mask, dtype=np.float64)
+            sum_values += state_array * mask_array
+            sum_sq_values += state_array * state_array * mask_array
+            counts += mask_array
+    if not np.any(counts > 0):
+        raise ValueError("Cannot compute proprio norm stats because no valid state values were exported.")
+    safe_counts = np.maximum(counts, 1.0)
+    mean = sum_values / safe_counts
+    variance = np.maximum(sum_sq_values / safe_counts - mean * mean, 0.0)
+    std = np.sqrt(variance)
+    std = np.where(std < 1.0e-6, 1.0, std)
+    mean = np.where(counts > 0, mean, 0.0)
+    std = np.where(counts > 0, std, 1.0)
+    return {
+        "state_dim": state_dim,
+        "dim_names": list(dim_names),
+        "mean": [float(value) for value in mean.tolist()],
+        "std": [float(value) for value in std.tolist()],
+        "valid_count": [int(value) for value in counts.tolist()],
+    }
+
+
+def _apply_proprio_norm_stats(
+    samples: list[ExportedHLMemorySample],
+    stats: dict[str, Any],
+) -> list[ExportedHLMemorySample]:
+    mean = np.asarray(stats["mean"], dtype=np.float64)
+    std = np.asarray(stats["std"], dtype=np.float64)
+    normalized: list[ExportedHLMemorySample] = []
+    for sample in samples:
+        states: list[tuple[float, ...]] = []
+        for state, mask in zip(sample.recent_robot_states, sample.recent_robot_state_masks, strict=True):
+            state_array = np.asarray(state, dtype=np.float64)
+            mask_array = np.asarray(mask, dtype=np.float64)
+            normalized_state = ((state_array - mean) / std) * mask_array
+            states.append(tuple(float(value) for value in normalized_state.tolist()))
+        normalized.append(dataclasses.replace(sample, recent_robot_states=tuple(states)))
+    return normalized
 
 
 def _collect_image_views(tree: Mapping[str, Any], *, prefix: str = "") -> dict[str, Image.Image | np.ndarray | torch.Tensor]:
