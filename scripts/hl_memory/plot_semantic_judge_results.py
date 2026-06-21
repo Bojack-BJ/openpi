@@ -102,10 +102,12 @@ def _setting_name(source: str) -> str:
 
 def _write_metrics_csv(metrics: list[dict[str, Any]], path: Path) -> None:
     error_keys = sorted({key for item in metrics for key in item["error_counts"]}, key=_error_sort_key)
+    setting_codes = _setting_code_map(metrics)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(
             handle,
             fieldnames=[
+                "setting_code",
                 "setting",
                 "total",
                 "match_count",
@@ -117,6 +119,7 @@ def _write_metrics_csv(metrics: list[dict[str, Any]], path: Path) -> None:
         writer.writeheader()
         for item in metrics:
             row = {
+                "setting_code": setting_codes[item["setting"]],
                 "setting": item["setting"],
                 "total": item["total"],
                 "match_count": item["match_count"],
@@ -129,44 +132,93 @@ def _write_metrics_csv(metrics: list[dict[str, Any]], path: Path) -> None:
 
 def _plot_accuracy(metrics: list[dict[str, Any]], path: Path, *, title: str) -> None:
     import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
 
-    settings = [_short_label(item["setting"]) for item in metrics]
+    setting_codes = _setting_code_map(metrics)
+    settings = [setting_codes[item["setting"]] for item in metrics]
     values = [item["semantic_accuracy"] for item in metrics]
     colors = [_setting_color(item["setting"]) for item in metrics]
 
-    fig, ax = plt.subplots(figsize=(11, 5.5), dpi=180)
+    fig, ax = plt.subplots(figsize=(11, 6.6), dpi=180)
     bars = ax.bar(settings, values, color=colors, edgecolor="#222222", linewidth=0.6)
     ax.set_ylim(0.0, max(0.4, max(values, default=0.0) * 1.25))
     ax.set_ylabel("Semantic accuracy")
     ax.set_title(f"{title}: Semantic Accuracy")
     ax.grid(axis="y", alpha=0.25)
-    ax.tick_params(axis="x", labelrotation=25)
+    ax.tick_params(axis="x", labelrotation=0)
     for bar, value in zip(bars, values, strict=True):
         ax.text(bar.get_x() + bar.get_width() / 2, value + 0.01, f"{value:.3f}", ha="center", va="bottom", fontsize=9)
+    handles = []
+    for item in metrics:
+        setting = item["setting"]
+        handles.append(
+            mpatches.Patch(
+                color=_setting_color(setting),
+                label=f"{setting_codes[setting]}: {_compact_setting_label(setting)}",
+            )
+        )
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncols=2, frameon=False, fontsize=8)
     fig.tight_layout()
-    fig.savefig(path)
+    fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
 
 def _plot_error_breakdown(metrics: list[dict[str, Any]], path: Path, *, title: str) -> None:
+    import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
 
-    settings = [_short_label(item["setting"]) for item in metrics]
-    fig, ax = plt.subplots(figsize=(12, 6), dpi=180)
+    setting_codes = _setting_code_map(metrics)
+    settings = [setting_codes[item["setting"]] for item in metrics]
+    fig, ax = plt.subplots(figsize=(12.5, 7.8), dpi=180)
     bottoms = [0] * len(metrics)
     for error_type in _ordered_error_types(metrics):
         values = [item["error_counts"].get(error_type, 0) for item in metrics]
         if not any(values):
             continue
-        ax.bar(settings, values, bottom=bottoms, label=error_type, color=ERROR_COLORS.get(error_type, "#bdbdbd"), edgecolor="white", linewidth=0.4)
+        ax.bar(
+            settings,
+            values,
+            bottom=bottoms,
+            label=error_type,
+            color=ERROR_COLORS.get(error_type, "#bdbdbd"),
+            edgecolor="white",
+            linewidth=0.4,
+        )
         bottoms = [bottom + value for bottom, value in zip(bottoms, values, strict=True)]
     ax.set_ylabel("Step count")
     ax.set_title(f"{title}: Error Breakdown")
     ax.grid(axis="y", alpha=0.25)
-    ax.tick_params(axis="x", labelrotation=25)
-    ax.legend(loc="upper right", ncols=2, frameon=False, fontsize=8)
+    ax.tick_params(axis="x", labelrotation=0)
+    error_legend = ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.07),
+        ncols=5,
+        frameon=False,
+        fontsize=8,
+        title="Judge label",
+    )
+    ax.add_artist(error_legend)
+    setting_handles = []
+    for item in metrics:
+        setting = item["setting"]
+        setting_handles.append(
+            mpatches.Patch(
+                facecolor="none",
+                edgecolor="none",
+                label=f"{setting_codes[setting]}: {_compact_setting_label(setting)}",
+            )
+        )
+    ax.legend(
+        handles=setting_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncols=2,
+        frameon=False,
+        fontsize=8,
+        title="Settings",
+    )
     fig.tight_layout()
-    fig.savefig(path)
+    fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -178,6 +230,7 @@ def _plot_timeline(rows: list[dict[str, Any]], path: Path, *, title: str) -> Non
     for row in rows:
         grouped[_setting_name(str(row.get("source_path", "")))].append(row)
     settings = sorted(grouped, key=lambda name: _setting_family_sort_key(name))
+    setting_codes = _setting_code_map([{"setting": setting, "error_counts": {}, "total": 0} for setting in settings])
     max_step = max((int(row.get("step_index") or row.get("source_row") or 0) for row in rows), default=0)
 
     fig, ax = plt.subplots(figsize=(13, max(4.0, 0.65 * len(settings) + 2.5)), dpi=180)
@@ -187,7 +240,7 @@ def _plot_timeline(rows: list[dict[str, Any]], path: Path, *, title: str) -> Non
             error_type = str(row.get("judge", {}).get("error_type", "missing"))
             ax.scatter(step, y, marker="s", s=75, color=ERROR_COLORS.get(error_type, "#bdbdbd"), edgecolor="white", linewidth=0.25)
     ax.set_yticks(range(len(settings)))
-    ax.set_yticklabels([_short_label(setting) for setting in settings])
+    ax.set_yticklabels([setting_codes[setting] for setting in settings])
     ax.set_xlim(-1, max_step + 1)
     ax.set_xlabel("Rollout step")
     ax.set_title(f"{title}: Per-Step Judge Labels")
@@ -205,16 +258,17 @@ def _plot_timeline(rows: list[dict[str, Any]], path: Path, *, title: str) -> Non
 
 def _plot_accuracy_svg(metrics: list[dict[str, Any]], path: Path, *, title: str) -> None:
     width = 1100
-    height = 650
+    height = 680
     margin_left = 80
     margin_right = 40
     margin_top = 70
-    margin_bottom = 230
+    margin_bottom = 250
     chart_w = width - margin_left - margin_right
     chart_h = height - margin_top - margin_bottom
     max_value = max(0.4, max((item["semantic_accuracy"] for item in metrics), default=0.0) * 1.25)
     bar_gap = 20
     bar_w = (chart_w - bar_gap * (len(metrics) - 1)) / max(len(metrics), 1)
+    setting_codes = _setting_code_map(metrics)
     parts = [_svg_header(width, height), _svg_text(width / 2, 32, f"{title}: Semantic Accuracy", size=22, anchor="middle", weight="700")]
     _add_axes(parts, margin_left, margin_top, chart_w, chart_h, y_label="Semantic accuracy")
     for i in range(5):
@@ -229,22 +283,24 @@ def _plot_accuracy_svg(metrics: list[dict[str, Any]], path: Path, *, title: str)
         y = margin_top + chart_h - h
         parts.append(f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_w:.1f}" height="{h:.1f}" fill="{_setting_color(item["setting"])}" stroke="#222" stroke-width="0.8"/>')
         parts.append(_svg_text(x + bar_w / 2, y - 8, f"{value:.3f}", size=13, anchor="middle", weight="600"))
-        parts.extend(_svg_multiline_label(x + bar_w / 2, margin_top + chart_h + 28, _short_label(item["setting"]), anchor="middle"))
+        parts.append(_svg_text(x + bar_w / 2, margin_top + chart_h + 28, setting_codes[item["setting"]], size=13, anchor="middle", weight="700"))
+    _append_svg_setting_legend(parts, metrics, setting_codes, x=margin_left, y=height - 160, columns=2, column_width=490)
     parts.append("</svg>\n")
     path.write_text("\n".join(parts))
 
 
 def _plot_error_breakdown_svg(metrics: list[dict[str, Any]], path: Path, *, title: str) -> None:
-    width = 1180
-    height = 700
+    width = 1320
+    height = 740
     margin_left = 80
     margin_top = 70
-    margin_bottom = 235
-    chart_w = 860
+    margin_bottom = 265
+    chart_w = 880
     chart_h = height - margin_top - margin_bottom
     max_total = max((item["total"] for item in metrics), default=1)
     bar_gap = 22
     bar_w = (chart_w - bar_gap * (len(metrics) - 1)) / max(len(metrics), 1)
+    setting_codes = _setting_code_map(metrics)
     parts = [_svg_header(width, height), _svg_text(width / 2, 32, f"{title}: Error Breakdown", size=22, anchor="middle", weight="700")]
     _add_axes(parts, margin_left, margin_top, chart_w, chart_h, y_label="Step count")
     for index, item in enumerate(metrics):
@@ -257,13 +313,15 @@ def _plot_error_breakdown_svg(metrics: list[dict[str, Any]], path: Path, *, titl
             h = chart_h * count / max_total
             bottom_y -= h
             parts.append(f'<rect x="{x:.1f}" y="{bottom_y:.1f}" width="{bar_w:.1f}" height="{h:.1f}" fill="{ERROR_COLORS.get(error_type, "#bdbdbd")}" stroke="white" stroke-width="0.6"/>')
-        parts.extend(_svg_multiline_label(x + bar_w / 2, margin_top + chart_h + 28, _short_label(item["setting"]), anchor="middle"))
+        parts.append(_svg_text(x + bar_w / 2, margin_top + chart_h + 28, setting_codes[item["setting"]], size=13, anchor="middle", weight="700"))
     legend_x = margin_left + chart_w + 45
     legend_y = margin_top + 10
+    parts.append(_svg_text(legend_x, legend_y - 22, "Judge label", size=13, weight="700"))
     for i, error_type in enumerate(_ordered_error_types(metrics)):
         y = legend_y + i * 24
         parts.append(f'<rect x="{legend_x}" y="{y - 12}" width="14" height="14" fill="{ERROR_COLORS.get(error_type, "#bdbdbd")}"/>')
         parts.append(_svg_text(legend_x + 22, y, error_type, size=12))
+    _append_svg_setting_legend(parts, metrics, setting_codes, x=margin_left, y=height - 175, columns=2, column_width=500)
     parts.append("</svg>\n")
     path.write_text("\n".join(parts))
 
@@ -273,10 +331,11 @@ def _plot_timeline_svg(rows: list[dict[str, Any]], path: Path, *, title: str) ->
     for row in rows:
         grouped[_setting_name(str(row.get("source_path", "")))].append(row)
     settings = sorted(grouped, key=lambda name: _setting_family_sort_key(name))
+    setting_codes = _setting_code_map([{"setting": setting, "error_counts": {}, "total": 0} for setting in settings])
     max_step = max((int(row.get("step_index") or row.get("source_row") or 0) for row in rows), default=0)
     width = 1250
     row_h = 42
-    margin_left = 305
+    margin_left = 95
     margin_right = 50
     margin_top = 72
     margin_bottom = 120
@@ -289,7 +348,7 @@ def _plot_timeline_svg(rows: list[dict[str, Any]], path: Path, *, title: str) ->
         parts.append(_svg_text(x, height - margin_bottom + 35, str(step), size=11, anchor="middle"))
     for y_index, setting in enumerate(settings):
         y = margin_top + y_index * row_h
-        parts.append(_svg_text(margin_left - 14, y + 17, _short_label(setting), size=13, anchor="end"))
+        parts.append(_svg_text(margin_left - 14, y + 17, setting_codes[setting], size=13, anchor="end", weight="700"))
         parts.append(f'<line x1="{margin_left}" y1="{y + 16}" x2="{margin_left + chart_w}" y2="{y + 16}" stroke="#f2f2f2"/>')
         for row in grouped[setting]:
             step = int(row.get("step_index") or row.get("source_row") or 0)
@@ -347,6 +406,55 @@ def _short_label(setting: str) -> str:
     label = label.replace("_no_", "\nno_")
     label = label.replace("_", " ")
     return label
+
+
+def _setting_code_map(metrics: list[dict[str, Any]]) -> dict[str, str]:
+    counters = {"C": 0, "F": 0}
+    codes: dict[str, str] = {}
+    for item in metrics:
+        setting = str(item["setting"])
+        prefix = "C" if "coarse" in setting.lower() else "F"
+        counters[prefix] += 1
+        codes[setting] = f"{prefix}{counters[prefix]}"
+    return codes
+
+
+def _compact_setting_label(setting: str) -> str:
+    label = setting.replace("20260328K086A_", "")
+    label = label.replace("K086A_", "")
+    replacements = {
+        "coarse_memer_baseline": "coarse baseline",
+        "coarse_memer_proprio_per_frame_plus_summary": "coarse proprio frame+summary",
+        "coarse_memer_proprio_per_frame": "coarse proprio frame",
+        "coarse_memer_proprio_summary": "coarse proprio summary",
+        "prior_no_proprio_002000": "fine prior no proprio @2000",
+        "prior_proprio_001400": "fine prior proprio @1400",
+        "prior_proprio_memer_001800": "fine prior proprio memer @1800",
+        "proprio_no_prior_001800": "fine proprio no prior @1800",
+        "proprio_no_prior_memer_002000": "fine proprio no prior memer @2000",
+    }
+    return replacements.get(label, label.replace("_", " "))
+
+
+def _append_svg_setting_legend(
+    parts: list[str],
+    metrics: list[dict[str, Any]],
+    setting_codes: dict[str, str],
+    *,
+    x: int,
+    y: int,
+    columns: int,
+    column_width: int,
+) -> None:
+    parts.append(_svg_text(x, y - 22, "Settings", size=13, weight="700"))
+    for index, item in enumerate(metrics):
+        setting = str(item["setting"])
+        column = index % columns
+        row = index // columns
+        item_x = x + column * column_width
+        item_y = y + row * 23
+        code = setting_codes[setting]
+        parts.append(_svg_text(item_x, item_y, f"{code}: {_compact_setting_label(setting)}", size=12))
 
 
 def _svg_multiline_label(x: float, y: float, text: str, *, anchor: str = "start", size: int = 12) -> list[str]:

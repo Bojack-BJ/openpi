@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import pathlib
 import tempfile
+import json
 
 from PIL import Image
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import build_loaded_video_clips_from_frames
+from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.data import load_video_clips_for_sample
 
 
@@ -83,6 +85,133 @@ def test_subtask_keyframe_target_uses_current_objective_and_keyframes():
     assert prediction.keyframe_candidate_positions == (1, 3)
     assert prediction.subtask_progress is None
     assert prediction.should_advance_objective is None
+
+
+def test_target_prediction_can_use_canonical_keyframe_candidates():
+    sample = _sample(
+        current_objective="current objective",
+        keyframe_candidate_positions=(1, 2, 3),
+        keyframe_event_frame_indices=(5,),
+        recent_frame_indices=(0, 5, 10),
+        recent_valid_length=3,
+    )
+
+    prediction = sample.target_prediction(
+        target_protocol="memer_objective",
+        keyframe_candidate_label_mode="canonical",
+    )
+
+    assert prediction.keyframe_candidate_positions == (2,)
+
+
+def test_keyframe_gated_memory_target_sets_completed_objective_from_keyframe_labels():
+    sample = _sample(
+        current_objective="place toast on plate",
+        horizon_current_objective="grasp steak",
+        keyframe_candidate_positions=(2,),
+        keyframe_label=True,
+    )
+
+    prediction = sample.target_prediction(target_protocol="keyframe_gated_memory")
+
+    assert prediction.current_objective == "place toast on plate"
+    assert prediction.horizon_current_objective == "grasp steak"
+    assert prediction.keyframe_candidate_positions == (2,)
+    assert prediction.completed_objective == "place toast on plate"
+    assert prediction.updated_language_memory
+
+
+def test_keyframe_gated_memory_target_leaves_completed_objective_empty_without_keyframes():
+    sample = _sample(
+        current_objective="place toast on plate",
+        keyframe_candidate_positions=(2,),
+        keyframe_label=False,
+    )
+
+    prediction = sample.target_prediction(target_protocol="keyframe_gated_memory")
+
+    assert prediction.completed_objective == ""
+
+
+def test_known_prior_tracker_target_uses_progress_and_advance_labels():
+    sample = _sample(
+        current_objective="insert into top-left hole",
+        task_progress="Completed subtasks: Grasp the stick.",
+        subtask_progress=0.75,
+        should_advance_objective=False,
+    )
+
+    prediction = sample.target_prediction(target_protocol="known_prior_tracker")
+
+    assert prediction.current_objective == "insert into top-left hole"
+    assert prediction.task_progress == "Completed subtasks: Grasp the stick."
+    assert prediction.subtask_progress == 0.75
+    assert prediction.should_advance_objective is False
+
+
+def test_state_context_objective_protocols_use_memer_objective_target_without_progress_target():
+    sample = _sample(
+        current_objective="insert into top-left hole",
+        horizon_current_objective="insert into top-right hole",
+        task_progress="Completed subtasks: Grasp the stick.",
+        last_objective="grasp stick",
+        previous_stage_objective="grasp stick",
+        subtask_progress=0.75,
+        should_advance_objective=False,
+    )
+
+    for protocol in ("objective_memory_state", "objective_last_objective", "objective_prev_stage"):
+        prediction = sample.target_prediction(target_protocol=protocol)
+
+        assert prediction.current_objective == "insert into top-left hole"
+        assert prediction.horizon_current_objective == "insert into top-right hole"
+        assert prediction.keyframe_candidate_positions == (1, 3)
+        if protocol == "objective_memory_state":
+            assert prediction.updated_language_memory == sample.updated_language_memory
+        else:
+            assert prediction.task_progress == "No completed subtask yet."
+        if protocol == "objective_last_objective":
+            assert prediction.last_objective == "grasp stick"
+        if protocol == "objective_prev_stage":
+            assert prediction.previous_stage_objective == "grasp stick"
+        assert prediction.subtask_progress is None
+        assert prediction.should_advance_objective is None
+
+
+def test_load_exported_samples_backfills_last_and_previous_stage_objectives():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        root = pathlib.Path(tmp_dir)
+        samples_path = root / "samples.jsonl"
+        samples = [
+            _sample(sample_id="s0", step_index=0, current_objective="grasp stick"),
+            _sample(sample_id="s1", step_index=1, current_objective="grasp stick"),
+            _sample(sample_id="s2", step_index=2, current_objective="insert top-left"),
+            _sample(sample_id="s3", step_index=3, current_objective="insert top-left"),
+            _sample(sample_id="s4", step_index=4, current_objective="insert top-right"),
+        ]
+        with samples_path.open("w") as handle:
+            for sample in samples:
+                payload = sample.to_dict()
+                payload.pop("last_objective", None)
+                payload.pop("previous_stage_objective", None)
+                handle.write(json.dumps(payload) + "\n")
+
+        loaded = load_exported_samples(root)
+
+        assert [sample.last_objective for sample in loaded] == [
+            "",
+            "grasp stick",
+            "grasp stick",
+            "insert top-left",
+            "insert top-left",
+        ]
+        assert [sample.previous_stage_objective for sample in loaded] == [
+            "",
+            "",
+            "grasp stick",
+            "grasp stick",
+            "insert top-left",
+        ]
 
 
 def test_sample_round_trips_proprio_fields():

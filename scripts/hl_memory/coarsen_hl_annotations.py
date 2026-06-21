@@ -21,7 +21,7 @@ from typing import Any
 DEFAULT_INPUT_NAME = "hl_annotations_llm_normalized.jsonl"
 DEFAULT_OUTPUT_NAME = "hl_annotations_llm_normalized_coarse.jsonl"
 MERGE_MODES = ("conservative", "aggressive")
-DEFAULT_SHORT_RUN_MERGE_MAX_FRAMES = 20
+DEFAULT_SHORT_RUN_MERGE_MAX_FRAMES = 35
 
 
 def main() -> None:
@@ -40,6 +40,7 @@ def main() -> None:
             output_jsonl,
             replace_target_fields=args.replace_target_fields,
             preserve_fine_fields=args.preserve_fine_fields,
+            relabel_coarse_keyframes=args.relabel_coarse_keyframes,
             merge_return_into_previous=args.merge_return_into_previous,
             merge_mode=args.merge_mode,
             lookahead_window=args.lookahead_window,
@@ -77,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Write fine_current_objective/fine_current_subtask/fine_horizon_* before replacing fields.",
+    )
+    parser.add_argument(
+        "--relabel-coarse-keyframes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After all coarse merges, clear inherited fine keyframe labels and mark only the final annotation row "
+            "of each coarse objective run as a keyframe."
+        ),
     )
     parser.add_argument(
         "--merge-return-into-previous",
@@ -145,6 +155,7 @@ def coarsen_file(
     *,
     replace_target_fields: bool,
     preserve_fine_fields: bool,
+    relabel_coarse_keyframes: bool,
     merge_return_into_previous: bool,
     merge_mode: str,
     lookahead_window: int,
@@ -161,6 +172,7 @@ def coarsen_file(
     changed_current = 0
     changed_horizon = 0
     short_run_merge_counts: Counter[str] = Counter()
+    task_specific_merge_counts: Counter[str] = Counter()
     for episode_rows in grouped.values():
         episode_rows.sort(key=lambda row: (int(row.get("frame_index", 0)), str(row.get("event_type", ""))))
         episode_processed: list[dict[str, Any]] = []
@@ -214,6 +226,12 @@ def coarsen_file(
             action_counts[current["action_type"]] += 1
             episode_processed.append(new_row)
 
+        task_specific_merge_counts.update(
+            _coarsen_insert_stick_hole_episode(
+                episode_processed,
+                replace_target_fields=replace_target_fields,
+            )
+        )
         if short_run_merge_max_frames > 0:
             merge_count = merge_short_current_objective_runs(
                 episode_processed,
@@ -221,6 +239,8 @@ def coarsen_file(
                 replace_target_fields=replace_target_fields,
             )
             short_run_merge_counts.update(merge_count)
+        if relabel_coarse_keyframes:
+            _relabel_coarse_segment_end_keyframes(episode_processed)
         processed.extend(episode_processed)
 
     processed.sort(key=lambda row: (int(row.get("episode_index", 0)), int(row.get("frame_index", 0))))
@@ -237,6 +257,9 @@ def coarsen_file(
         "merge_mode": merge_mode,
         "lookahead_window": lookahead_window,
         "short_run_merge_max_frames": short_run_merge_max_frames,
+        "relabel_coarse_keyframes": relabel_coarse_keyframes,
+        "coarse_keyframe_count": sum(row.get("keyframe_label") is True for row in processed),
+        "task_specific_merge_counts": dict(task_specific_merge_counts.most_common()),
         "short_run_merge_counts": dict(short_run_merge_counts.most_common()),
         "action_counts": dict(action_counts.most_common()),
     }
@@ -264,6 +287,29 @@ def _count_final_field_changes(
         new_horizon = str(processed.get("horizon_current_objective") or processed.get("horizon_current_subtask") or "").strip()
         changed_horizon += int(bool(old_horizon) and normalize_text(old_horizon) != normalize_text(new_horizon))
     return changed_current, changed_horizon
+
+
+def _relabel_coarse_segment_end_keyframes(rows: list[dict[str, Any]]) -> None:
+    """Align keyframe supervision with final coarse objective runs."""
+    if not rows:
+        return
+
+    for row in rows:
+        if "keyframe_label" in row and "fine_keyframe_label" not in row:
+            row["fine_keyframe_label"] = row["keyframe_label"]
+        row["keyframe_label"] = False
+        row["coarse_keyframe_label_source"] = "coarse_segment_non_terminal"
+
+    run_start = 0
+    while run_start < len(rows):
+        objective = _row_objective(rows[run_start])
+        run_end = run_start + 1
+        while run_end < len(rows) and _row_objective(rows[run_end]) == objective:
+            run_end += 1
+        terminal = rows[run_end - 1]
+        terminal["keyframe_label"] = True
+        terminal["coarse_keyframe_label_source"] = "coarse_segment_end"
+        run_start = run_end
 
 
 def _preserve_fine_fields(row: dict[str, Any]) -> None:
@@ -400,6 +446,141 @@ def _find_previous_meaningful(rows: list[dict[str, Any]], index: int) -> str:
 
 def _row_objective(row: dict[str, Any]) -> str:
     return str(row.get("current_objective") or row.get("current_subtask") or row.get("phase") or "").strip()
+
+
+def _coarsen_insert_stick_hole_episode(
+    rows: list[dict[str, Any]],
+    *,
+    replace_target_fields: bool,
+) -> Counter[str]:
+    """Merge insert-stick micro steps while preserving the target hole position.
+
+    The insert-stick task repeatedly follows this fine pattern:
+    ``grab -> move to <position> hole -> insert -> release``.  Generic coarse
+    rules correctly remove the short fragments but collapse all targets into
+    ``the hole``.  This task-specific pass keeps the destination phrase so the
+    low-level policy still receives the ordered hole target.
+    """
+
+    counts: Counter[str] = Counter()
+    fine_texts = [_fine_current_text(row) for row in rows]
+    if not any("stick" in normalize_text(text) for text in fine_texts):
+        return counts
+    if not any("hole" in normalize_text(text) for text in fine_texts):
+        return counts
+
+    active_hole: str | None = None
+    pending_grab_rows: list[int] = []
+    for row_index, fine_text in enumerate(fine_texts):
+        normalized = normalize_text(fine_text)
+        hole = _extract_stick_hole_target(normalized)
+        if hole is not None:
+            active_hole = hole
+            objective = _insert_stick_hole_objective(hole)
+            for pending_index in pending_grab_rows:
+                _rewrite_current_objective(
+                    rows[pending_index],
+                    objective=objective,
+                    action_type="place_object",
+                    reason="insert_stick_hole_sequence_merged",
+                    source_objective=_fine_current_text(rows[pending_index]),
+                    replace_target_fields=replace_target_fields,
+                )
+                counts["insert_stick_hole_sequence_merged"] += 1
+            pending_grab_rows.clear()
+            _rewrite_current_objective(
+                rows[row_index],
+                objective=objective,
+                action_type="place_object",
+                reason="insert_stick_hole_sequence_merged",
+                source_objective=fine_text,
+                replace_target_fields=replace_target_fields,
+            )
+            counts["insert_stick_hole_sequence_merged"] += 1
+            continue
+
+        if _is_insert_stick_completion(normalized) and active_hole:
+            _rewrite_current_objective(
+                rows[row_index],
+                objective=_insert_stick_hole_objective(active_hole),
+                action_type="place_object",
+                reason="insert_stick_hole_sequence_merged",
+                source_objective=fine_text,
+                replace_target_fields=replace_target_fields,
+            )
+            counts["insert_stick_hole_sequence_merged"] += 1
+            continue
+
+        if _is_stick_grab(normalized):
+            next_hole = _next_stick_hole_target(fine_texts, row_index)
+            if next_hole is not None:
+                pending_grab_rows.append(row_index)
+                continue
+
+        if "back to observation" in normalized or "observation space" in normalized:
+            active_hole = None
+            pending_grab_rows.clear()
+            _rewrite_current_objective(
+                rows[row_index],
+                objective="Move back to observation space",
+                action_type="reset_hand",
+                reason="insert_stick_reset_normalized",
+                source_objective=fine_text,
+                replace_target_fields=replace_target_fields,
+            )
+            counts["insert_stick_reset_normalized"] += 1
+            continue
+
+        pending_grab_rows.clear()
+
+    return counts
+
+
+def _fine_current_text(row: dict[str, Any]) -> str:
+    return str(
+        row.get("fine_current_objective")
+        or row.get("fine_current_subtask")
+        or row.get("fine_phase")
+        or row.get("coarse_source_objective")
+        or row.get("current_objective")
+        or row.get("current_subtask")
+        or ""
+    ).strip()
+
+
+def _extract_stick_hole_target(normalized_text: str) -> str | None:
+    match = re.search(r"\bmove to (?P<hole>[a-z0-9 -]+ hole)\b", normalized_text)
+    if match is None:
+        return None
+    hole = re.sub(r"\s+", " ", match.group("hole").strip())
+    return hole.replace("bottom left", "bottom-left").replace("bottom right", "bottom-right")
+
+
+def _next_stick_hole_target(fine_texts: list[str], row_index: int) -> str | None:
+    for text in fine_texts[row_index + 1 :]:
+        normalized = normalize_text(text)
+        if "back to observation" in normalized or "observation space" in normalized:
+            return None
+        hole = _extract_stick_hole_target(normalized)
+        if hole is not None:
+            return hole
+        if "stick" not in normalized and "hole" not in normalized:
+            return None
+    return None
+
+
+def _is_insert_stick_completion(normalized_text: str) -> bool:
+    if "stick" not in normalized_text:
+        return False
+    return "insert" in normalized_text or "release" in normalized_text
+
+
+def _is_stick_grab(normalized_text: str) -> bool:
+    return "stick" in normalized_text and any(token in normalized_text for token in ("grab", "grasp", "pick up"))
+
+
+def _insert_stick_hole_objective(hole: str) -> str:
+    return f"Move to and insert the stick into the {hole}"
 
 
 def classify_action(text: str) -> str:
@@ -606,7 +787,9 @@ def _merge_short_place_into_transport(
             continue
         if previous["span_frames"] <= 0:
             continue
-        if not _object_overlap(run["objective"], previous["objective"]):
+        if not _object_overlap(run["objective"], previous["objective"]) and not _is_place_staging_transport(
+            previous["objective"], run["objective"]
+        ):
             continue
         for merge_run in (previous, run):
             for row_index in range(merge_run["start_row"], merge_run["end_row"] + 1):
@@ -621,6 +804,42 @@ def _merge_short_place_into_transport(
         counts["short_place_merged_with_transport"] += 1
         return True
     return False
+
+
+def _is_place_staging_transport(transport_objective: str, place_objective: str) -> bool:
+    """Return true for staging motions that should share the following place label.
+
+    Fine annotations often split placement into ``move above <support>`` followed
+    by ``place <object> on <support/object>``.  The two labels may not share the
+    manipulated object, e.g. ``Move above plate`` then
+    ``Place leaf vegetable on steak``.  For coarse HL supervision this boundary
+    is too fine, so a short staging transport is allowed to merge into the
+    following place objective when it clearly targets a placement support.
+    """
+
+    transport = normalize_text(transport_objective)
+    place = normalize_text(place_objective)
+    if classify_action(transport) != "transport_object" or classify_action(place) != "place_object":
+        return False
+    if not any(token in transport for token in ("move above", "move over", "align above", "above ")):
+        return False
+    if not any(token in place for token in ("place ", "put ", "stack ", "set ")):
+        return False
+    return any(
+        support in transport
+        for support in (
+            "plate",
+            "tray",
+            "table",
+            "bowl",
+            "cup",
+            "box",
+            "container",
+            "slot",
+            "target",
+            "goal",
+        )
+    )
 
 
 def _merge_terminal_release_into_reset(

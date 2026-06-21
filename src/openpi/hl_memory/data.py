@@ -77,13 +77,19 @@ class ExportedHLMemorySample:
     should_advance_objective: bool | None = None
     active_hand: str = ""
     keyframe_label: bool | None = None
+    keyframe_event_ids: tuple[str, ...] = ()
+    keyframe_event_frame_indices: tuple[int, ...] = ()
     horizon_frame_index: int | None = None
     horizon_current_objective: str = ""
     horizon_current_subtask: str = ""
     horizon_phase: str = ""
+    last_objective: str = ""
+    previous_stage_objective: str = ""
     recent_robot_states: tuple[tuple[float, ...], ...] = ()
     recent_robot_state_masks: tuple[tuple[float, ...], ...] = ()
     robot_state_dim_names: tuple[str, ...] = ()
+    object_name: str = ""
+    recent_object_center_points: tuple[tuple[float | None, float | None], ...] = ()
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ExportedHLMemorySample":
@@ -119,13 +125,19 @@ class ExportedHLMemorySample:
             should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
             active_hand=str(data.get("active_hand", "")).strip(),
             keyframe_label=_parse_optional_bool(data.get("keyframe_label")),
+            keyframe_event_ids=tuple(str(value) for value in data.get("keyframe_event_ids", ())),
+            keyframe_event_frame_indices=tuple(int(value) for value in data.get("keyframe_event_frame_indices", ())),
             horizon_frame_index=_parse_optional_int(data.get("horizon_frame_index")),
             horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
             horizon_current_subtask=str(data.get("horizon_current_subtask", "")).strip(),
             horizon_phase=str(data.get("horizon_phase", "")).strip(),
+            last_objective=str(data.get("last_objective", "")).strip(),
+            previous_stage_objective=str(data.get("previous_stage_objective", "")).strip(),
             recent_robot_states=_parse_float_matrix(data.get("recent_robot_states", ())),
             recent_robot_state_masks=_parse_float_matrix(data.get("recent_robot_state_masks", ())),
             robot_state_dim_names=tuple(str(value) for value in data.get("robot_state_dim_names", ())),
+            object_name=str(data.get("object_name", "")).strip(),
+            recent_object_center_points=_parse_optional_point_matrix(data.get("recent_object_center_points", ())),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -159,23 +171,89 @@ class ExportedHLMemorySample:
             "should_advance_objective": self.should_advance_objective,
             "active_hand": self.active_hand,
             "keyframe_label": self.keyframe_label,
+            "keyframe_event_ids": list(self.keyframe_event_ids),
+            "keyframe_event_frame_indices": list(self.keyframe_event_frame_indices),
             "horizon_frame_index": self.horizon_frame_index,
             "horizon_current_objective": self.horizon_current_objective,
             "horizon_current_subtask": self.horizon_current_subtask,
             "horizon_phase": self.horizon_phase,
+            "last_objective": self.last_objective,
+            "previous_stage_objective": self.previous_stage_objective,
             "recent_robot_states": [list(row) for row in self.recent_robot_states],
             "recent_robot_state_masks": [list(row) for row in self.recent_robot_state_masks],
             "robot_state_dim_names": list(self.robot_state_dim_names),
+            "object_name": self.object_name,
+            "recent_object_center_points": [list(row) for row in self.recent_object_center_points],
         }
 
-    def target_prediction(self, *, target_protocol: str = "hl_v1") -> HLMemoryPrediction:
+    def target_prediction(
+        self,
+        *,
+        target_protocol: str = "hl_v1",
+        keyframe_candidate_label_mode: str = "event_band",
+    ) -> HLMemoryPrediction:
+        keyframe_candidate_positions = self.keyframe_candidate_positions
+        if keyframe_candidate_label_mode not in {"canonical", "event_band"}:
+            raise ValueError(f"Unsupported keyframe_candidate_label_mode: {keyframe_candidate_label_mode!r}")
+        if keyframe_candidate_label_mode == "canonical":
+            keyframe_candidate_positions = _canonical_keyframe_positions(self)
+        if target_protocol == "known_prior_tracker":
+            objective = self.current_objective or self.current_subtask
+            return HLMemoryPrediction(
+                updated_language_memory=self.updated_language_memory,
+                current_subtask=objective,
+                keyframe_candidate_positions=keyframe_candidate_positions,
+                phase=objective,
+                target_query="",
+                goal_query="",
+                task_progress=self.task_progress,
+                current_objective=objective,
+                subtask_progress=self.subtask_progress,
+                should_advance_objective=self.should_advance_objective,
+            )
+        if target_protocol in {"objective_memory_state", "objective_last_objective", "objective_prev_stage"}:
+            objective = self.current_objective or self.current_subtask
+            horizon_objective = self.horizon_current_objective or objective
+            updated_language_memory = self.updated_language_memory if target_protocol == "objective_memory_state" else ""
+            return HLMemoryPrediction(
+                updated_language_memory=updated_language_memory,
+                current_subtask=objective,
+                keyframe_candidate_positions=keyframe_candidate_positions,
+                phase=objective,
+                target_query="",
+                goal_query="",
+                current_objective=objective,
+                horizon_current_objective=horizon_objective,
+                last_objective=self.last_objective if target_protocol == "objective_last_objective" else "",
+                previous_stage_objective=(
+                    self.previous_stage_objective if target_protocol == "objective_prev_stage" else ""
+                ),
+            )
+        if target_protocol in {
+            "keyframe_gated_memory",
+            "keyframe_gated_memory_typed_mask",
+            "keyframe_gated_memory_two_pass",
+        }:
+            objective = self.current_objective or self.current_subtask
+            horizon_objective = self.horizon_current_objective or objective
+            return HLMemoryPrediction(
+                updated_language_memory="",
+                current_subtask=objective,
+                keyframe_candidate_positions=keyframe_candidate_positions,
+                phase=objective,
+                target_query="",
+                goal_query="",
+                current_objective=objective,
+                horizon_current_objective=horizon_objective,
+                completed_objective=objective if self.keyframe_label is True else "",
+            )
         if target_protocol == "memer_objective":
             objective = self.current_objective or self.current_subtask
             horizon_objective = self.horizon_current_objective or objective
             return HLMemoryPrediction(
                 updated_language_memory="",
                 current_subtask=objective,
-                keyframe_candidate_positions=self.keyframe_candidate_positions,
+                keyframe_candidate_positions=keyframe_candidate_positions,
                 phase=objective,
                 target_query="",
                 goal_query="",
@@ -187,7 +265,7 @@ class ExportedHLMemorySample:
             return HLMemoryPrediction(
                 updated_language_memory="",
                 current_subtask=objective,
-                keyframe_candidate_positions=self.keyframe_candidate_positions,
+                keyframe_candidate_positions=keyframe_candidate_positions,
                 phase=objective,
                 target_query="",
                 goal_query="",
@@ -198,7 +276,7 @@ class ExportedHLMemorySample:
         return HLMemoryPrediction(
             updated_language_memory=self.updated_language_memory,
             current_subtask=self.current_subtask,
-            keyframe_candidate_positions=self.keyframe_candidate_positions,
+            keyframe_candidate_positions=keyframe_candidate_positions,
             phase=self.phase,
             target_query=self.target_query,
             goal_query=self.goal_query,
@@ -271,7 +349,60 @@ def load_exported_samples(dataset_dir: pathlib.Path | str) -> list[ExportedHLMem
                 raise ValueError(f"Invalid JSON on line {line_number} in {sample_path}") from exc
             samples.append(ExportedHLMemorySample.from_dict(payload))
     samples.sort(key=lambda item: (item.episode_index, item.step_index))
-    return samples
+    return _with_derived_state_context(samples)
+
+
+def _with_derived_state_context(samples: list[ExportedHLMemorySample]) -> list[ExportedHLMemorySample]:
+    """Backfill state-context fields for old exported samples.
+
+    `last_objective` is the previous exported sample's objective in the same
+    episode, matching online use where the next HL call receives the last HL
+    output. `previous_stage_objective` is the previous distinct objective, so it
+    changes only at objective boundaries and acts as an oracle stage-level
+    sequence cue for analysis.
+    """
+    result: list[ExportedHLMemorySample] = []
+    last_by_episode: dict[int, str] = {}
+    previous_distinct_by_episode: dict[int, str] = {}
+    current_distinct_by_episode: dict[int, str] = {}
+    for sample in samples:
+        objective = (sample.current_objective or sample.current_subtask).strip()
+        episode = sample.episode_index
+        current_distinct = current_distinct_by_episode.get(episode, "")
+        previous_stage = previous_distinct_by_episode.get(episode, "")
+        if objective and current_distinct and _normalize_text(objective) != _normalize_text(current_distinct):
+            previous_distinct_by_episode[episode] = current_distinct
+            previous_stage = current_distinct
+            current_distinct_by_episode[episode] = objective
+        elif objective and not current_distinct:
+            current_distinct_by_episode[episode] = objective
+
+        last_objective = sample.last_objective or last_by_episode.get(episode, "")
+        derived_previous_stage = sample.previous_stage_objective or previous_stage
+        if last_objective != sample.last_objective or derived_previous_stage != sample.previous_stage_objective:
+            sample = dataclasses.replace(
+                sample,
+                last_objective=last_objective,
+                previous_stage_objective=derived_previous_stage,
+            )
+        result.append(sample)
+        if objective:
+            last_by_episode[episode] = objective
+    return result
+
+
+def _canonical_keyframe_positions(sample: ExportedHLMemorySample) -> tuple[int, ...]:
+    position_lookup = {int(frame_index): position for position, frame_index in enumerate(sample.recent_frame_indices, start=1)}
+    positions: list[int] = []
+    for frame_index in sample.keyframe_event_frame_indices:
+        position = position_lookup.get(int(frame_index))
+        if position is not None and position not in positions:
+            positions.append(position)
+    if not positions and sample.keyframe_label is True:
+        position = position_lookup.get(int(sample.frame_index))
+        if position is not None:
+            positions.append(position)
+    return tuple(positions)
 
 
 def group_annotations_by_episode(
@@ -352,6 +483,10 @@ def _parse_relevant_objects(value: object) -> tuple[str, ...]:
     return tuple(objects)
 
 
+def _normalize_text(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
 def _parse_optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None
@@ -393,6 +528,22 @@ def _parse_float_matrix(value: object) -> tuple[tuple[float, ...], ...]:
         if not isinstance(row, list | tuple):
             continue
         rows.append(tuple(float(item) for item in row))
+    return tuple(rows)
+
+
+def _parse_optional_point_matrix(value: object) -> tuple[tuple[float | None, float | None], ...]:
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, list | tuple):
+        return ()
+    rows: list[tuple[float | None, float | None]] = []
+    for row in value:
+        if row is None:
+            rows.append((None, None))
+            continue
+        if not isinstance(row, list | tuple) or len(row) < 2:
+            continue
+        rows.append((_parse_optional_float(row[0]), _parse_optional_float(row[1])))
     return tuple(rows)
 
 

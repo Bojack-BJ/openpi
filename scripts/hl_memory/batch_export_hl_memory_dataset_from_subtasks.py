@@ -146,6 +146,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proprio-enabled", action="store_true", help="Forward to export_hl_memory_dataset.py.")
     parser.add_argument("--proprio-state-columns", default="auto", help="Forward to export_hl_memory_dataset.py.")
     parser.add_argument("--proprio-state-dim", type=int, default=14, help="Forward to export_hl_memory_dataset.py.")
+    parser.add_argument(
+        "--memory-render-mode",
+        choices=("dashboard", "completed-subtasks"),
+        default="dashboard",
+        help=(
+            "Forward to export_hl_memory_dataset.py. Use `completed-subtasks` for state-context experiments so "
+            "language_memory contains only objectives completed at stable objective boundaries."
+        ),
+    )
+    parser.add_argument("--keyframe-event-band-before-sec", type=float, default=1.0, help="Forward to export_hl_memory_dataset.py.")
+    parser.add_argument("--keyframe-event-band-after-sec", type=float, default=0.5, help="Forward to export_hl_memory_dataset.py.")
+    parser.add_argument(
+        "--keyframe-candidate-label-mode",
+        choices=("canonical", "event_band"),
+        default="event_band",
+        help="Forward to export_hl_memory_dataset.py.",
+    )
     parser.add_argument("--export-script", type=Path, default=DEFAULT_EXPORT_SCRIPT)
     parser.add_argument("--annotation-script", type=Path, default=DEFAULT_ANNOTATION_SCRIPT)
     parser.add_argument("--summary-json", type=Path, default=None)
@@ -315,6 +332,14 @@ def build_jobs(args: argparse.Namespace, *, passthrough: list[str]) -> list[Job]
             args.missing_episode_policy,
             "--subtask-progress-quantum",
             str(args.subtask_progress_quantum),
+            "--memory-render-mode",
+            args.memory_render_mode,
+            "--keyframe-event-band-before-sec",
+            str(args.keyframe_event_band_before_sec),
+            "--keyframe-event-band-after-sec",
+            str(args.keyframe_event_band_after_sec),
+            "--keyframe-candidate-label-mode",
+            args.keyframe_candidate_label_mode,
         ]
         if args.proprio_enabled:
             cmd.append("--proprio-enabled")

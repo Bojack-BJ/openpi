@@ -272,6 +272,10 @@ def build_proprio_batch(
     max_time = 0
     for sample in samples:
         if not sample.recent_robot_states:
+            if sample.recent_valid_length == 0:
+                rows.append([])
+                mask_rows.append([])
+                continue
             raise ValueError(
                 f"Sample {sample.sample_id} has no recent_robot_states. Re-export the dataset with --proprio-enabled."
             )
@@ -313,6 +317,8 @@ def render_proprio_token_text(sample: ExportedHLMemorySample, config: HLMemoryCo
     if not config.proprio_enabled:
         return ""
     if not sample.recent_robot_states:
+        if sample.recent_valid_length == 0:
+            return "No proprio token is available because Pass A proposed no candidate frame.\n"
         raise ValueError(
             f"Sample {sample.sample_id} has no recent_robot_states. Re-export the dataset with --proprio-enabled."
         )

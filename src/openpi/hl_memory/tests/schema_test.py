@@ -46,6 +46,17 @@ def test_prediction_defaults_missing_keyframe_positions_to_empty():
     )
 
     assert parsed.keyframe_candidate_positions == ()
+    assert parsed.completed_objective == ""
+
+
+def test_prediction_parses_completed_objective_when_present():
+    parsed = HLMemoryPrediction.from_json(
+        '{"current_objective":"place toast","horizon_current_objective":"grasp steak",'
+        '"completed_objective":"place toast","keyframe_candidate_positions":[2]}'
+    )
+
+    assert parsed.completed_objective == "place toast"
+    assert parsed.to_dict(include_legacy=False)["completed_objective"] == "place toast"
 
 
 def test_prediction_parses_json_after_thinking_block():

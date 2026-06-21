@@ -28,6 +28,8 @@ from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.proprio import proprio_base_embedding_modules
 from openpi.hl_memory.proprio import save_proprio_state_if_available
 from openpi.hl_memory.proprio import temporarily_unwrap_proprio_embeddings
+from openpi.hl_memory.sampling import sample_keyframe_stratified
+from openpi.hl_memory.training_loss import compute_hl_target_loss_with_metrics
 
 
 
@@ -103,6 +105,14 @@ class TrainArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: str = "event_band"
+    keyframe_positive_sample_ratio: float = 0.0
+    keyframe_confirm_positive_sample_ratio: float = 0.0
+    two_pass_training_proposal_noise_probability: float = 0.25
+    two_pass_predict_loss_weight: float = 1.0
+    two_pass_confirm_loss_weight: float = 1.0
     learning_rate: float = 5e-6
     vision_tower_learning_rate: float | None = None
     weight_decay: float = 1e-4
@@ -220,6 +230,10 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
+        keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
+        keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
+        two_pass_training_proposal_noise_probability=args.two_pass_training_proposal_noise_probability,
     )
     adapter = create_hf_adapter(hl_config)
     device = _resolve_training_device(args, distributed=distributed)
@@ -274,6 +288,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     running_forward_time = 0.0
     running_backward_time = 0.0
     running_optim_time = 0.0
+    running_loss_metrics: dict[str, float] = {}
 
     progress = tqdm(
         range(1, args.num_train_steps + 1),
@@ -294,9 +309,18 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
             step_forward_time = 0.0
             step_backward_time = 0.0
             step_optim_time = 0.0
+            step_loss_metrics: dict[str, float] = {}
             with _torch_profiler_context(args, step, is_main=is_main, device=device) as torch_prof:
                 for accum_index in range(args.grad_accum_steps):
-                    batch = _sample_batch(samples, args.batch_size, rng)
+                    batch = _sample_batch(
+                        samples,
+                        args.batch_size,
+                        rng,
+                        keyframe_positive_sample_ratio=args.keyframe_positive_sample_ratio,
+                        keyframe_confirm_positive_sample_ratio=args.keyframe_confirm_positive_sample_ratio,
+                        target_protocol=hl_config.target_protocol,
+                        keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                    )
                     micro_loss = 0.0
                     sync_gradients = accum_index == args.grad_accum_steps - 1
                     sync_context = (
@@ -324,7 +348,17 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                                 "This would make the language-model loss NaN."
                             )
                         forward_start_time = time.perf_counter()
-                        loss = _compute_target_loss(loaded.model, inputs)
+                        loss, loss_metrics = compute_hl_target_loss_with_metrics(
+                            loaded.model,
+                            inputs,
+                            two_pass_predict_weight=args.two_pass_predict_loss_weight,
+                            two_pass_confirm_weight=args.two_pass_confirm_loss_weight,
+                        )
+                        _accumulate_loss_metrics(
+                            step_loss_metrics,
+                            loss_metrics,
+                            loss_scale=1.0 / args.grad_accum_steps,
+                        )
                         _maybe_cuda_synchronize(device, enabled=profile_step)
                         step_forward_time += time.perf_counter() - forward_start_time
                         loss_value = float(loss.detach().cpu())
@@ -355,6 +389,10 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
             step_elapsed = time.perf_counter() - step_start_time
             logged_step_loss = _mean_across_ranks(step_loss, device=device) if distributed else step_loss
             running_loss += logged_step_loss
+            logged_step_loss_metrics = (
+                _mean_metric_dict_across_ranks(step_loss_metrics, device=device) if distributed else step_loss_metrics
+            )
+            _accumulate_float_metrics(running_loss_metrics, logged_step_loss_metrics)
             logged_data_time = _mean_across_ranks(step_data_time, device=device) if distributed else step_data_time
             logged_step_time = _mean_across_ranks(step_elapsed, device=device) if distributed else step_elapsed
             logged_forward_time = _mean_across_ranks(step_forward_time, device=device) if distributed else step_forward_time
@@ -380,6 +418,9 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
 
             if is_main and step % args.log_interval == 0:
                 avg_loss = running_loss / args.log_interval
+                avg_loss_metrics = {
+                    f"train/{name}": value / args.log_interval for name, value in sorted(running_loss_metrics.items())
+                }
                 avg_data_time = running_data_time / args.log_interval
                 avg_step_time = running_step_time / args.log_interval
                 avg_forward_time = running_forward_time / args.log_interval
@@ -403,6 +444,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     wandb_run,
                     {
                         "train/loss": avg_loss,
+                        **avg_loss_metrics,
                         "time/data_s_per_it": avg_data_time,
                         "time/forward_s_per_it": avg_forward_time,
                         "time/backward_s_per_it": avg_backward_time,
@@ -423,9 +465,10 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                 running_forward_time = 0.0
                 running_backward_time = 0.0
                 running_optim_time = 0.0
+                running_loss_metrics = {}
             if val_samples and step % args.val_interval == 0:
                 val_started_at = time.perf_counter()
-                val_loss = _evaluate_loss(
+                val_metrics = _evaluate_loss(
                     loaded=loaded,
                     adapter=adapter,
                     samples=val_samples,
@@ -435,8 +478,13 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     hl_config=hl_config,
                     frame_cache=frame_cache,
                     device=device,
+                    two_pass_predict_loss_weight=args.two_pass_predict_loss_weight,
+                    two_pass_confirm_loss_weight=args.two_pass_confirm_loss_weight,
                 )
-                logged_val_loss = _mean_across_ranks(val_loss, device=device) if distributed else val_loss
+                logged_val_metrics = (
+                    _mean_metric_dict_across_ranks(val_metrics, device=device) if distributed else val_metrics
+                )
+                logged_val_loss = logged_val_metrics.get("loss", float("nan"))
                 val_elapsed = time.perf_counter() - val_started_at
                 logged_val_elapsed = _mean_across_ranks(val_elapsed, device=device) if distributed else val_elapsed
                 if is_main:
@@ -452,6 +500,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                         wandb_run,
                         {
                             "val/loss": logged_val_loss,
+                            **{f"val/{name}": value for name, value in sorted(logged_val_metrics.items())},
                             "val/time_s": logged_val_elapsed,
                             "val/batches_per_rank": args.val_batches,
                             "val/effective_samples": args.val_batches * args.batch_size * world_size,
@@ -982,40 +1031,6 @@ def _maybe_drop_step_prior(sample, *, args: TrainArgs, rng: random.Random):
     return dataclasses.replace(sample, step_prior=())
 
 
-def _compute_target_loss(model: torch.nn.Module, inputs: dict[str, torch.Tensor]) -> torch.Tensor:
-    labels = inputs["labels"]
-    logits_to_keep = _target_logit_positions(labels)
-    if logits_to_keep is None:
-        outputs = model(**inputs)
-        return outputs.loss
-    model_inputs = {key: value for key, value in inputs.items() if key != "labels"}
-    try:
-        outputs = model(**model_inputs, logits_to_keep=logits_to_keep)
-    except TypeError:
-        outputs = model(**inputs)
-        return outputs.loss
-    logits = outputs.logits
-    shifted_labels = torch.nn.functional.pad(labels, (0, 1), value=-100).index_select(1, logits_to_keep + 1)
-    return torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]).float(),
-        shifted_labels.reshape(-1),
-        ignore_index=-100,
-    )
-
-
-def _target_logit_positions(labels: torch.Tensor) -> torch.Tensor | None:
-    # A logit at position i predicts the label at position i + 1. Since all
-    # prompt/padding labels are -100, only positions before supervised target
-    # tokens need vocab projection.
-    if labels.shape[1] < 2:
-        return None
-    supervised_next_token = labels[:, 1:] != -100
-    positions = torch.nonzero(supervised_next_token.any(dim=0), as_tuple=False).flatten()
-    if positions.numel() == 0:
-        return None
-    return positions.to(device=labels.device, dtype=torch.long)
-
-
 def _evaluate_loss(
     *,
     loaded,
@@ -1027,12 +1042,14 @@ def _evaluate_loss(
     hl_config: HLMemoryConfig,
     frame_cache: FrameCache,
     device: torch.device,
-) -> float:
+    two_pass_predict_loss_weight: float,
+    two_pass_confirm_loss_weight: float,
+) -> dict[str, float]:
     if num_batches <= 0:
         raise ValueError("--val-batches must be positive when validation is enabled.")
     was_training = loaded.model.training
     loaded.model.eval()
-    total_loss = 0.0
+    total_metrics: dict[str, float] = {}
     try:
         with torch.no_grad():
             for _ in range(num_batches):
@@ -1051,7 +1068,12 @@ def _evaluate_loss(
                         f"HL validation sample {bad_sample.sample_id} produced zero supervised target tokens "
                         "after label masking."
                     )
-                loss = _compute_target_loss(loaded.model, inputs)
+                loss, loss_metrics = compute_hl_target_loss_with_metrics(
+                    loaded.model,
+                    inputs,
+                    two_pass_predict_weight=two_pass_predict_loss_weight,
+                    two_pass_confirm_weight=two_pass_confirm_loss_weight,
+                )
                 loss_value = float(loss.detach().cpu())
                 if not math.isfinite(loss_value):
                     sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
@@ -1059,11 +1081,11 @@ def _evaluate_loss(
                         f"Non-finite HL validation loss for batch sample_ids={sample_ids}: loss={loss_value} "
                         f"input_shape={tuple(inputs['input_ids'].shape)}."
                     )
-                total_loss += loss_value
+                _accumulate_loss_metrics(total_metrics, loss_metrics)
     finally:
         if was_training:
             loaded.model.train()
-    return total_loss / num_batches
+    return {name: value / num_batches for name, value in sorted(total_metrics.items())}
 
 
 def _init_distributed(args: TrainArgs) -> bool:
@@ -1090,6 +1112,27 @@ def _mean_across_ranks(value: float, *, device: torch.device) -> float:
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
     tensor /= dist.get_world_size()
     return float(tensor.detach().cpu())
+
+
+def _mean_metric_dict_across_ranks(metrics: dict[str, float], *, device: torch.device) -> dict[str, float]:
+    return {name: _mean_across_ranks(value, device=device) for name, value in metrics.items()}
+
+
+def _accumulate_loss_metrics(
+    total: dict[str, float],
+    metrics: dict[str, torch.Tensor],
+    *,
+    loss_scale: float = 1.0,
+) -> None:
+    for name, value in metrics.items():
+        numeric = float(value.detach().cpu())
+        scale = loss_scale if name == "loss" or name.startswith("loss_") else 1.0
+        total[name] = total.get(name, 0.0) + numeric * scale
+
+
+def _accumulate_float_metrics(total: dict[str, float], metrics: dict[str, float]) -> None:
+    for name, value in metrics.items():
+        total[name] = total.get(name, 0.0) + float(value)
 
 
 def _should_profile_step(args: TrainArgs, step: int) -> bool:
@@ -1172,12 +1215,34 @@ def _clip_grad_norm(model: torch.nn.Module, max_norm: float) -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
 
-def _sample_batch(samples: list[RuntimeSample], batch_size: int, rng: random.Random):
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive.")
-    if len(samples) >= batch_size:
-        return rng.sample(samples, batch_size)
-    return [rng.choice(samples) for _ in range(batch_size)]
+def _sample_batch(
+    samples: list[RuntimeSample],
+    batch_size: int,
+    rng: random.Random,
+    *,
+    keyframe_positive_sample_ratio: float = 0.0,
+    keyframe_confirm_positive_sample_ratio: float = 0.0,
+    target_protocol: str = "hl_v1",
+    keyframe_candidate_label_mode: str = "event_band",
+):
+    return sample_keyframe_stratified(
+        samples,
+        batch_size,
+        rng,
+        sample_from_item=lambda item: item.sample,
+        keyframe_positive_sample_ratio=keyframe_positive_sample_ratio,
+        keyframe_confirm_positive_sample_ratio=keyframe_confirm_positive_sample_ratio,
+        target_protocol=target_protocol,
+        keyframe_candidate_label_mode=keyframe_candidate_label_mode,
+    )
+
+
+def _sample_with_replacement(samples: list[RuntimeSample], count: int, rng: random.Random) -> list[RuntimeSample]:
+    if count <= 0:
+        return []
+    if len(samples) >= count:
+        return rng.sample(samples, count)
+    return [rng.choice(samples) for _ in range(count)]
 
 
 def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryConfig, train_args: TrainArgs, is_main: bool) -> None:

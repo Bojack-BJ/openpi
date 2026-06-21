@@ -6,7 +6,7 @@
 
 ```bash
 export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi/src
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="${WANDB_API_KEY}"
 export WANDB_MODE=online
 
 torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory_multitask.py \
@@ -91,6 +91,40 @@ Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 promp
 - `--target-protocol hl_v1`：默认完整 HL V1 target，监督 `task_progress/current_objective/subtask_progress/should_advance_objective/active_hand/relevant_objects/notes/keyframes/...`。
 - `--target-protocol subtask_keyframe`：更纯的视觉时序 baseline，只监督 `{"current_objective": "...", "keyframe_candidate_positions": [...]}`。这里的 objective 是当前帧的 executable instruction，更适合作为 LL VLA 的语言目标；不监督 language memory、progress、advance、target/goal/notes。
 - `--target-protocol memer_objective`：MEMER-style 简化 target，监督 `{"current_objective": "...", "horizon_current_objective": "...", "keyframe_candidate_positions": [...]}`。`current_objective` 是当前帧目标，`horizon_current_objective` 是 short-horizon 目标；如果 sample 没有 horizon 字段，horizon fallback 到 current。
+- `--target-protocol objective_memory_state`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/updated_language_memory`，prompt 额外输入 `language_memory`。用于测试模型是否能消费并更新 compact memory。
+- `--target-protocol objective_last_objective`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/last_objective`。不把 `last_objective` 放进 prompt；它是训练辅助输出，推理可忽略。
+- `--target-protocol objective_prev_stage`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/previous_stage_objective`，prompt 额外输入 `previous_stage_objective`。用于测试模型是否能维护比 full memory 更轻的阶段状态。
+- `--target-protocol keyframe_gated_memory`：单 pass keyframe-gated target，监督 `current_objective/horizon_current_objective/keyframe_candidate_positions/completed_objective`。runtime 只在 `completed_objective` 非空且有 keyframe candidate 时更新 completed-event log。
+- `--target-protocol keyframe_gated_memory_two_pass`：two-pass typed target。训练时每个 sample 展开成 Pass A / Pass B 两条 VLM examples；Pass A 看 historical keyframes + 完整 recent window，只监督 current/horizon/keyframe proposal；Pass B 看 historical keyframes + candidate frames，只监督 canonical completed event，非 candidate recent frames 不进入 processor。训练时会对 GT proposal 做确定性位置扰动，并在 negative sample 上注入 false proposal，缩小 train/inference proposal exposure gap。Pass B prompt 不包含 GT current/horizon 文本。推理时 Pass A 无 candidate 会直接跳过 Pass B。
+- `--target-protocol known_prior_tracker`：监督 `current_objective/subtask_progress/should_advance_objective/keyframes`，用于已知 step prior 的状态机式对比实验；不建议作为当前主线。
+
+Keyframe candidate 默认使用 event-band 监督，而不是只在 coarse segment 末尾的单帧给正例：
+
+- `--keyframe-candidate-label-mode event_band`：只要 recent window 命中过渡点附近 band，就输出离 canonical keyframe 最近的一个 candidate position。
+- `--keyframe-event-band-before-sec 1.0 --keyframe-event-band-after-sec 0.5`：默认 band，提升 H088 这类短 transition 的 recall。
+- `--keyframe-candidate-label-mode canonical`：严格只监督 canonical keyframe，主要用于 ablation。
+- `--keyframe-positive-sample-ratio 0.4`：可选 loader-level sampling balance，让每个 batch 里约 40% 样本带 keyframe candidate。
+- `--keyframe-confirm-positive-sample-ratio 0.2`：仅用于 `keyframe_gated_memory_two_pass`，让约 20% source samples 是 canonical completion positives；该比例包含在上面的 40% proposal-positive 比例内。推荐三池比例为 canonical confirm 20%、event-band proposal-only 20%、negative 60%。
+- `--two-pass-training-proposal-noise-probability 0.25`：canonical/event-band positive 的 Pass B candidate 位置扰动概率。Negative sample 始终给 Pass B 一个 deterministic false proposal 并监督空 completion，从而训练拒绝错误 Pass A proposal。
+- `--two-pass-predict-loss-weight 1.0 --two-pass-confirm-loss-weight 1.0`：先分别对每条 Pass A/Pass B target 的 token loss 求均值，再按 pass 权重聚合。这样较短的 completion JSON 不会被较长的 Pass A JSON 按 token 数稀释。
+
+`keyframe_label` 仍然是 canonical 单点，`keyframe_gated_memory.completed_objective` 也只在 canonical event 上非空；event band 只扩大 candidate proposal 的视觉监督，不会让 long-term memory 存入每个 band 帧。
+
+采样按每个 source sample 独立做概率选择，不按 microbatch 内数量取整。这个区别在
+`batch_size=1` 时尤其重要：旧的 `round(batch_size * 0.4)` 会退化成 100% positive；
+当前实现会跨 rank 和 grad-accum microsteps 在期望意义上保持 20% / 20% / 60%。
+
+`objective_last_objective` 和 `objective_prev_stage` 不要求重新导出旧 `samples.jsonl`：loader 会按
+`episode_index/step_index` 自动补 `last_objective` 和 `previous_stage_objective`。但如果要修正
+`language_memory` 的历史累加内容，例如旧样本里一直是 `No completed subtask yet`，仍然需要重新 export dataset；
+loader 不能从旧字符串里恢复正确的 completed-subtasks memory。
+
+Context/state 训练方式：`objective_*` 协议不会改视频输入，核心 target 仍是 MEMER 的
+`current_objective/horizon_current_objective/keyframes`，但会额外监督一个状态字段。`objective_memory_state`
+在 prompt 里追加 `Completed-subtasks memory: ...`，并额外输出 `updated_language_memory`；
+`objective_last_objective` 不把 last objective 放进 prompt，而是额外输出 `last_objective` 作为训练辅助目标，
+推理时可忽略；`objective_prev_stage` 在 prompt 里追加 `Previous stage objective: ...`，并额外输出
+`previous_stage_objective`，用于测试模型是否能维护一个比 full memory 更轻的阶段状态。
 
 Proprio/state 输入默认关闭。打开后不是把 state 数字写进 prompt，而是把归一化 state 通过 MLP 投成 learned soft tokens，插入 Qwen text embedding 序列：
 
@@ -155,7 +189,7 @@ python scripts/hl_memory/train_hl_memory.py \
 
 ```bash
 export PYTHONPATH=/lumos-vePFS/suzhou/Users/lixiaotong/openpi/src
-export WANDB_API_KEY="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"
+export WANDB_API_KEY="${WANDB_API_KEY}"
 export WANDB_MODE=online
 
 torchrun --standalone --nproc_per_node 8 scripts/hl_memory/train_hl_memory.py \

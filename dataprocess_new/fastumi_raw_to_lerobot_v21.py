@@ -774,22 +774,6 @@ def read_frames_by_indices(video_path: Path, frame_indices: np.ndarray) -> Optio
     if frame_indices.size == 0:
         return []
 
-    # Require non-decreasing indices
-    if np.any(frame_indices[1:] < frame_indices[:-1]):
-        cap = cv2.VideoCapture(str(video_path))
-        if not cap.isOpened():
-            return None
-        frames: List[np.ndarray] = []
-        for fidx in frame_indices.tolist():
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fidx))
-            ok, fr = cap.read()
-            if not ok:
-                cap.release()
-                return None
-            frames.append(fr)
-        cap.release()
-        return frames
-
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return None
@@ -798,9 +782,17 @@ def read_frames_by_indices(video_path: Path, frame_indices: np.ndarray) -> Optio
     first = int(frame_indices[0])
     cap.set(cv2.CAP_PROP_POS_FRAMES, first)
     cur = first
+    last_index: int | None = None
+    last_frame: np.ndarray | None = None
 
     for target in frame_indices.tolist():
         target = int(target)
+        if last_index == target and last_frame is not None:
+            frames.append(last_frame.copy())
+            continue
+        if target < cur:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            cur = target
         # skip until reach target
         while cur < target:
             ok, _ = cap.read()
@@ -813,6 +805,8 @@ def read_frames_by_indices(video_path: Path, frame_indices: np.ndarray) -> Optio
             cap.release()
             return None
         frames.append(fr)
+        last_index = target
+        last_frame = fr
         cur += 1
 
     cap.release()

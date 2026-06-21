@@ -36,6 +36,14 @@ python scripts/hl_memory/eval_hl_memory_rollout.py \
 
 简化协议的主指标是 `objective_exact_match/objective_normalized_match` 和 `keyframe_precision/keyframe_recall`。progress、advance、language memory、target/goal 等指标仍会输出，但这些协议没有监督这些字段，不应作为主判断。`memer_objective` 额外训练 `horizon_current_objective`，主要用于学习短提前量；当前 eval 主表仍以 `current_objective` 为主。
 
+Event-band keyframe 训练后，per-frame keyframe precision/recall 只作为辅助指标。更重要的是：
+
+- `keyframe_event_recall`：同一个 canonical transition 在 event band 内是否至少被提出一次。
+- `keyframe_event_duplicate_predictions`：同一 sample 对同一 event 的重复 proposal 数。
+- `keyframe_event_timing_error`：预测 candidate 对应帧与 canonical event frame 的 frame-level 偏差。
+
+如果训练/export 使用了非默认候选模式，eval/rollout 也要显式传同样的 `--keyframe-candidate-label-mode` 和 event-band 秒数，确保 expected target 与训练一致。
+
 快速 smoke eval 可以先只跑少量未见 episode 或单个 ablation：
 
 ```bash
@@ -158,6 +166,23 @@ python scripts/hl_memory/run_hl_memory_zero_shot.py \
   --output-json /tmp/hl_rollout_known_prior/summary.json
 ```
 
+coarse rollout 如果要用 coarse objective 做可视化/语义评估 GT，不要依赖 raw session 里的 `subtask.json`。`session_path/subtask.json` 通常仍是 fine segment，直接用会导致 coarse 模型看起来“稳定但 GT 对不上”。应显式指定 coarse annotation JSONL 和对应 episode index：
+
+```bash
+python scripts/hl_memory/run_hl_memory_zero_shot.py \
+  --session-path /root/Users/segmentation_data_dtw/20260328K086A/20260408/task_20260328K086Aa_Making_sandwiches__generalization_of_ingredient_order_and_interference_items/background/multi_session_20260408/session_113030 \
+  --instruction "Use left to pick bread from left side of toaster and place flat on plate use right to pick steak and place flat on top of bread on plate use right to pick lettuce and place flat on top of steak use left to grab bread from toaster" \
+  --ground-truth-annotations-path /root/Users/dataset/lerobot_home/subtask/20260328K086A/hl_annotations_llm_normalized_coarse.jsonl \
+  --ground-truth-episode-index 0 \
+  --ground-truth-field current_objective \
+  --target-protocol memer_objective \
+  --rollout-interval-sec 1 \
+  --debug-dir /root/Users/lixiaotong/HL_MEM_rollout/K086A_coarse_memer_baseline \
+  --output-json /root/Users/lixiaotong/HL_MEM_rollout/K086A_coarse_memer_baseline/summary.json
+```
+
+这里的 `--ground-truth-*` 只影响 `ground_truth_subtask`、debug panel 和后续 semantic judge，不改变模型输入 prompt；模型输入仍由 `--instruction`、`--task-config-path`、language memory 和视频/proprio 决定。`--ground-truth-field` 默认 `current_objective`，coarse 数据建议保持这个默认值。`--ground-truth-fps` 默认复用 `--training-fps`，K086A 当前为 `20.0`。GT 匹配按 `recent_end_sec * fps` 转成 frame index，再在指定 episode 的 annotation rows 中选最近 frame。
+
 Input rules：
 
 - 单视角 `--video-path` 映射为 `front`。
@@ -178,6 +203,10 @@ Input rules：
 | `--video-path` | 单视角输入视频，内部视角名为 `front`。 |
 | `--left-video-path` / `--right-video-path` | 双视角输入视频，内部视角名为 `robot_0` / `robot_1`，同一时间抽帧后横向拼接成一张 HL frame。 |
 | `--task-config-path` | JSON task plan，可提供 `task_description` 和 `steps`，作为分段先验；视觉证据优先级仍高于 plan。 |
+| `--ground-truth-annotations-path` | 可选 GT JSONL，只用于 rollout summary/debug/eval 的 `ground_truth_subtask`，不进入 prompt。coarse rollout 应指向 `hl_annotations_llm_normalized_coarse.jsonl`。 |
+| `--ground-truth-episode-index` | `--ground-truth-annotations-path` 对应的 LeRobot episode index；必须和当前 raw session 对齐。 |
+| `--ground-truth-field` | 从 GT JSONL 读取的字段，默认 `current_objective`；coarse/fine objective GT 都推荐用这个字段。 |
+| `--ground-truth-fps` | 将 rollout 秒数映射到 annotation `frame_index` 的 fps；默认复用 `--training-fps`。 |
 | `--known-prior-mode` | 将 `task-config-path` 的 step/subtask 序列作为显式状态机，不让模型自由决定下一步 objective；适合已知流程或先由 thinking 大模型离线拆解出 steps 的任务。 |
 | `--known-prior-start-index` | known-prior 初始 step index，0-based，默认 `0`。 |
 | `--known-prior-advance-threshold` | 如果模型没有显式输出 `should_advance_objective=true`，则用 `subtask_progress >= threshold` 推进到下一 prior step，默认 `0.65`；当前模型常输出粗粒度 `0.33/0.66`，用 `0.95` 很容易永远不切。 |
@@ -193,7 +222,7 @@ Input rules：
 | `--local-vlm-ckpt-path` | 本地 VLM/checkpoint 路径；设置后优先覆盖 `--model-path`。 |
 | `--vlm-backend` | VLM 后端，常用 `qwen2_5_vl` 或 `qwen3_5_vl`。 |
 | `--vlm-variant` | Qwen3.5 变体，例如 `qwen3_5_2b`，也可用短名 `2b` / `4b` / `27b`。 |
-| `--target-protocol` | 推理 prompt/输出协议，默认 `hl_v1`；`subtask_keyframe` 输出当前 objective + keyframes，`memer_objective` 输出当前 objective + horizon objective + keyframes。 |
+| `--target-protocol` | 推理 prompt/输出协议，默认 `hl_v1`；`subtask_keyframe` 输出当前 objective + keyframes，`memer_objective` 输出当前 objective + horizon objective + keyframes；`objective_memory_state` / `objective_last_objective` / `objective_prev_stage` 都输出 current + horizon objective + keyframes，并分别额外预测 memory、last objective、previous-stage objective 状态字段。 |
 | `--precision` | 推理精度，常用 `float16` 或 `bfloat16`；遇到 vision/cuDNN 问题先试 `float16`。 |
 | `--device` | 推理设备，通常是 `cuda`；CPU 只适合小模型/调试。 |
 
@@ -207,12 +236,26 @@ clip 和 memory 参数：
 | `--training-fps` | HL 训练导出所基于的 LeRobot fps，默认 `20.0`。 |
 | `--frame-subsample` | 旧兼容参数；固定窗口模式下不决定 recent clip 总时长。 |
 | `--recent-seconds` | 手动指定 recent clip 秒数列表，例如 `10,12,14`；不能和 rollout interval 模式一起用。 |
+| `--last-objective` | 单次推理或 rollout 初始化时传入上一轮 objective；当前 `objective_last_objective` 只把它作为辅助输出监督，不作为 prompt 输入。 |
+| `--previous-stage-objective` | 单次推理或 rollout 初始化时传入上一段不同 objective；主要给 `objective_prev_stage` 用。无 GT 时 rollout 会根据模型输出的 objective transition 自维护。 |
 | `--memory-seconds` | 手动指定历史 memory keyframe 秒数列表，例如 `2,8,15`。 |
 | `--auto-memory` | 单次预测时自动从 recent 前面的时间段取 memory frames；rollout 模式会关闭它并使用上一步 keyframes。 |
 | `--recent-frames-length` | recent clip 最大帧数，默认 `8`。 |
 | `--memory-length` | memory clip 最大帧数，默认 `8`。 |
 | `--frame-height` / `--frame-width` | 输入 VLM 前的固定双槽画布尺寸，默认 `456x224`（width x height），即两个 `224x224` 视角槽加 `8px` gap。 |
 | `--allow-single-frame-fallback` | 视频太短或时间点不足时允许复用单帧补齐，方便调试短视频。 |
+
+State context runtime behavior:
+
+- `objective_memory_state` reads `language_memory` from CLI/rollout state and injects it as one prompt line,
+  `Completed-subtasks memory: ...`; the next rollout memory uses the model's `updated_language_memory`.
+- `objective_last_objective` does not inject last objective into the prompt. The model predicts `last_objective` as an
+  auxiliary output for analysis/training, and interval rollout can ignore it.
+- `objective_prev_stage` injects `Previous stage objective: ...`; interval rollout initializes it from
+  `--previous-stage-objective`, then updates it from the model's predicted `previous_stage_objective` when present, with
+  objective-transition fallback.
+- The output schema remains MEMER-style current + horizon objective + keyframes, plus the one state field for the chosen
+  protocol.
 
 rollout 和调试参数：
 
@@ -230,6 +273,19 @@ rollout 和调试参数：
 | `--embedding-debug-dir` | 保存 prompt token、last hidden state、可用 attention heatmap、text/image top attention、image-token latent PCA；用于分析模型是否看图/看 memory。 |
 | `--embedding-debug-max-tokens` | attention heatmap 最多可视化多少个 token，默认 `160`，避免长 prompt 图片过大。 |
 | `--debug-video-fps` | 用 debug panels 合成 rollout debug 视频的 FPS。 |
+
+### Protocol-aware rollout artifacts
+
+Rollout `summary.json`, `rollout.jsonl`, `rollout_pretty.json`, and debug panels only expose fields used by the selected
+`--target-protocol`:
+
+- `objective_memory_state`: input shows `completed_subtasks_memory`; output shows `updated_language_memory`.
+- `objective_prev_stage`: input/output show `previous_stage_objective`; language memory and last-objective fields are omitted.
+- `objective_last_objective`: no text state is supplied as input; output shows the auxiliary `last_objective`.
+- Common visual inputs are represented by `historical_keyframe_seconds` and `recent_frame_seconds`.
+
+Each rollout step uses an `input` / `output` structure. Parser details and saved artifact paths are nested under
+`diagnostics`, so compatibility fields that are not part of the active protocol do not look like model inputs.
 | `--max-new-tokens` | 非 thinking 模式的最大生成 token 数。 |
 | `--enable-thinking` | 打开 Qwen thinking；默认关闭，建议先关闭以保证 JSON 输出稳定。 |
 | `--parallel-mode` | 大模型加载方式；单卡默认 `none`，27B OOM 时可试 `device_map`。 |

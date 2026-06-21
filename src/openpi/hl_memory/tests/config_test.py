@@ -91,6 +91,53 @@ def test_target_protocol_accepts_subtask_keyframe():
     assert config.target_protocol == "subtask_keyframe"
 
 
+def test_target_protocol_accepts_known_prior_tracker():
+    config = HLMemoryConfig(target_protocol="known_prior_tracker")
+
+    assert config.target_protocol == "known_prior_tracker"
+
+
+def test_target_protocol_accepts_state_context_objective_protocols():
+    for protocol in ("objective_memory_state", "objective_last_objective", "objective_prev_stage"):
+        config = HLMemoryConfig(target_protocol=protocol)
+
+        assert config.target_protocol == protocol
+
+
+def test_target_protocol_accepts_keyframe_gated_memory():
+    config = HLMemoryConfig(target_protocol="keyframe_gated_memory")
+
+    assert config.target_protocol == "keyframe_gated_memory"
+
+
+def test_target_protocol_accepts_keyframe_gated_memory_two_pass():
+    config = HLMemoryConfig(target_protocol="keyframe_gated_memory_two_pass")
+
+    assert config.target_protocol == "keyframe_gated_memory_two_pass"
+
+
+def test_typed_mask_protocol_requires_qwen25():
+    config = HLMemoryConfig(
+        vlm_backend="qwen2_5_vl",
+        target_protocol="keyframe_gated_memory_typed_mask",
+    )
+    assert config.target_protocol == "keyframe_gated_memory_typed_mask"
+
+    with pytest.raises(ValueError, match="only supported"):
+        HLMemoryConfig(
+            vlm_backend="qwen3_5_vl",
+            target_protocol="keyframe_gated_memory_typed_mask",
+        )
+
+
+def test_two_pass_training_proposal_noise_probability_is_validated():
+    config = HLMemoryConfig(two_pass_training_proposal_noise_probability=0.25)
+
+    assert config.two_pass_training_proposal_noise_probability == 0.25
+    with pytest.raises(ValueError, match="two_pass_training_proposal_noise_probability"):
+        HLMemoryConfig(two_pass_training_proposal_noise_probability=1.1)
+
+
 def test_target_protocol_rejects_unknown_value():
     with pytest.raises(ValueError, match="target_protocol"):
         HLMemoryConfig(target_protocol="unknown")  # type: ignore[arg-type]

@@ -35,6 +35,21 @@ from openpi.hl_memory.zero_shot import update_rollout_memory_seconds
 from openpi.hl_memory.zero_shot import write_debug_video
 
 
+_GROUND_TRUTH_ANNOTATION_CACHE: dict[tuple[str, int, str], tuple[tuple[int, str], ...]] = {}
+_OBJECT_MASK_INDEX_CACHE: dict[str, tuple[tuple[int, pathlib.Path], ...]] = {}
+_KEYFRAME_GATED_PROTOCOLS = {
+    "keyframe_gated_memory",
+    "keyframe_gated_memory_typed_mask",
+    "keyframe_gated_memory_two_pass",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class KeyframeGatedRolloutState:
+    completed_events: tuple[str, ...] = ()
+    accepted_keyframe_seconds: tuple[float, ...] = ()
+
+
 @dataclasses.dataclass
 class ZeroShotArgs:
     """Run one-shot or interval rollout HL-memory inference on single-view or dual-view videos."""
@@ -46,6 +61,14 @@ class ZeroShotArgs:
     right_video_path: pathlib.Path | None = None
     session_path: pathlib.Path | None = None
     task_config_path: pathlib.Path | None = None
+    ground_truth_annotations_path: pathlib.Path | None = None
+    ground_truth_episode_index: int | None = None
+    ground_truth_field: str = "current_objective"
+    ground_truth_fps: float | None = None
+    object_context_enabled: bool = False
+    object_name: str = ""
+    object_mask_dir: pathlib.Path | None = None
+    object_mask_frame_fps: float | None = None
 
     # Optional YAML config and model checkpoint/source.
     config_yaml: pathlib.Path | None = None
@@ -63,6 +86,8 @@ class ZeroShotArgs:
 
     # Runtime memory and clip selection.
     language_memory: str = ""
+    last_objective: str = ""
+    previous_stage_objective: str = ""
     memory_input_mode: str = "full"
     memory_seconds: str | None = None
     recent_seconds: str | None = None
@@ -117,6 +142,9 @@ class ZeroShotArgs:
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
     proprio_norm_stats_path: pathlib.Path | None = None
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: str = "event_band"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -135,10 +163,23 @@ def main(args: ZeroShotArgs) -> None:
     _resolve_video_paths(args)
     if args.task_config_path is not None:
         _load_task_config(args.task_config_path)
+    if args.ground_truth_annotations_path is not None:
+        _load_ground_truth_annotations(
+            args.ground_truth_annotations_path,
+            episode_index=args.ground_truth_episode_index,
+            field=args.ground_truth_field,
+        )
+    if args.ground_truth_fps is not None and args.ground_truth_fps <= 0:
+        raise ValueError("`--ground-truth-fps` must be positive when set.")
+    if args.object_mask_frame_fps is not None and args.object_mask_frame_fps <= 0:
+        raise ValueError("`--object-mask-frame-fps` must be positive when set.")
     if args.memory_input_mode not in {"full", "completed_only", "empty"}:
         raise ValueError("`--memory-input-mode` must be one of `full`, `completed_only`, or `empty`.")
     if args.target_protocol == "memer_objective" and args.known_prior_mode:
-        raise ValueError("`--target-protocol memer_objective` does not support `--known-prior-mode` in v1.")
+        raise ValueError(
+            "`--target-protocol memer_objective` does not support `--known-prior-mode`; "
+            "use `--target-protocol known_prior_tracker` for state-machine rollout."
+        )
     if args.proprio_enabled and args.session_path is None:
         raise ValueError("Zero-shot proprio input requires `--session-path` for RGB/trajectory alignment.")
     config = HLMemoryConfig(
@@ -168,6 +209,9 @@ def main(args: ZeroShotArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
+        keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
+        keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
     )
     adapter = create_hf_adapter(config)
     resolved_model_path = args.model_path
@@ -304,6 +348,10 @@ def _cli_option_was_set(*option_names: str) -> bool:
     return False
 
 
+def _normalize_text(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
 def _run_single_prediction(
     args: ZeroShotArgs,
     *,
@@ -324,20 +372,30 @@ def _run_single_prediction(
     sample = build_zero_shot_sample(
         video_path=_sample_video_path(args),
         instruction=_instruction_with_task_plan(args),
-        language_memory=_language_memory_for_model(args.language_memory, args.memory_input_mode),
+        language_memory=_protocol_language_memory_input(
+            config.target_protocol,
+            args.language_memory,
+            args.memory_input_mode,
+        ),
+        last_objective=args.last_objective if config.target_protocol == "objective_last_objective" else "",
+        previous_stage_objective=(
+            args.previous_stage_objective if config.target_protocol == "objective_prev_stage" else ""
+        ),
         step_prior=_task_config_steps(args.task_config_path),
         memory_seconds=selection.memory_seconds,
         recent_seconds=selection.recent_seconds,
     )
     sample = _attach_runtime_proprio(sample, args=args, config=config, recent_seconds=selection.recent_seconds)
+    sample = _attach_runtime_object_context(sample, args=args, recent_seconds=selection.recent_seconds)
     generation = adapter.generate_prediction(loaded, sample, clips, device=args.device)
     recent_end_sec = selection.recent_seconds[-1] if selection.recent_seconds else 0.0
-    prediction, memory_rule_applied = apply_rollout_language_memory_rule(
+    prediction, memory_rule_applied = _apply_protocol_runtime_prediction(
+        config.target_protocol,
         generation.prediction,
         previous_memory=args.language_memory,
         recent_end_sec=recent_end_sec,
     )
-    ground_truth_subtask = _task_config_subtask_at(args.task_config_path, recent_end_sec)
+    ground_truth_subtask = _ground_truth_subtask_at(args, recent_end_sec)
     candidate_seconds = keyframe_candidate_seconds(
         prediction,
         selection,
@@ -352,10 +410,19 @@ def _run_single_prediction(
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
         "instruction": args.instruction,
         "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
-        "step_prior": list(sample.step_prior),
-        "language_memory": args.language_memory,
-        "memory_input_mode": args.memory_input_mode,
-        "language_memory_input": sample.language_memory,
+        "ground_truth_annotations_path": (
+            None if args.ground_truth_annotations_path is None else str(args.ground_truth_annotations_path)
+        ),
+        "ground_truth_episode_index": args.ground_truth_episode_index,
+        "ground_truth_field": args.ground_truth_field,
+        "ground_truth_fps": _ground_truth_fps(args),
+        "input": _protocol_input_payload(
+            config.target_protocol,
+            sample=sample,
+            memory_seconds=selection.memory_seconds,
+            recent_seconds=selection.recent_seconds,
+            proprio_enabled=config.proprio_enabled,
+        ),
         "duration_sec": selection.duration_sec,
         "recent_step_sec": _resolved_recent_step_sec(args),
         "recent_sample_hz": args.recent_sample_hz,
@@ -370,13 +437,17 @@ def _run_single_prediction(
         "recent_valid_length": clips.recent_valid_length,
         "proprio_enabled": config.proprio_enabled,
         "proprio_norm_stats_path": _payload_proprio_norm_stats_path(args),
-        "raw_model_output": generation.raw_output,
-        "parse_error": generation.parse_error,
-        "model_prediction": generation.prediction.to_dict(),
-        "prediction": prediction.to_dict(),
+        "object_context_enabled": args.object_context_enabled,
+        "object_name": sample.object_name,
+        "recent_object_center_points": [list(point) for point in sample.recent_object_center_points],
+        "output": _protocol_prediction_payload(config.target_protocol, prediction),
         "ground_truth_subtask": ground_truth_subtask,
-        "language_memory_rule_applied": memory_rule_applied,
-        "keyframe_candidate_seconds": list(candidate_seconds),
+        "diagnostics": {
+            "raw_model_output": generation.raw_output,
+            "parse_error": generation.parse_error,
+            "language_memory_rule_applied": memory_rule_applied,
+            "keyframe_candidate_seconds": list(candidate_seconds),
+        },
     }
 
     if args.debug_dir is not None:
@@ -394,6 +465,9 @@ def _run_single_prediction(
             selection=selection,
             prediction=prediction,
             recent_end_sec=recent_end_sec,
+            target_protocol=config.target_protocol,
+            instruction=sample.instruction,
+            state_input=_protocol_state_input(config.target_protocol, sample),
             language_memory_before=sample.language_memory,
             language_memory_after=prediction.updated_language_memory,
             memory_seconds_before=selection.memory_seconds,
@@ -445,11 +519,18 @@ def _run_rollout(
     recent_step_sec = _resolved_recent_step_sec(args)
     memory_seconds = tuple(parse_seconds_argument(args.memory_seconds))
     keyframe_vote_seconds = list(memory_seconds)
+    keyframe_gated_state = KeyframeGatedRolloutState(
+        completed_events=_parse_completed_event_log(args.language_memory),
+        accepted_keyframe_seconds=memory_seconds,
+    )
     known_prior_steps = _known_prior_steps(args)
     known_prior_index = _initial_known_prior_index(args, known_prior_steps)
     known_prior_stall_steps = 0
     known_prior_next_step_confirmation_index: int | None = None
     known_prior_next_step_confirmation_steps = 0
+    last_objective = args.last_objective.strip()
+    previous_stage_objective = args.previous_stage_objective.strip()
+    current_stage_objective = last_objective
     if known_prior_steps and not language_memory.strip():
         language_memory = _known_prior_language_memory(
             known_prior_steps,
@@ -466,7 +547,13 @@ def _run_rollout(
         known_prior_index_before = known_prior_index
         known_prior_match: dict[str, object] | None = None
         language_memory_before = language_memory
-        language_memory_input = _language_memory_for_model(language_memory_before, args.memory_input_mode)
+        language_memory_input = _protocol_language_memory_input(
+            config.target_protocol,
+            _render_completed_event_log(keyframe_gated_state.completed_events)
+            if config.target_protocol in _KEYFRAME_GATED_PROTOCOLS
+            else language_memory_before,
+            args.memory_input_mode,
+        )
         clips, selection = _build_clips_from_args(
             args,
             config=config,
@@ -483,13 +570,19 @@ def _run_rollout(
                 known_prior_index=known_prior_index if known_prior_steps else None,
             ),
             language_memory=language_memory_input,
+            last_objective=last_objective if config.target_protocol == "objective_last_objective" else "",
+            previous_stage_objective=(
+                previous_stage_objective if config.target_protocol == "objective_prev_stage" else ""
+            ),
             step_prior=known_prior_steps or _task_config_steps(args.task_config_path),
             memory_seconds=selection.memory_seconds,
             recent_seconds=selection.recent_seconds,
         )
         sample = _attach_runtime_proprio(sample, args=args, config=config, recent_seconds=selection.recent_seconds)
+        sample = _attach_runtime_object_context(sample, args=args, recent_seconds=selection.recent_seconds)
         generation = adapter.generate_prediction(loaded, sample, clips, device=args.device)
-        prediction, memory_rule_applied = apply_rollout_language_memory_rule(
+        prediction, memory_rule_applied = _apply_protocol_runtime_prediction(
+            config.target_protocol,
             generation.prediction,
             previous_memory=language_memory_before,
             recent_end_sec=end_sec,
@@ -520,20 +613,45 @@ def _run_rollout(
                 known_prior_stall_steps += 1
                 known_prior_next_step_confirmation_index = known_prior_match["next_step_confirmation_index"]
                 known_prior_next_step_confirmation_steps = int(known_prior_match["next_step_confirmation_steps"])
-        ground_truth_subtask = _task_config_subtask_at(args.task_config_path, end_sec)
+        predicted_objective = prediction.current_objective.strip()
+        predicted_previous_stage_objective = prediction.previous_stage_objective.strip()
+        if predicted_objective:
+            if predicted_previous_stage_objective:
+                previous_stage_objective = predicted_previous_stage_objective
+                if _normalize_text(predicted_objective) != _normalize_text(current_stage_objective):
+                    current_stage_objective = predicted_objective
+            elif current_stage_objective and _normalize_text(predicted_objective) != _normalize_text(current_stage_objective):
+                previous_stage_objective = current_stage_objective
+                current_stage_objective = predicted_objective
+            elif not current_stage_objective:
+                current_stage_objective = predicted_objective
+        ground_truth_subtask = _ground_truth_subtask_at(args, end_sec)
         candidate_seconds = keyframe_candidate_seconds(
             prediction,
             selection,
             recent_valid_length=clips.recent_valid_length,
         )
-        keyframe_vote_seconds.extend(candidate_seconds)
-        memory_seconds = update_rollout_memory_seconds(
-            keyframe_vote_seconds,
-            (),
-            memory_length=config.memory_length,
-            merge_distance_sec=args.keyframe_merge_distance_sec,
-        )
-        language_memory = prediction.updated_language_memory
+        keyframe_gated_update: dict[str, object] | None = None
+        if config.target_protocol in _KEYFRAME_GATED_PROTOCOLS:
+            keyframe_gated_state, keyframe_gated_update = _update_keyframe_gated_rollout_state(
+                keyframe_gated_state,
+                prediction=prediction,
+                candidate_seconds=candidate_seconds,
+                memory_length=config.memory_length,
+                merge_distance_sec=args.keyframe_merge_distance_sec,
+            )
+            memory_seconds = keyframe_gated_state.accepted_keyframe_seconds
+            language_memory = _render_completed_event_log(keyframe_gated_state.completed_events)
+        else:
+            keyframe_vote_seconds.extend(candidate_seconds)
+            memory_seconds = update_rollout_memory_seconds(
+                keyframe_vote_seconds,
+                (),
+                memory_length=config.memory_length,
+                merge_distance_sec=args.keyframe_merge_distance_sec,
+            )
+        if config.target_protocol in {"hl_v1", "known_prior_tracker", "objective_memory_state"}:
+            language_memory = prediction.updated_language_memory
 
         saved_keyframes: list[str] = []
         debug_panel_path: pathlib.Path | None = None
@@ -557,11 +675,15 @@ def _run_rollout(
                 prediction=prediction,
                 step_index=step_index,
                 recent_end_sec=end_sec,
+                target_protocol=config.target_protocol,
+                instruction=sample.instruction,
+                state_input=_protocol_state_input(config.target_protocol, sample),
                 language_memory_before=language_memory_input,
                 language_memory_after=language_memory,
                 memory_seconds_before=memory_before,
                 memory_seconds_after=memory_seconds,
                 keyframe_candidate_seconds=candidate_seconds,
+                state_update=_format_keyframe_gated_state_update(keyframe_gated_update),
                 ground_truth_subtask=ground_truth_subtask,
                 parse_error=generation.parse_error,
             )
@@ -583,42 +705,30 @@ def _run_rollout(
             {
                 "step_index": step_index,
                 "recent_end_sec": end_sec,
-                "language_memory_before": language_memory_before,
-                "language_memory_input": language_memory_input,
-                "language_memory_after": language_memory,
-                "known_prior_mode": bool(known_prior_steps),
-                "known_prior_steps": list(known_prior_steps),
-                "known_prior_index_before": known_prior_index_before if known_prior_steps else None,
-                "known_prior_index_after": known_prior_index if known_prior_steps else None,
-                "known_prior_current_step": known_prior_steps[known_prior_index] if known_prior_steps else None,
-                "known_prior_stall_steps": known_prior_stall_steps if known_prior_steps else None,
-                "known_prior_next_step_confirmation_index": (
-                    known_prior_next_step_confirmation_index if known_prior_steps else None
+                "input": _protocol_input_payload(
+                    config.target_protocol,
+                    sample=sample,
+                    memory_seconds=memory_before,
+                    recent_seconds=selection.recent_seconds,
+                    proprio_enabled=config.proprio_enabled,
                 ),
-                "known_prior_next_step_confirmation_steps": (
-                    known_prior_next_step_confirmation_steps if known_prior_steps else None
-                ),
-                "known_prior_match": known_prior_match,
-                "memory_seconds_before": list(memory_before),
-                "memory_seconds_after": list(memory_seconds),
-                "keyframe_vote_seconds": list(keyframe_vote_seconds),
-                "recent_seconds": list(selection.recent_seconds),
-                "memory_valid_length": clips.memory_valid_length,
-                "recent_valid_length": clips.recent_valid_length,
-                "proprio_enabled": config.proprio_enabled,
-                "raw_model_output": generation.raw_output,
-                "parse_error": generation.parse_error,
-                "model_prediction": generation.prediction.to_dict(),
-                "prediction": prediction.to_dict(),
+                "output": _protocol_prediction_payload(config.target_protocol, prediction),
                 "ground_truth_subtask": ground_truth_subtask,
-                "language_memory_rule_applied": memory_rule_applied,
-                "keyframe_candidate_seconds": list(candidate_seconds),
-                "debug_dir": None if step_debug_dir is None else str(step_debug_dir),
-                "debug_panel_path": None if debug_panel_path is None else str(debug_panel_path),
-                "saved_keyframe_candidate_paths": saved_keyframes,
-                "embedding_debug": embedding_debug_payload,
+                "diagnostics": {
+                    "raw_model_output": generation.raw_output,
+                    "parse_error": generation.parse_error,
+                    "keyframe_candidate_seconds": list(candidate_seconds),
+                    **({"state_update": keyframe_gated_update} if keyframe_gated_update is not None else {}),
+                    "debug_dir": None if step_debug_dir is None else str(step_debug_dir),
+                    "debug_panel_path": None if debug_panel_path is None else str(debug_panel_path),
+                    "saved_keyframe_candidate_paths": saved_keyframes,
+                },
+                **({"known_prior_match": known_prior_match} if known_prior_steps else {}),
+                **({"embedding_debug": embedding_debug_payload} if embedding_debug_payload is not None else {}),
             }
         )
+        if predicted_objective:
+            last_objective = predicted_objective
         _write_live_rollout_summary(
             args.output_json,
             _build_rollout_payload(
@@ -688,7 +798,7 @@ def _build_rollout_payload(
     debug_video_path: pathlib.Path | None = None,
     debug_video_error: str | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "video_paths": _payload_video_paths_from_args(args),
         "session_path": None if args.session_path is None else str(args.session_path),
         "model_path": args.model_path,
@@ -696,6 +806,12 @@ def _build_rollout_payload(
         "resolved_model_id": config.resolved_model_id if resolved_model_path is None else resolved_model_path,
         "instruction": args.instruction,
         "task_config_path": None if args.task_config_path is None else str(args.task_config_path),
+        "ground_truth_annotations_path": (
+            None if args.ground_truth_annotations_path is None else str(args.ground_truth_annotations_path)
+        ),
+        "ground_truth_episode_index": args.ground_truth_episode_index,
+        "ground_truth_field": args.ground_truth_field,
+        "ground_truth_fps": _ground_truth_fps(args),
         "initial_language_memory": args.language_memory,
         "duration_sec": duration_sec,
         "rollout_interval_sec": args.rollout_interval_sec,
@@ -709,29 +825,278 @@ def _build_rollout_payload(
         "video_fps": config.video_fps,
         "target_protocol": config.target_protocol,
         "proprio_enabled": config.proprio_enabled,
-        "proprio_norm_stats_path": _payload_proprio_norm_stats_path(args),
         "keyframe_merge_distance_sec": args.keyframe_merge_distance_sec,
-        "known_prior_mode": bool(known_prior_steps),
-        "memory_input_mode": args.memory_input_mode,
-        "known_prior_steps": list(known_prior_steps),
-        "step_prior": list(known_prior_steps or _task_config_steps(args.task_config_path)),
-        "known_prior_advance_threshold": args.known_prior_advance_threshold,
-        "known_prior_match_threshold": args.known_prior_match_threshold,
-        "known_prior_max_advance_steps": args.known_prior_max_advance_steps,
-        "known_prior_next_step_require_completion": args.known_prior_next_step_require_completion,
-        "known_prior_next_step_confirm_steps": args.known_prior_next_step_confirm_steps,
-        "known_prior_safe_skip_mode": args.known_prior_safe_skip_mode,
-        "known_prior_skip_match_threshold": args.known_prior_skip_match_threshold,
-        "known_prior_skip_min_progress": args.known_prior_skip_min_progress,
-        "known_prior_skip_min_stall_steps": args.known_prior_skip_min_stall_steps,
-        "final_known_prior_index": known_prior_index if known_prior_steps else None,
-        "final_language_memory": language_memory,
         "final_memory_seconds": list(memory_seconds),
         "debug_dir": None if debug_dir is None else str(debug_dir),
         "debug_video_path": None if debug_video_path is None else str(debug_video_path),
         "debug_video_error": debug_video_error,
         "steps": steps,
     }
+    if config.proprio_enabled:
+        payload["proprio_norm_stats_path"] = _payload_proprio_norm_stats_path(args)
+    if args.object_context_enabled:
+        payload["object_context"] = {
+            "object_name": args.object_name,
+            "object_mask_dir": None if args.object_mask_dir is None else str(args.object_mask_dir),
+            "object_mask_frame_fps": _object_mask_frame_fps(args),
+        }
+    if known_prior_steps:
+        payload["known_prior"] = {
+            "steps": list(known_prior_steps),
+            "final_index": known_prior_index,
+            "advance_threshold": args.known_prior_advance_threshold,
+            "match_threshold": args.known_prior_match_threshold,
+            "max_advance_steps": args.known_prior_max_advance_steps,
+        }
+    final_state = _protocol_final_state(
+        config.target_protocol,
+        language_memory=language_memory,
+        previous_stage_objective=_last_step_output_value(steps, "previous_stage_objective"),
+    )
+    if final_state:
+        payload["final_state"] = final_state
+    return payload
+
+
+def _protocol_language_memory_input(protocol: str, memory: str, memory_input_mode: str) -> str:
+    if protocol in _KEYFRAME_GATED_PROTOCOLS:
+        return memory.strip()
+    if protocol not in {
+        "hl_v1",
+        "known_prior_tracker",
+        "subtask_keyframe",
+        "objective_memory_state",
+    }:
+        return ""
+    return _language_memory_for_model(memory, memory_input_mode)
+
+
+def _apply_protocol_runtime_prediction(
+    protocol: str,
+    prediction,
+    *,
+    previous_memory: str,
+    recent_end_sec: float,
+):
+    if protocol in {"hl_v1", "known_prior_tracker"}:
+        return apply_rollout_language_memory_rule(
+            prediction,
+            previous_memory=previous_memory,
+            recent_end_sec=recent_end_sec,
+        )
+    return prediction, False
+
+
+def _protocol_state_input(protocol: str, sample) -> str:
+    if protocol == "objective_memory_state":
+        return sample.language_memory
+    if protocol == "objective_prev_stage":
+        return sample.previous_stage_objective
+    if protocol in _KEYFRAME_GATED_PROTOCOLS:
+        return sample.language_memory
+    return ""
+
+
+def _protocol_input_payload(
+    protocol: str,
+    *,
+    sample,
+    memory_seconds,
+    recent_seconds,
+    proprio_enabled: bool,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "instruction": sample.instruction,
+        "historical_keyframe_seconds": list(memory_seconds),
+        "recent_frame_seconds": list(recent_seconds),
+    }
+    if protocol == "objective_memory_state":
+        payload["completed_subtasks_memory"] = sample.language_memory
+    elif protocol == "objective_prev_stage":
+        payload["previous_stage_objective"] = sample.previous_stage_objective
+    elif protocol in _KEYFRAME_GATED_PROTOCOLS:
+        payload["completed_event_log"] = sample.language_memory
+    if proprio_enabled:
+        payload["recent_robot_states"] = [list(row) for row in sample.recent_robot_states]
+        payload["recent_robot_state_masks"] = [list(row) for row in sample.recent_robot_state_masks]
+    if sample.object_name or sample.recent_object_center_points:
+        payload["object_context"] = {
+            "object_name": sample.object_name,
+            "recent_center_points": [list(point) for point in sample.recent_object_center_points],
+        }
+    return payload
+
+
+def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "current_objective": prediction.current_objective,
+        "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+    }
+    if protocol in {
+        "memer_objective",
+        "objective_memory_state",
+        "objective_last_objective",
+        "objective_prev_stage",
+        "keyframe_gated_memory",
+        "keyframe_gated_memory_two_pass",
+    }:
+        payload["horizon_current_objective"] = prediction.horizon_current_objective
+    if protocol == "objective_memory_state":
+        payload["updated_language_memory"] = prediction.updated_language_memory
+    elif protocol == "objective_last_objective":
+        payload["last_objective"] = prediction.last_objective
+    elif protocol == "objective_prev_stage":
+        payload["previous_stage_objective"] = prediction.previous_stage_objective
+    elif protocol in _KEYFRAME_GATED_PROTOCOLS:
+        payload["completed_objective"] = prediction.completed_objective
+    elif protocol == "known_prior_tracker":
+        payload["subtask_progress"] = prediction.subtask_progress
+        payload["should_advance_objective"] = prediction.should_advance_objective
+    elif protocol == "hl_v1":
+        return prediction.to_dict(include_legacy=False)
+    return payload
+
+
+def _protocol_final_state(
+    protocol: str,
+    *,
+    language_memory: str,
+    previous_stage_objective: str,
+) -> dict[str, str]:
+    if protocol == "objective_memory_state":
+        return {"completed_subtasks_memory": language_memory}
+    if protocol in _KEYFRAME_GATED_PROTOCOLS:
+        return {"completed_event_log": language_memory}
+    if protocol == "objective_prev_stage":
+        return {"previous_stage_objective": previous_stage_objective}
+    return {}
+
+
+def _update_keyframe_gated_rollout_state(
+    state: KeyframeGatedRolloutState,
+    *,
+    prediction: HLMemoryPrediction,
+    candidate_seconds: tuple[float, ...] | list[float],
+    memory_length: int,
+    merge_distance_sec: float,
+) -> tuple[KeyframeGatedRolloutState, dict[str, object]]:
+    completed_objective = prediction.completed_objective.strip()
+    candidate_seconds = tuple(float(second) for second in candidate_seconds)
+    if not completed_objective:
+        return state, {
+            "accepted": False,
+            "reason": "empty_completed_objective",
+            "completed_objective": "",
+            "candidate_seconds": list(candidate_seconds),
+            "completed_events_after": list(state.completed_events),
+            "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
+        }
+    if not candidate_seconds:
+        return state, {
+            "accepted": False,
+            "reason": "no_keyframe_candidates",
+            "completed_objective": completed_objective,
+            "candidate_seconds": [],
+            "completed_events_after": list(state.completed_events),
+            "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
+        }
+
+    # Event-band training can produce several candidate frames for one transition.
+    # Keep one compact representative so long-term memory does not grow with band width.
+    representative_second = max(candidate_seconds)
+    normalized_completed = _normalize_text(completed_objective)
+    duplicate_seconds = [
+        second
+        for event, second in zip(state.completed_events, state.accepted_keyframe_seconds, strict=False)
+        if _normalize_text(event) == normalized_completed
+        and abs(representative_second - second) < merge_distance_sec
+    ]
+    if duplicate_seconds:
+        return state, {
+            "accepted": False,
+            "reason": "duplicate_completed_objective_near_existing_keyframe",
+            "completed_objective": completed_objective,
+            "candidate_seconds": list(candidate_seconds),
+            "representative_keyframe_second": representative_second,
+            "completed_events_after": list(state.completed_events),
+            "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
+        }
+
+    completed_events = (*state.completed_events, completed_objective)
+    accepted_keyframe_seconds = update_rollout_memory_seconds(
+        (*state.accepted_keyframe_seconds, representative_second),
+        (),
+        memory_length=memory_length,
+        merge_distance_sec=merge_distance_sec,
+    )
+    new_state = KeyframeGatedRolloutState(
+        completed_events=completed_events,
+        accepted_keyframe_seconds=accepted_keyframe_seconds,
+    )
+    return new_state, {
+        "accepted": True,
+        "reason": "accepted_completed_objective_with_keyframes",
+        "completed_objective": completed_objective,
+        "candidate_seconds": list(candidate_seconds),
+        "representative_keyframe_second": representative_second,
+        "completed_events_after": list(new_state.completed_events),
+        "accepted_keyframe_seconds_after": list(new_state.accepted_keyframe_seconds),
+    }
+
+
+def _parse_completed_event_log(memory: str) -> tuple[str, ...]:
+    events: list[str] = []
+    for raw_line in memory.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("completed events:"):
+            line = line.split(":", 1)[1].strip()
+            for item in line.split(";"):
+                event = item.strip(" .")
+                if event:
+                    events.append(event)
+            continue
+        if line.startswith("-"):
+            line = line[1:].strip()
+        if ":" in line:
+            _, line = line.split(":", 1)
+            line = line.strip()
+        if line and line.lower() not in {"none", "no accepted completed event yet"}:
+            events.append(line.strip(" ."))
+    return tuple(event for event in events if event)
+
+
+def _render_completed_event_log(events: tuple[str, ...] | list[str], *, max_events: int = 8) -> str:
+    if not events:
+        return "No accepted completed event yet."
+    compact_events = [str(event).strip() for event in events[-max_events:] if str(event).strip()]
+    if not compact_events:
+        return "No accepted completed event yet."
+    prefix = "Recent completed events"
+    if len(events) > len(compact_events):
+        prefix += f" (last {len(compact_events)} of {len(events)})"
+    return prefix + ": " + "; ".join(compact_events) + "."
+
+
+def _format_keyframe_gated_state_update(update: dict[str, object] | None) -> str:
+    if update is None:
+        return ""
+    accepted = "accepted" if update.get("accepted") else "rejected"
+    reason = str(update.get("reason", "unknown"))
+    completed_objective = str(update.get("completed_objective", "")).strip() or "none"
+    events_after = update.get("completed_events_after", [])
+    event_count = len(events_after) if isinstance(events_after, list) else 0
+    return f"{accepted}; reason={reason}; completed_objective={completed_objective}; events_after={event_count}"
+
+
+def _last_step_output_value(steps: list[dict[str, object]], field: str) -> str:
+    if not steps:
+        return ""
+    output = steps[-1].get("output")
+    if not isinstance(output, dict):
+        return ""
+    return str(output.get(field, "")).strip()
 
 
 def _build_clips_from_args(
@@ -856,6 +1221,129 @@ def _resolve_video_paths(args: ZeroShotArgs) -> dict[str, pathlib.Path]:
 
 def _payload_video_paths_from_args(args: ZeroShotArgs) -> dict[str, str]:
     return {view_name: str(path) for view_name, path in _resolve_video_paths(args).items()}
+
+
+def _attach_runtime_object_context(
+    sample,
+    *,
+    args: ZeroShotArgs,
+    recent_seconds: tuple[float, ...] | list[float],
+):
+    if not args.object_context_enabled:
+        return sample
+    mask_dir = _resolve_object_mask_dir(args)
+    mask_index = _load_object_mask_index(mask_dir)
+    fps = _object_mask_frame_fps(args)
+    centers = tuple(_object_center_for_second(mask_index, second=float(second), fps=fps) for second in recent_seconds)
+    return dataclasses.replace(
+        sample,
+        object_name=args.object_name.strip() or _infer_object_name(args),
+        recent_object_center_points=centers,
+    )
+
+
+def _resolve_object_mask_dir(args: ZeroShotArgs) -> pathlib.Path:
+    if args.object_mask_dir is not None:
+        if not args.object_mask_dir.is_dir():
+            raise FileNotFoundError(f"Object mask dir does not exist: {args.object_mask_dir}")
+        return args.object_mask_dir
+    if args.session_path is None:
+        raise ValueError("`--object-context-enabled` requires `--session-path` or `--object-mask-dir`.")
+    candidates = [
+        args.session_path / "mask_stage_results" / "single_hand" / "masks",
+        args.session_path / "mask_stage_results" / "masks",
+    ]
+    for hand_dir in _session_hand_dirs(args.session_path):
+        candidates.extend(
+            [
+                hand_dir / "mask_stage_results" / "single_hand" / "masks",
+                hand_dir / "mask_stage_results" / "masks",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(f"No object mask directory found for session path: {args.session_path}")
+
+
+def _load_object_mask_index(mask_dir: pathlib.Path) -> tuple[tuple[int, pathlib.Path], ...]:
+    cache_key = str(mask_dir.resolve())
+    cached = _OBJECT_MASK_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    entries: list[tuple[int, pathlib.Path]] = []
+    for path in sorted(mask_dir.glob("*.png")):
+        try:
+            frame_index = int(path.stem)
+        except ValueError:
+            continue
+        entries.append((frame_index, path))
+    if not entries:
+        raise FileNotFoundError(f"No numeric PNG object masks found in {mask_dir}")
+    result = tuple(entries)
+    _OBJECT_MASK_INDEX_CACHE[cache_key] = result
+    return result
+
+
+def _object_mask_frame_fps(args: ZeroShotArgs) -> float:
+    if args.object_mask_frame_fps is not None:
+        return float(args.object_mask_frame_fps)
+    if args.task_config_path is not None:
+        task_config = _load_task_config(args.task_config_path)
+        video_fps = _optional_float(task_config.get("video_fps"))
+        if video_fps is not None and video_fps > 0:
+            return video_fps
+    return float(args.training_fps)
+
+
+def _object_center_for_second(
+    mask_index: tuple[tuple[int, pathlib.Path], ...],
+    *,
+    second: float,
+    fps: float,
+) -> tuple[float | None, float | None]:
+    target_frame = int(round(max(0.0, second) * fps))
+    nearest_path = _nearest_mask_path(mask_index, target_frame)
+    if nearest_path is None:
+        return (None, None)
+    return _mask_center_xy_norm(nearest_path)
+
+
+def _nearest_mask_path(mask_index: tuple[tuple[int, pathlib.Path], ...], target_frame: int) -> pathlib.Path | None:
+    if not mask_index:
+        return None
+    frame_indices = [frame for frame, _ in mask_index]
+    insertion = int(np.searchsorted(frame_indices, int(target_frame)))
+    if insertion <= 0:
+        return mask_index[0][1]
+    if insertion >= len(mask_index):
+        return mask_index[-1][1]
+    before = mask_index[insertion - 1]
+    after = mask_index[insertion]
+    return before[1] if abs(before[0] - target_frame) <= abs(after[0] - target_frame) else after[1]
+
+
+def _mask_center_xy_norm(path: pathlib.Path) -> tuple[float | None, float | None]:
+    with Image.open(path) as image:
+        mask = np.asarray(image.convert("L"))
+    ys, xs = np.nonzero(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return (None, None)
+    height, width = mask.shape[:2]
+    denom_x = max(width - 1, 1)
+    denom_y = max(height - 1, 1)
+    return (float(np.mean(xs) / denom_x), float(np.mean(ys) / denom_y))
+
+
+def _infer_object_name(args: ZeroShotArgs) -> str:
+    instruction = args.instruction.lower()
+    if "stick" in instruction:
+        return "stick"
+    if "calculator" in instruction:
+        return "calculator"
+    if "bottle" in instruction:
+        return "bottle"
+    return "tracked object"
 
 
 def _attach_runtime_proprio(
@@ -1460,6 +1948,86 @@ def _dedupe_consecutive_strings(values) -> list[str]:
     return result
 
 
+def _ground_truth_subtask_at(args: ZeroShotArgs, second: float | None) -> str | None:
+    if args.ground_truth_annotations_path is not None:
+        return _annotation_ground_truth_at(
+            args.ground_truth_annotations_path,
+            second=second,
+            episode_index=args.ground_truth_episode_index,
+            field=args.ground_truth_field,
+            fps=_ground_truth_fps(args),
+        )
+    return _task_config_subtask_at(args.task_config_path, second)
+
+
+def _ground_truth_fps(args: ZeroShotArgs) -> float:
+    return float(args.ground_truth_fps if args.ground_truth_fps is not None else args.training_fps)
+
+
+def _annotation_ground_truth_at(
+    path: pathlib.Path,
+    *,
+    second: float | None,
+    episode_index: int | None,
+    field: str,
+    fps: float,
+) -> str | None:
+    if second is None:
+        return None
+    rows = _load_ground_truth_annotations(path, episode_index=episode_index, field=field)
+    if not rows:
+        return None
+
+    target_frame = int(round(second * fps))
+    best_frame, best_value = min(rows, key=lambda item: (abs(item[0] - target_frame), item[0] > target_frame))
+    del best_frame
+    return best_value
+
+
+def _load_ground_truth_annotations(
+    path: pathlib.Path,
+    *,
+    episode_index: int | None,
+    field: str,
+) -> tuple[tuple[int, str], ...]:
+    if episode_index is None:
+        raise ValueError("`--ground-truth-episode-index` is required with `--ground-truth-annotations-path`.")
+    path = pathlib.Path(path)
+    cache_key = (str(path.resolve()), int(episode_index), field)
+    cached = _GROUND_TRUTH_ANNOTATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows: list[tuple[int, str]] = []
+    with path.open() as file:
+        for line_number, line in enumerate(file, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL row {line_number} in {path}: {exc}") from exc
+            if _optional_int(payload.get("episode_index")) != episode_index:
+                continue
+            frame_index = _optional_int(payload.get("frame_index"))
+            if frame_index is None:
+                continue
+            value = str(payload.get(field, "")).strip()
+            if not value and field != "current_objective":
+                value = str(payload.get("current_objective", "")).strip()
+            if not value:
+                continue
+            rows.append((frame_index, value))
+
+    rows = sorted(rows, key=lambda item: item[0])
+    result = tuple(rows)
+    if not result:
+        raise ValueError(f"No usable GT rows found in {path} for episode_index={episode_index}, field={field!r}.")
+    _GROUND_TRUTH_ANNOTATION_CACHE[cache_key] = result
+    return result
+
+
 def _task_config_subtask_at(path: pathlib.Path | None, second: float | None) -> str | None:
     if path is None or second is None:
         return None
@@ -1490,6 +2058,15 @@ def _optional_float(value: object) -> float | None:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 

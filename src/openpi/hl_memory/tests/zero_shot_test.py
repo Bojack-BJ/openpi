@@ -192,13 +192,16 @@ def test_save_prediction_debug_panel_writes_current_frame_summary(tmp_path):
         prediction=prediction,
         step_index=1,
         recent_end_sec=1.0,
+        target_protocol="hl_v1",
+        instruction="fold the shoebox",
+        state_input="",
         language_memory_before="Task started.",
         language_memory_after=prediction.updated_language_memory,
         keyframe_candidate_seconds=(1.0,),
     )
 
     assert output_path.exists()
-    assert Image.open(output_path).size == (1400, 820)
+    assert Image.open(output_path).size == (1500, 900)
 
 
 def test_debug_text_lines_include_progress_and_advance_state():
@@ -218,11 +221,15 @@ def test_debug_text_lines_include_progress_and_advance_state():
         step_index=0,
         recent_end_sec=1.0,
         current_second=1.0,
+        target_protocol="known_prior_tracker",
+        instruction="place the object",
+        state_input="",
         language_memory_before="before",
         language_memory_after="after",
         memory_seconds_before=(),
         memory_seconds_after=(),
         keyframe_candidate_seconds=(),
+        state_update="",
         ground_truth_subtask=None,
         parse_error=None,
     )

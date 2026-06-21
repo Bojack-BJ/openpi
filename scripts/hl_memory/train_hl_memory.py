@@ -24,6 +24,8 @@ from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.proprio import save_proprio_state_if_available
 from openpi.hl_memory.proprio import temporarily_unwrap_proprio_embeddings
+from openpi.hl_memory.sampling import sample_keyframe_stratified
+from openpi.hl_memory.training_loss import compute_hl_target_loss
 
 
 @dataclasses.dataclass
@@ -54,6 +56,14 @@ class TrainArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: str = "event_band"
+    keyframe_positive_sample_ratio: float = 0.0
+    keyframe_confirm_positive_sample_ratio: float = 0.0
+    two_pass_training_proposal_noise_probability: float = 0.25
+    two_pass_predict_loss_weight: float = 1.0
+    two_pass_confirm_loss_weight: float = 1.0
     learning_rate: float = 5e-6
     vision_tower_learning_rate: float | None = None
     weight_decay: float = 1e-4
@@ -140,6 +150,10 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
+        keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
+        keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
+        two_pass_training_proposal_noise_probability=args.two_pass_training_proposal_noise_probability,
     )
     adapter = create_hf_adapter(hl_config)
     device = _resolve_training_device(args, distributed=distributed)
@@ -184,7 +198,15 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
             step_loss = 0.0
             step_data_time = 0.0
             for accum_index in range(args.grad_accum_steps):
-                batch = _sample_batch(samples, args.batch_size, rng)
+                batch = _sample_batch(
+                    samples,
+                    args.batch_size,
+                    rng,
+                    keyframe_positive_sample_ratio=args.keyframe_positive_sample_ratio,
+                    keyframe_confirm_positive_sample_ratio=args.keyframe_confirm_positive_sample_ratio,
+                    target_protocol=hl_config.target_protocol,
+                    keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                )
                 micro_loss = 0.0
                 sync_gradients = accum_index == args.grad_accum_steps - 1
                 sync_context = (
@@ -209,8 +231,12 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                             "This would make the language-model loss NaN."
                         )
                     step_data_time += time.perf_counter() - data_start_time
-                    outputs = loaded.model(**inputs)
-                    loss = outputs.loss
+                    loss = compute_hl_target_loss(
+                        loaded.model,
+                        inputs,
+                        two_pass_predict_weight=args.two_pass_predict_loss_weight,
+                        two_pass_confirm_weight=args.two_pass_confirm_loss_weight,
+                    )
                     loss_value = float(loss.detach().cpu())
                     if not math.isfinite(loss_value):
                         sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
@@ -556,12 +582,34 @@ def _has_fp16_trainable_parameters(model: torch.nn.Module) -> bool:
     return any(parameter.requires_grad and parameter.dtype in {torch.float16, torch.bfloat16} for parameter in model.parameters())
 
 
-def _sample_batch(samples, batch_size: int, rng: random.Random):
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive.")
-    if len(samples) >= batch_size:
-        return rng.sample(samples, batch_size)
-    return [rng.choice(samples) for _ in range(batch_size)]
+def _sample_batch(
+    samples,
+    batch_size: int,
+    rng: random.Random,
+    *,
+    keyframe_positive_sample_ratio: float = 0.0,
+    keyframe_confirm_positive_sample_ratio: float = 0.0,
+    target_protocol: str = "hl_v1",
+    keyframe_candidate_label_mode: str = "event_band",
+):
+    return sample_keyframe_stratified(
+        samples,
+        batch_size,
+        rng,
+        sample_from_item=lambda sample: sample,
+        keyframe_positive_sample_ratio=keyframe_positive_sample_ratio,
+        keyframe_confirm_positive_sample_ratio=keyframe_confirm_positive_sample_ratio,
+        target_protocol=target_protocol,
+        keyframe_candidate_label_mode=keyframe_candidate_label_mode,
+    )
+
+
+def _sample_with_replacement(samples, count: int, rng: random.Random):
+    if count <= 0:
+        return []
+    if len(samples) >= count:
+        return rng.sample(samples, count)
+    return [rng.choice(samples) for _ in range(count)]
 
 
 def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryConfig, train_args: TrainArgs) -> None:

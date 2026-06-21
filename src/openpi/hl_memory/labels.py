@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import dataclasses
+import math
 
 from openpi.hl_memory.schema import render_language_memory_fields
 
@@ -12,6 +13,7 @@ DEFAULT_LANGUAGE_MEMORY = render_language_memory_fields(
     relevant_objects=(),
     notes="none",
 )
+DEFAULT_COMPLETED_SUBTASKS_MEMORY = "No completed subtask yet."
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,6 +124,97 @@ def derive_keyframe_positions(
     return tuple(positions)
 
 
+@dataclasses.dataclass(frozen=True)
+class KeyframeEventBand:
+    event_id: str
+    canonical_frame_index: int
+    band_start_frame_index: int
+    band_end_frame_index: int
+    annotation_index: int
+    objective: str
+
+
+def derive_keyframe_event_bands(
+    annotations: Sequence[SubtaskAnnotation],
+    *,
+    training_fps: float,
+    before_sec: float,
+    after_sec: float,
+) -> tuple[KeyframeEventBand, ...]:
+    if training_fps <= 0.0:
+        raise ValueError("training_fps must be positive.")
+    before_frames = int(math.ceil(max(before_sec, 0.0) * training_fps))
+    after_frames = int(math.ceil(max(after_sec, 0.0) * training_fps))
+    explicit_keyframe_labels = any(annotation.keyframe_label is not None for annotation in annotations)
+    events: list[KeyframeEventBand] = []
+    for annotation_index, annotation in enumerate(annotations):
+        if explicit_keyframe_labels:
+            is_keyframe = annotation.keyframe_label is True
+        else:
+            previous = annotations[annotation_index - 1] if annotation_index > 0 else None
+            is_keyframe = annotation_emits_keyframe(annotation, previous)
+        if not is_keyframe:
+            continue
+        canonical = int(annotation.frame_index)
+        objective = (annotation.current_objective or annotation.current_subtask).strip()
+        events.append(
+            KeyframeEventBand(
+                event_id=f"event_{len(events):04d}",
+                canonical_frame_index=canonical,
+                band_start_frame_index=max(0, canonical - before_frames),
+                band_end_frame_index=canonical + after_frames,
+                annotation_index=annotation_index,
+                objective=objective,
+            )
+        )
+    return tuple(events)
+
+
+def derive_event_band_keyframe_positions(
+    event_bands: Sequence[KeyframeEventBand],
+    recent_indices: Sequence[int],
+    *,
+    upto_frame_index: int | None = None,
+) -> tuple[tuple[int, ...], tuple[str, ...], tuple[int, ...]]:
+    """Returns one candidate position per event band intersecting the recent window.
+
+    The chosen position is the recent frame closest to the canonical keyframe,
+    keeping event-band supervision broad while the candidate memory remains
+    compact.
+    """
+    candidates: list[tuple[int, str, int]] = []
+    for event in event_bands:
+        if upto_frame_index is not None and event.band_start_frame_index > upto_frame_index:
+            continue
+        best_position: int | None = None
+        best_distance: int | None = None
+        for position, frame_index in enumerate(recent_indices, start=1):
+            frame_index = int(frame_index)
+            if frame_index < event.band_start_frame_index or frame_index > event.band_end_frame_index:
+                continue
+            distance = abs(frame_index - event.canonical_frame_index)
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_position = position
+        if best_position is not None:
+            candidates.append((best_position, event.event_id, event.canonical_frame_index))
+
+    # A recent window may overlap multiple event bands. Keep stable temporal
+    # ordering and avoid duplicate positions from adjacent events.
+    deduped: list[tuple[int, str, int]] = []
+    used_positions: set[int] = set()
+    for candidate in sorted(candidates, key=lambda item: (item[0], item[2], item[1])):
+        if candidate[0] in used_positions:
+            continue
+        used_positions.add(candidate[0])
+        deduped.append(candidate)
+    return (
+        tuple(item[0] for item in deduped),
+        tuple(item[1] for item in deduped),
+        tuple(item[2] for item in deduped),
+    )
+
+
 def update_progress_state(
     state: TaskProgressState,
     annotation: SubtaskAnnotation,
@@ -129,6 +222,17 @@ def update_progress_state(
     completed_subtasks = list(state.completed_subtasks)
     failed_subtasks = list(state.failed_subtasks)
     recent_events = list(state.recent_events)
+
+    previous_objective = state.current_objective.strip()
+    current_objective = (annotation.current_objective or annotation.phase or annotation.current_subtask).strip()
+    if (
+        previous_objective
+        and current_objective
+        and annotation.current_objective.strip()
+        and _normalize_objective(previous_objective) != _normalize_objective(current_objective)
+        and _normalize_objective(previous_objective) != "continue the task"
+    ):
+        completed_subtasks.append(previous_objective)
 
     event_text = _event_text(annotation)
     if annotation.event_type == "success" and annotation.current_subtask not in completed_subtasks:
@@ -147,7 +251,7 @@ def update_progress_state(
         target_query=annotation.target_query,
         goal_query=annotation.goal_query,
         task_progress=annotation.task_progress,
-        current_objective=annotation.current_objective or annotation.phase or annotation.current_subtask,
+        current_objective=current_objective,
         relevant_objects=annotation.relevant_objects
         or tuple(value for value in (annotation.target_query, annotation.goal_query) if value),
         notes=annotation.notes,
@@ -172,6 +276,15 @@ def render_language_memory(state: TaskProgressState) -> str:
         relevant_objects=tuple(fields["relevant_objects"]),  # type: ignore[arg-type]
         notes=str(fields["notes"]),
     )
+
+
+def render_completed_subtasks_memory(state: TaskProgressState) -> str:
+    """Render only stable, completed objectives in chronological order."""
+    if not state.completed_subtasks:
+        return DEFAULT_COMPLETED_SUBTASKS_MEMORY
+    lines = ["Completed subtasks:"]
+    lines.extend(f"{index}. {objective}" for index, objective in enumerate(state.completed_subtasks, start=1))
+    return "\n".join(lines)
 
 
 def expected_event_text(annotation: SubtaskAnnotation) -> str:
@@ -203,6 +316,10 @@ def _render_task_progress(state: TaskProgressState) -> str:
     if not parts:
         return "No completed subtask yet."
     return " ".join(parts)
+
+
+def _normalize_objective(value: str) -> str:
+    return " ".join(value.lower().split())
 
 
 def _parse_relevant_objects(value: object) -> tuple[str, ...]:

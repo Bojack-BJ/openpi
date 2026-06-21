@@ -60,6 +60,9 @@ class EvalArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: str = "event_band"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     frame_cache_size: int = 512
     eval_modes: str = "sample_context"
@@ -99,6 +102,9 @@ def main(args: EvalArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
+        keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
+        keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
     )
     adapter = create_hf_adapter(hl_config)
     logging.info("[stage] loading model from %s", args.model_path)
@@ -232,16 +238,26 @@ def _run_multitask_rollout(
                     prediction,
                     item.sample,
                     target_protocol=hl_config.target_protocol,
+                    keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
                 )
                 for key, value in metrics.items():
                     totals[key] += value
                 sequence_ok &= _normalize(prediction.current_objective) == _normalize(
-                    item.sample.target_prediction(target_protocol=hl_config.target_protocol).current_objective
+                    item.sample.target_prediction(
+                        target_protocol=hl_config.target_protocol,
+                        keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                    ).current_objective
                 )
                 total_steps += 1
                 if prediction_rows is not None:
                     prediction_rows.append(
-                        _prediction_row(item, prediction, metrics, target_protocol=hl_config.target_protocol)
+                        _prediction_row(
+                            item,
+                            prediction,
+                            metrics,
+                            target_protocol=hl_config.target_protocol,
+                            keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                        )
                     )
                 if mode in ("language_memory_only", "full"):
                     language_memory = prediction.updated_language_memory
@@ -280,12 +296,19 @@ def _run_sample_context_eval(
                 prediction,
                 item.sample,
                 target_protocol=hl_config.target_protocol,
+                keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
             )
             for key, value in metrics.items():
                 totals[key] += value
             if prediction_rows is not None:
                 prediction_rows.append(
-                    _prediction_row(item, prediction, metrics, target_protocol=hl_config.target_protocol)
+                    _prediction_row(
+                        item,
+                        prediction,
+                        metrics,
+                        target_protocol=hl_config.target_protocol,
+                        keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                    )
                 )
             progress.update(1)
     finally:
@@ -312,7 +335,14 @@ def _with_ablation_context(sample, *, mode, memory, frame_lookup, language_memor
     )
 
 
-def _prediction_row(item: RuntimeSample, prediction, metrics: dict[str, float], *, target_protocol: str = "hl_v1") -> dict[str, object]:
+def _prediction_row(
+    item: RuntimeSample,
+    prediction,
+    metrics: dict[str, float],
+    *,
+    target_protocol: str = "hl_v1",
+    keyframe_candidate_label_mode: str = "event_band",
+) -> dict[str, object]:
     sample = item.sample
     return {
         "task_id": item.dataset_dir.parent.name,
@@ -321,7 +351,10 @@ def _prediction_row(item: RuntimeSample, prediction, metrics: dict[str, float], 
         "episode_index": sample.episode_index,
         "step_index": sample.step_index,
         "instruction": sample.instruction,
-        "expected": sample.target_prediction(target_protocol=target_protocol).to_dict(),
+        "expected": sample.target_prediction(
+            target_protocol=target_protocol,
+            keyframe_candidate_label_mode=keyframe_candidate_label_mode,
+        ).to_dict(),
         "prediction": prediction.to_dict(),
         "metrics": metrics,
     }

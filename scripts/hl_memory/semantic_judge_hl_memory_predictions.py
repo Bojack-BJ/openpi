@@ -164,7 +164,11 @@ def _rows_from_record(
 ) -> list[dict[str, Any]]:
     metadata = metadata or {}
     expected = _as_dict(record.get("expected"))
-    prediction = _as_dict(record.get("prediction")) or _as_dict(record.get("model_prediction"))
+    prediction = (
+        _as_dict(record.get("output"))
+        or _as_dict(record.get("prediction"))
+        or _as_dict(record.get("model_prediction"))
+    )
     if not prediction:
         prediction = _maybe_parse_prediction(record.get("prediction")) or _maybe_parse_prediction(record.get("model_prediction"))
     if not prediction:

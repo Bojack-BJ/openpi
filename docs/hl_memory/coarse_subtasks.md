@@ -79,6 +79,25 @@ PYTHONPATH=src python scripts/hl_memory/batch_export_hl_memory_dataset_from_subt
 
 Inspect a few generated rows before launching a full training run. The most important fields are `current_objective`, `fine_current_objective`, `coarse_action_type`, and `coarse_merge_reason`.
 
+## Keyframe Alignment
+
+Coarse conversion recomputes keyframe supervision after all merge passes.
+`keyframe_label=true` is written only on the final annotation row of each final
+coarse objective run. Inherited fine labels are retained as
+`fine_keyframe_label` for debugging but no longer supervise coarse training.
+
+This behavior is enabled by default through `--relabel-coarse-keyframes`.
+`--no-relabel-coarse-keyframes` is only for compatibility experiments.
+
+The exported fields have different meanings:
+
+- `keyframe_label`: the current sample is a coarse completion boundary.
+- `keyframe_candidate_positions`: positions in the recent clip that contain
+  historical keyframes.
+
+`completed_objective` must be supervised from `keyframe_label`, not merely from
+a non-empty candidate list.
+
 ## Current Statistics
 
 Latest full run on `/root/Users/dataset/lerobot_home/subtask` with `hl_annotations_llm_normalized_coarse.jsonl`:

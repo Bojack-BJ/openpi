@@ -395,6 +395,8 @@ def build_zero_shot_sample(
     video_path: pathlib.Path | str,
     instruction: str,
     language_memory: str = "",
+    last_objective: str = "",
+    previous_stage_objective: str = "",
     step_prior: Iterable[str] = (),
     memory_seconds: Iterable[float] = (),
     recent_seconds: Iterable[float] = (),
@@ -424,6 +426,8 @@ def build_zero_shot_sample(
         event_type="none",
         event_text="",
         step_prior=step_prior,
+        last_objective=last_objective,
+        previous_stage_objective=previous_stage_objective,
     )
 
 
@@ -471,11 +475,15 @@ def save_prediction_debug_panel(
     prediction: HLMemoryPrediction,
     step_index: int | None = None,
     recent_end_sec: float | None = None,
+    target_protocol: str,
+    instruction: str,
+    state_input: str,
     language_memory_before: str = "",
     language_memory_after: str = "",
     memory_seconds_before: Iterable[float] = (),
     memory_seconds_after: Iterable[float] = (),
     keyframe_candidate_seconds: Iterable[float] = (),
+    state_update: str = "",
     ground_truth_subtask: str | None = None,
     parse_error: str | None = None,
     title: str = "HL memory debug",
@@ -572,11 +580,15 @@ def save_prediction_debug_panel(
         step_index=step_index,
         recent_end_sec=recent_end_sec,
         current_second=current_second,
+        target_protocol=target_protocol,
+        instruction=instruction,
+        state_input=state_input,
         language_memory_before=language_memory_before,
         language_memory_after=language_memory_after or prediction.updated_language_memory,
         memory_seconds_before=memory_seconds_before,
         memory_seconds_after=memory_seconds_after,
         keyframe_candidate_seconds=keyframe_candidate_seconds,
+        state_update=state_update,
         ground_truth_subtask=ground_truth_subtask,
         parse_error=parse_error,
     )
@@ -643,11 +655,15 @@ def _build_debug_text_lines(
     step_index: int | None,
     recent_end_sec: float | None,
     current_second: float | None,
+    target_protocol: str,
+    instruction: str,
+    state_input: str,
     language_memory_before: str,
     language_memory_after: str,
     memory_seconds_before: Iterable[float],
     memory_seconds_after: Iterable[float],
     keyframe_candidate_seconds: Iterable[float],
+    state_update: str,
     ground_truth_subtask: str | None,
     parse_error: str | None,
 ) -> list[tuple[str, str]]:
@@ -659,35 +675,107 @@ def _build_debug_text_lines(
     lines.append(("", ""))
     if ground_truth_subtask:
         _append_wrapped_debug_line(lines, "GT subtask", ground_truth_subtask, style="accent", max_lines=2)
+    lines.append(("", ""))
+    lines.append(("Input", "section"))
+    _append_wrapped_debug_line(lines, "Instruction", instruction or "unspecified", max_lines=3)
+    state_label = _debug_state_input_label(target_protocol)
+    if state_label is not None:
+        _append_wrapped_debug_line(lines, state_label, state_input or "none", max_lines=6)
+    lines.append(("", ""))
+    is_keyframe_gated = target_protocol in {
+        "keyframe_gated_memory",
+        "keyframe_gated_memory_typed_mask",
+        "keyframe_gated_memory_two_pass",
+    }
+    lines.append(("Visual prediction" if is_keyframe_gated else "Output", "section"))
     _append_wrapped_debug_line(lines, "Current objective", prediction.current_objective, style="accent", max_lines=3)
-    _append_wrapped_debug_line(lines, "Subtask progress", _format_optional_progress(prediction.subtask_progress), max_lines=1)
-    _append_wrapped_debug_line(lines, "Should advance", _format_optional_bool(prediction.should_advance_objective), max_lines=1)
-    _append_wrapped_debug_line(lines, "Phase", prediction.phase, max_lines=2)
-    _append_wrapped_debug_line(lines, "Target", prediction.target_query or "none", max_lines=2)
-    _append_wrapped_debug_line(lines, "Goal", prediction.goal_query or "none", max_lines=2)
-    if prediction.sam_text_prompt:
-        _append_wrapped_debug_line(lines, "SAM prompt", prediction.sam_text_prompt, max_lines=2)
-    if prediction.sam_point_xy is not None:
-        _append_wrapped_debug_line(lines, "SAM point", list(prediction.sam_point_xy), max_lines=1)
-    if prediction.target_bbox_xyxy is not None:
-        _append_wrapped_debug_line(lines, "Target bbox", str(list(prediction.target_bbox_xyxy)), max_lines=1)
+    if prediction.horizon_current_objective:
+        _append_wrapped_debug_line(
+            lines,
+            "Horizon objective",
+            prediction.horizon_current_objective,
+            style="accent",
+            max_lines=3,
+        )
+    state_output = _debug_state_output(target_protocol, prediction)
+    if state_output is not None:
+        label, value = state_output
+        _append_wrapped_debug_line(lines, label, value or "none", max_lines=6)
+    if target_protocol == "known_prior_tracker":
+        _append_wrapped_debug_line(lines, "Subtask progress", _format_optional_progress(prediction.subtask_progress))
+        _append_wrapped_debug_line(lines, "Should advance", _format_optional_bool(prediction.should_advance_objective))
+    elif target_protocol == "hl_v1":
+        _append_wrapped_debug_line(lines, "Phase", prediction.phase, max_lines=2)
+        _append_wrapped_debug_line(lines, "Target", prediction.target_query or "none", max_lines=2)
+        _append_wrapped_debug_line(lines, "Goal", prediction.goal_query or "none", max_lines=2)
+        if prediction.sam_text_prompt:
+            _append_wrapped_debug_line(lines, "SAM prompt", prediction.sam_text_prompt, max_lines=2)
     _append_wrapped_debug_line(
         lines,
         "Keyframes",
         f"positions={list(prediction.keyframe_candidate_positions)} seconds={_format_seconds(keyframe_candidate_seconds)}",
         max_lines=3,
     )
-    _append_wrapped_debug_line(lines, "Memory keyframe secs before", _format_seconds(memory_seconds_before), style="muted")
-    _append_wrapped_debug_line(lines, "Memory keyframe secs after", _format_seconds(memory_seconds_after), style="muted")
+    _append_wrapped_debug_line(
+        lines,
+        "Historical keyframe secs before",
+        _format_seconds(memory_seconds_before),
+        style="muted",
+    )
+    _append_wrapped_debug_line(
+        lines,
+        "Historical keyframe secs after",
+        _format_seconds(memory_seconds_after),
+        style="muted",
+    )
     if parse_error:
         _append_wrapped_debug_line(lines, "Parse error", parse_error, max_lines=3)
-    lines.append(("", ""))
-    lines.append(("Memory before", "section"))
-    _append_wrapped_debug_block(lines, language_memory_before or "none", max_lines=5)
-    lines.append(("", ""))
-    lines.append(("Memory after", "section"))
-    _append_wrapped_debug_block(lines, language_memory_after or "none", max_lines=6, style="accent")
+    if is_keyframe_gated:
+        lines.append(("", ""))
+        lines.append(("State before", "section"))
+        _append_wrapped_debug_line(lines, "Completed event log", state_input or "none", max_lines=5)
+        _append_wrapped_debug_line(lines, "Historical keyframes", _format_seconds(memory_seconds_before), max_lines=3)
+        lines.append(("", ""))
+        lines.append(("State update", "section"))
+        _append_wrapped_debug_line(lines, "Update", state_update or "none", max_lines=4, style="accent")
+        _append_wrapped_debug_line(lines, "Historical keyframes after", _format_seconds(memory_seconds_after), max_lines=3)
+    if target_protocol == "hl_v1":
+        lines.append(("", ""))
+        lines.append(("Memory before", "section"))
+        _append_wrapped_debug_block(lines, language_memory_before or "none", max_lines=5)
+        lines.append(("", ""))
+        lines.append(("Memory after", "section"))
+        _append_wrapped_debug_block(lines, language_memory_after or "none", max_lines=6, style="accent")
     return lines
+
+
+def _debug_state_input_label(target_protocol: str) -> str | None:
+    return {
+        "objective_memory_state": "Completed-subtasks memory",
+        "objective_prev_stage": "Previous stage objective",
+        "keyframe_gated_memory": "Completed event log",
+        "keyframe_gated_memory_typed_mask": "Completed event log",
+        "keyframe_gated_memory_two_pass": "Completed event log",
+    }.get(target_protocol)
+
+
+def _debug_state_output(
+    target_protocol: str,
+    prediction: HLMemoryPrediction,
+) -> tuple[str, str] | None:
+    if target_protocol == "objective_memory_state":
+        return ("Updated completed memory", prediction.updated_language_memory)
+    if target_protocol == "objective_prev_stage":
+        return ("Previous stage objective", prediction.previous_stage_objective)
+    if target_protocol == "objective_last_objective":
+        return ("Last objective (aux)", prediction.last_objective)
+    if target_protocol in {
+        "keyframe_gated_memory",
+        "keyframe_gated_memory_typed_mask",
+        "keyframe_gated_memory_two_pass",
+    }:
+        return ("Completed objective", prediction.completed_objective)
+    return None
 
 
 def _append_wrapped_debug_line(

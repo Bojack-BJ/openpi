@@ -7,8 +7,20 @@ from typing import Literal
 HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl"]
 Precision = Literal["bfloat16", "float16", "float32"]
 HLVLMParallelMode = Literal["none", "device_map", "tensor_parallel"]
-HLTargetProtocol = Literal["hl_v1", "memer_objective", "subtask_keyframe"]
+HLTargetProtocol = Literal[
+    "hl_v1",
+    "memer_objective",
+    "subtask_keyframe",
+    "known_prior_tracker",
+    "objective_memory_state",
+    "objective_last_objective",
+    "objective_prev_stage",
+    "keyframe_gated_memory",
+    "keyframe_gated_memory_typed_mask",
+    "keyframe_gated_memory_two_pass",
+]
 HLProprioTokenMode = Literal["per_frame", "summary", "per_frame_plus_summary"]
+HLKeyframeCandidateLabelMode = Literal["canonical", "event_band"]
 
 _DEFAULT_VARIANTS: dict[HLVLMBackend, str | None] = {
     "paligemma": None,
@@ -65,6 +77,10 @@ class HLMemoryConfig:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: HLKeyframeCandidateLabelMode = "event_band"
+    two_pass_training_proposal_noise_probability: float = 0.25
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
@@ -73,10 +89,36 @@ class HLMemoryConfig:
             raise ValueError("`precision` must be one of `bfloat16`, `float16`, or `float32`.")
         if self.parallel_mode not in {"none", "device_map", "tensor_parallel"}:
             raise ValueError("`parallel_mode` must be one of `none`, `device_map`, or `tensor_parallel`.")
-        if self.target_protocol not in {"hl_v1", "memer_objective", "subtask_keyframe"}:
-            raise ValueError("`target_protocol` must be one of `hl_v1`, `memer_objective`, or `subtask_keyframe`.")
+        if self.target_protocol not in {
+            "hl_v1",
+            "memer_objective",
+            "subtask_keyframe",
+            "known_prior_tracker",
+            "objective_memory_state",
+            "objective_last_objective",
+            "objective_prev_stage",
+            "keyframe_gated_memory",
+            "keyframe_gated_memory_typed_mask",
+            "keyframe_gated_memory_two_pass",
+        }:
+            raise ValueError(
+                "`target_protocol` must be one of `hl_v1`, `memer_objective`, `subtask_keyframe`, "
+                "`known_prior_tracker`, `objective_memory_state`, `objective_last_objective`, or "
+                "`objective_prev_stage`, `keyframe_gated_memory`, `keyframe_gated_memory_typed_mask`, or "
+                "`keyframe_gated_memory_two_pass`."
+            )
+        if self.target_protocol == "keyframe_gated_memory_typed_mask" and self.vlm_backend != "qwen2_5_vl":
+            raise ValueError("`keyframe_gated_memory_typed_mask` is only supported by `qwen2_5_vl`.")
         if self.proprio_token_mode not in {"per_frame", "summary", "per_frame_plus_summary"}:
             raise ValueError("`proprio_token_mode` must be one of `per_frame`, `summary`, or `per_frame_plus_summary`.")
+        if self.keyframe_candidate_label_mode not in {"canonical", "event_band"}:
+            raise ValueError("`keyframe_candidate_label_mode` must be one of `canonical` or `event_band`.")
+        if self.keyframe_event_band_before_sec < 0.0:
+            raise ValueError("keyframe_event_band_before_sec must be non-negative.")
+        if self.keyframe_event_band_after_sec < 0.0:
+            raise ValueError("keyframe_event_band_after_sec must be non-negative.")
+        if not 0.0 <= self.two_pass_training_proposal_noise_probability <= 1.0:
+            raise ValueError("two_pass_training_proposal_noise_probability must be in [0, 1].")
         if self.proprio_state_dim <= 0:
             raise ValueError("proprio_state_dim must be positive.")
         if self.proprio_hidden_dim <= 0:

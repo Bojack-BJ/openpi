@@ -40,6 +40,9 @@ class EvalArgs:
     recent_sample_hz: float = 2.0
     frame_height: int = 224
     frame_width: int = 456
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: str = "event_band"
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
@@ -104,6 +107,9 @@ def main(args: EvalArgs) -> None:
         recent_sample_hz=args.recent_sample_hz,
         frame_height=args.frame_height,
         frame_width=args.frame_width,
+        keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
+        keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
+        keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
         enable_thinking=args.enable_thinking,
         thinking_budget_tokens=args.thinking_budget_tokens,
         thinking_max_new_tokens=args.thinking_max_new_tokens,
@@ -141,7 +147,11 @@ def main(args: EvalArgs) -> None:
         known_prior_match_threshold=args.known_prior_match_threshold,
         known_prior_max_advance_steps=args.known_prior_max_advance_steps,
     )
-    prediction_writer = _PredictionJsonlWriter(args.prediction_jsonl, target_protocol=hl_config.target_protocol)
+    prediction_writer = _PredictionJsonlWriter(
+        args.prediction_jsonl,
+        target_protocol=hl_config.target_protocol,
+        keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+    )
     try:
         metrics = _evaluate_with_progress(
             grouped,
@@ -310,9 +320,16 @@ def _filter_samples(
 
 
 class _PredictionJsonlWriter:
-    def __init__(self, path: pathlib.Path | None, *, target_protocol: str):
+    def __init__(
+        self,
+        path: pathlib.Path | None,
+        *,
+        target_protocol: str,
+        keyframe_candidate_label_mode: str,
+    ):
         self._handle = None
         self._target_protocol = target_protocol
+        self._keyframe_candidate_label_mode = keyframe_candidate_label_mode
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._handle = path.open("w", encoding="utf-8")
@@ -320,7 +337,10 @@ class _PredictionJsonlWriter:
     def write(self, *, mode, runtime_sample, source_sample, prediction, metrics) -> None:
         if self._handle is None:
             return
-        expected = source_sample.target_prediction(target_protocol=self._target_protocol)
+        expected = source_sample.target_prediction(
+            target_protocol=self._target_protocol,
+            keyframe_candidate_label_mode=self._keyframe_candidate_label_mode,
+        )
         payload = {
             "mode": mode,
             "sample_id": source_sample.sample_id,

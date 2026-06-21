@@ -9,6 +9,7 @@ _NEW_PREDICTION_KEYS = {
     "current_objective",
     "relevant_objects",
     "notes",
+    "completed_objective",
 }
 _LEGACY_PREDICTION_KEYS = {
     "updated_language_memory",
@@ -32,6 +33,9 @@ class HLMemoryPrediction:
     should_advance_objective: bool | None = None
     active_hand: str = ""
     horizon_current_objective: str = ""
+    last_objective: str = ""
+    previous_stage_objective: str = ""
+    completed_objective: str = ""
     sam_text_prompt: str = ""
     sam_point_xy: tuple[int, int] | None = None
     target_bbox_xyxy: tuple[int, int, int, int] | None = None
@@ -91,6 +95,12 @@ class HLMemoryPrediction:
             result["active_hand"] = self.active_hand
         if self.horizon_current_objective:
             result["horizon_current_objective"] = self.horizon_current_objective
+        if self.last_objective:
+            result["last_objective"] = self.last_objective
+        if self.previous_stage_objective:
+            result["previous_stage_objective"] = self.previous_stage_objective
+        if self.completed_objective:
+            result["completed_objective"] = self.completed_objective
         if self.sam_text_prompt:
             result["sam_text_prompt"] = self.sam_text_prompt
         if self.sam_point_xy is not None:
@@ -159,6 +169,9 @@ class HLMemoryPrediction:
             should_advance_objective=_parse_optional_bool(data.get("should_advance_objective")),
             active_hand=str(data.get("active_hand", "")).strip(),
             horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
+            last_objective=str(data.get("last_objective", "")).strip(),
+            previous_stage_objective=str(data.get("previous_stage_objective", "")).strip(),
+            completed_objective=str(data.get("completed_objective", "")).strip(),
             sam_text_prompt=str(data.get("sam_text_prompt", data.get("sam_prompt", ""))).strip(),
             sam_point_xy=_parse_optional_point(
                 data.get("sam_point_xy")

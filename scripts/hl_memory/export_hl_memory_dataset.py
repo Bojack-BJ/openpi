@@ -25,8 +25,12 @@ from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import load_annotations_jsonl
 from openpi.hl_memory.labels import DEFAULT_LANGUAGE_MEMORY
+from openpi.hl_memory.labels import DEFAULT_COMPLETED_SUBTASKS_MEMORY
 from openpi.hl_memory.labels import TaskProgressState
+from openpi.hl_memory.labels import derive_event_band_keyframe_positions
+from openpi.hl_memory.labels import derive_keyframe_event_bands
 from openpi.hl_memory.labels import derive_keyframe_positions
+from openpi.hl_memory.labels import render_completed_subtasks_memory
 from openpi.hl_memory.labels import render_language_memory
 from openpi.hl_memory.labels import render_language_memory_fields_from_state
 from openpi.hl_memory.labels import update_progress_state
@@ -71,6 +75,10 @@ class ExportArgs:
     proprio_enabled: bool = False
     proprio_state_columns: str = "auto"
     proprio_state_dim: int = 14
+    memory_render_mode: Literal["dashboard", "completed-subtasks"] = "dashboard"
+    keyframe_event_band_before_sec: float = 1.0
+    keyframe_event_band_after_sec: float = 0.5
+    keyframe_candidate_label_mode: Literal["canonical", "event_band"] = "event_band"
     overwrite: bool = False
 
 
@@ -121,6 +129,9 @@ def main(args: ExportArgs) -> None:
         merge_distance=args.merge_distance,
         frame_height=args.frame_height,
         frame_width=args.frame_width,
+        keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
+        keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
+        keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
     )
 
     all_episode_items = sorted(episode_to_annotations.items())
@@ -224,6 +235,7 @@ def _export_split(
                 subtask_progress_quantum=args.subtask_progress_quantum,
                 proprio_state_columns=proprio_state_columns,
                 proprio_state_dim=args.proprio_state_dim,
+                memory_render_mode=args.memory_render_mode,
             )
         )
 
@@ -258,6 +270,7 @@ def _export_split(
         "proprio_state_columns": list(proprio_state_columns),
         "proprio_state_dim": args.proprio_state_dim,
         "proprio_norm_stats": None if active_proprio_norm_stats is None else "proprio_norm_stats.json",
+        "memory_render_mode": args.memory_render_mode,
         "export_config": _export_config_metadata(hl_config),
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
@@ -322,6 +335,9 @@ def _export_config_metadata(hl_config: HLMemoryConfig) -> dict[str, Any]:
         "merge_distance": hl_config.merge_distance,
         "frame_height": hl_config.frame_height,
         "frame_width": hl_config.frame_width,
+        "keyframe_event_band_before_sec": hl_config.keyframe_event_band_before_sec,
+        "keyframe_event_band_after_sec": hl_config.keyframe_event_band_after_sec,
+        "keyframe_candidate_label_mode": hl_config.keyframe_candidate_label_mode,
     }
 
 
@@ -617,6 +633,7 @@ def _export_episode(
     subtask_progress_quantum: float,
     proprio_state_columns: tuple[str, ...],
     proprio_state_dim: int,
+    memory_render_mode: Literal["dashboard", "completed-subtasks"],
 ) -> list[ExportedHLMemorySample]:
     episode_start_time = time.perf_counter()
     progress_state = TaskProgressState()
@@ -626,6 +643,13 @@ def _export_episode(
     )
     samples: list[ExportedHLMemorySample] = []
     episode_step_prior = _episode_step_prior(episode_annotations)
+    derived_progress_labels = _derive_objective_progress_labels(episode_annotations)
+    keyframe_event_bands = derive_keyframe_event_bands(
+        episode_annotations,
+        training_fps=hl_config.training_fps,
+        before_sec=hl_config.keyframe_event_band_before_sec,
+        after_sec=hl_config.keyframe_event_band_after_sec,
+    )
 
     for step_index, annotation in enumerate(episode_annotations):
         if step_index > 0 and step_index % 50 == 0:
@@ -668,11 +692,29 @@ def _export_episode(
         )
         memory_frame_paths = tuple(frame_cache[global_indices[index]] for index in memory_frame_indices)
 
-        current_language_memory = render_language_memory(progress_state)
+        current_language_memory = _render_export_memory(progress_state, mode=memory_render_mode)
         next_progress_state = update_progress_state(progress_state, annotation)
-        updated_language_memory = render_language_memory(next_progress_state)
+        updated_language_memory = _render_export_memory(next_progress_state, mode=memory_render_mode)
         next_memory_fields = render_language_memory_fields_from_state(next_progress_state)
-        keyframe_candidate_positions = derive_keyframe_positions(episode_annotations, step_index, recent_local_indices)
+        canonical_keyframe_positions = derive_keyframe_positions(episode_annotations, step_index, recent_local_indices)
+        event_band_positions: tuple[int, ...] = ()
+        keyframe_event_ids: tuple[str, ...] = ()
+        keyframe_event_frame_indices: tuple[int, ...] = ()
+        if hl_config.keyframe_candidate_label_mode == "event_band":
+            (
+                event_band_positions,
+                keyframe_event_ids,
+                keyframe_event_frame_indices,
+            ) = derive_event_band_keyframe_positions(
+                keyframe_event_bands,
+                recent_local_indices,
+                upto_frame_index=annotation.frame_index,
+            )
+        keyframe_candidate_positions = (
+            event_band_positions
+            if hl_config.keyframe_candidate_label_mode == "event_band"
+            else canonical_keyframe_positions
+        )
         instruction = annotation.instruction or _extract_instruction(dataset[global_indices[annotation.frame_index]])
         sample = ExportedHLMemorySample(
             sample_id=f"episode_{episode_index:06d}_step_{step_index:06d}",
@@ -680,7 +722,7 @@ def _export_episode(
             step_index=step_index,
             frame_index=annotation.frame_index,
             instruction=instruction,
-            language_memory=current_language_memory or DEFAULT_LANGUAGE_MEMORY,
+            language_memory=current_language_memory or _default_export_memory(mode=memory_render_mode),
             updated_language_memory=updated_language_memory,
             current_subtask=annotation.current_subtask,
             phase=annotation.phase or annotation.current_subtask,
@@ -700,10 +742,21 @@ def _export_episode(
             current_objective=str(next_memory_fields["current_objective"]),
             relevant_objects=tuple(next_memory_fields["relevant_objects"]),  # type: ignore[arg-type]
             notes=str(next_memory_fields["notes"]),
-            subtask_progress=_quantize_optional_progress(annotation.subtask_progress, subtask_progress_quantum),
-            should_advance_objective=annotation.should_advance_objective,
+            subtask_progress=_quantize_optional_progress(
+                annotation.subtask_progress
+                if annotation.subtask_progress is not None
+                else derived_progress_labels[step_index][0],
+                subtask_progress_quantum,
+            ),
+            should_advance_objective=(
+                annotation.should_advance_objective
+                if annotation.should_advance_objective is not None
+                else derived_progress_labels[step_index][1]
+            ),
             active_hand=annotation.active_hand,
             keyframe_label=annotation.keyframe_label,
+            keyframe_event_ids=keyframe_event_ids,
+            keyframe_event_frame_indices=keyframe_event_frame_indices,
             horizon_frame_index=annotation.horizon_frame_index,
             horizon_current_objective=annotation.horizon_current_objective,
             horizon_current_subtask=annotation.horizon_current_subtask,
@@ -714,11 +767,36 @@ def _export_episode(
         )
         samples.append(sample)
 
-        absolute_keyframes, _ = map_relative_positions_to_absolute(keyframe_candidate_positions, recent_local_indices)
+        if keyframe_event_frame_indices:
+            # Event-band proposals can appear before the canonical transition.
+            # Historical memory must not leak a future event into earlier samples.
+            absolute_keyframes = [
+                frame_index
+                for frame_index in keyframe_event_frame_indices
+                if int(frame_index) <= int(annotation.frame_index)
+            ]
+        else:
+            absolute_keyframes, _ = map_relative_positions_to_absolute(keyframe_candidate_positions, recent_local_indices)
         keyframe_memory.add_candidates(absolute_keyframes)
         progress_state = next_progress_state
 
     return samples
+
+
+def _render_export_memory(
+    state: TaskProgressState,
+    *,
+    mode: Literal["dashboard", "completed-subtasks"],
+) -> str:
+    if mode == "completed-subtasks":
+        return render_completed_subtasks_memory(state)
+    return render_language_memory(state)
+
+
+def _default_export_memory(*, mode: Literal["dashboard", "completed-subtasks"]) -> str:
+    if mode == "completed-subtasks":
+        return DEFAULT_COMPLETED_SUBTASKS_MEMORY
+    return DEFAULT_LANGUAGE_MEMORY
 
 
 def _episode_step_prior(episode_annotations: list[Any]) -> tuple[str, ...]:
@@ -732,6 +810,35 @@ def _episode_step_prior(episode_annotations: list[Any]) -> tuple[str, ...]:
         steps.append(current)
         previous = normalized
     return tuple(steps)
+
+
+def _derive_objective_progress_labels(
+    episode_annotations: list[Any],
+) -> list[tuple[float, bool]]:
+    labels: list[tuple[float, bool]] = [(0.0, False)] * len(episode_annotations)
+    run_start = 0
+    while run_start < len(episode_annotations):
+        objective = _annotation_objective(episode_annotations[run_start])
+        run_end = run_start
+        while (
+            run_end + 1 < len(episode_annotations)
+            and _annotation_objective(episode_annotations[run_end + 1]) == objective
+        ):
+            run_end += 1
+        start_frame = int(episode_annotations[run_start].frame_index)
+        end_frame = int(episode_annotations[run_end].frame_index)
+        span = max(end_frame - start_frame, 1)
+        for index in range(run_start, run_end + 1):
+            frame_index = int(episode_annotations[index].frame_index)
+            progress = min(max((frame_index - start_frame) / span, 0.0), 1.0)
+            labels[index] = (progress, index == run_end)
+        run_start = run_end + 1
+    return labels
+
+
+def _annotation_objective(annotation: Any) -> str:
+    value = annotation.current_objective or annotation.phase or annotation.current_subtask
+    return " ".join(str(value).lower().split())
 
 
 def _build_episode_index_map(dataset: Any) -> dict[int, list[int]]:

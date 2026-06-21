@@ -46,6 +46,9 @@ The current controlled K086A sweep should use the same data split, checkpoint ba
 | `memer_context_summary` | `memer_objective` | coarse preferred | dropped | dropped | optional | chosen best mode | full-context summary token | Tests learned compression before JSON decode |
 | `memer_prior_context` | `memer_objective` | coarse preferred | dropped | weak prior with dropout | optional | chosen best mode | optional | Tests whether prior helps after coarse labels/proprio |
 | `subtask_keyframe_baseline` | `subtask_keyframe` | fine | dropped | dropped | off/on | selected | none | Diagnostic only; currently lower priority |
+| `objective_memory_state` | `objective_memory_state` | coarse preferred | completed-subtasks memory in/out | dropped | optional | selected | `updated_language_memory` | Tests whether model can consume and update compact history |
+| `objective_last_objective` | `objective_last_objective` | coarse preferred | no state input | dropped | optional | selected | `last_objective` | Auxiliary-output ablation that forces previous-objective reconstruction |
+| `objective_prev_stage` | `objective_prev_stage` | coarse preferred | previous distinct objective in/out | dropped | optional | selected | `previous_stage_objective` | Tests compact self-maintained stage state |
 | `hl_v1_full` | `hl_v1` | fine | optional | optional | optional | selected | none | Full memory/progress/advance protocol, not the current debugging baseline |
 
 Recommended immediate sweep:
@@ -59,8 +62,88 @@ Recommended immediate sweep:
 | 5 | `coarse + memer_memory_aux` | Forces visual/state-to-memory learning while keeping text memory out of input |
 | 6 | `coarse + memer_context_summary` | Tests a learned full-input summary token |
 | 7 | prior variants | Only after the pure-model settings are stable |
+| 8 | `coarse + objective_memory_state` | Tests full completed-history context without supervising free-form memory output |
+| 9 | `coarse + objective_last_objective` | Tests the lightest online state feedback loop |
+| 10 | `coarse + objective_prev_stage` | Tests the upper bound from clean previous-stage context |
 
 Do not treat prior-trained + known-prior rollout as the same metric as pure-model rollout. Known-prior override rewrites model outputs and can mask or introduce timing errors.
+
+The three `objective_*` protocols are MEMER-style state-context ablations. They supervise the same target as
+`memer_objective`, `{"current_objective": "...", "horizon_current_objective": "...",
+"keyframe_candidate_positions": [...]}`, and differ only in what text state is provided in the prompt:
+
+- `objective_memory_state`: consumes `language_memory` and predicts `updated_language_memory`.
+- `objective_last_objective`: predicts `last_objective` as an auxiliary target and does not consume it as prompt input.
+- `objective_prev_stage`: consumes `previous_stage_objective` and predicts the maintained `previous_stage_objective`.
+
+Existing `samples.jsonl` can train these protocols: the loader backfills `last_objective` and
+`previous_stage_objective` when old exports do not contain those fields. Re-export is still recommended after label
+logic changes that affect `language_memory` itself, because loader backfill cannot repair stale memory strings stored in
+old samples.
+
+### State Context Injection And Prediction
+
+The `objective_*` protocols do not add learned tokens or change the video inputs. They keep the MEMER current/horizon
+objective target and add one state field to the JSON target. Depending on the ablation, the state is also supplied as
+plain text context in the user prompt.
+
+`objective_memory_state` consumes and predicts compact memory:
+
+```text
+Task instruction: ...
+Completed-subtasks memory: ...
+```
+
+target adds:
+
+```json
+{"updated_language_memory": "..."}
+```
+
+`objective_last_objective` does not provide `last_objective` as prompt input. It predicts it as an auxiliary training
+field, and rollout can ignore it:
+
+```json
+{"last_objective": "..."}
+```
+
+`objective_prev_stage` consumes and predicts the previous distinct objective:
+
+```text
+Task instruction: ...
+Previous stage objective: ...
+```
+
+target adds:
+
+```json
+{"previous_stage_objective": "..."}
+```
+
+The prompt explicitly tells the VLM that supplied state text is a weak temporal cue and that the last valid recent frame
+should override stale or contradictory state text. This keeps the ablation comparable to `memer_objective`: same videos,
+same core MEMER target JSON, plus one state-maintenance output.
+
+Data source by protocol:
+
+| Protocol | Prompt context line | Extra target field | Training source | Rollout source |
+| --- | --- | --- | --- | --- |
+| `objective_memory_state` | `Completed-subtasks memory: ...` | `updated_language_memory` | teacher-forced `sample.language_memory` -> `sample.updated_language_memory` | runtime `language_memory`; next state uses predicted `updated_language_memory` |
+| `objective_last_objective` | none | `last_objective` | teacher-forced previous sample objective in the same episode | auxiliary output only; rollout can ignore it |
+| `objective_prev_stage` | `Previous stage objective: ...` | `previous_stage_objective` | oracle previous distinct objective in the same episode | self-maintained from predicted `previous_stage_objective`, with transition fallback |
+
+Important limitation: `last_objective` and `previous_stage_objective` can be derived from old samples because they depend
+only on `current_objective` order. `language_memory` cannot be repaired this way; if the stored memory text is stale, for
+example every row says `No completed subtask yet`, the dataset must be re-exported.
+
+Interpretation:
+
+- `objective_memory_state` is the closest to a real stateful rollout if the runtime memory is maintained outside the
+  VLM or by the model's `updated_language_memory`.
+- `objective_last_objective` is an auxiliary-output ablation. It forces the model to reconstruct the previous objective
+  during training, but the field is not needed by rollout.
+- `objective_prev_stage` is a compact self-maintained state ablation. Training is still teacher-forced/oracle; rollout
+  quality depends on whether the model can keep the predicted previous-stage field stable.
 
 ## Coarse Label Sidecar
 
@@ -72,7 +155,7 @@ PYTHONPATH=src python scripts/hl_memory/coarsen_hl_annotations.py \
   --input-name hl_annotations_llm_normalized.jsonl \
   --output-name hl_annotations_llm_normalized_coarse.jsonl \
   --merge-mode conservative \
-  --short-run-merge-max-frames 20 \
+  --short-run-merge-max-frames 35 \
   --overwrite \
   --summary-json /root/Users/dataset/lerobot_home/subtask/batch_coarse_hl_annotations_summary.json
 ```
@@ -104,6 +187,7 @@ Default merge behavior:
 | approach -> grasp | approach rows are relabeled toward acquire/grasp |
 | approach/grasp handle -> open/close | handle acquisition is relabeled toward the articulation objective |
 | same-object short wording variants | compatible short runs are merged and prefer the shorter/general label, e.g. `Fold packaging box sides` -> `Fold packaging box` |
+| short staging transport -> place | `move above/over <support>` is merged into the following place objective, e.g. `Move above plate` -> `Place leaf vegetable on steak` |
 | bottle/cap rotate/twist | preserved; do not short-run merge directional operation fragments |
 | return/retreat | preserved as executable reset objectives; add `--merge-return-into-previous` only for a special ablation |
 
@@ -111,7 +195,7 @@ Use `--merge-mode aggressive` for the extra `grasp/transport -> place` rule. It 
 
 This is intentionally heuristic. Inspect a few generated JSONL rows before launching a full run. The output keeps object grounding in `current_objective`; `coarse_action_type` is metadata, not the text target.
 
-Latest conservative coarse stats: 12,618 runs, p10 18 frames, median 59 frames, p90 123 frames. The remaining p10 short runs are mostly reset/release boundaries and directional bottle/cap operations, which are deliberately left unmerged.
+Latest conservative coarse stats should be regenerated after changing the merge threshold or staging-placement rule. Older 20-frame runs left some `move above plate -> place ...` boundaries unmerged; the current recommended 35-frame pass is intended to remove those timing-only boundaries before MEMER training.
 
 ## Architecture Additions To Consider
 

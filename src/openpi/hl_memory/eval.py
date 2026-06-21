@@ -48,8 +48,12 @@ def compute_prediction_metrics(
     sample: ExportedHLMemorySample,
     *,
     target_protocol: str = "hl_v1",
+    keyframe_candidate_label_mode: str = "event_band",
 ) -> dict[str, float]:
-    expected = sample.target_prediction(target_protocol=target_protocol)
+    expected = sample.target_prediction(
+        target_protocol=target_protocol,
+        keyframe_candidate_label_mode=keyframe_candidate_label_mode,
+    )
     expected_positions = set(expected.keyframe_candidate_positions)
     predicted_positions = set(prediction.keyframe_candidate_positions)
     overlap = expected_positions & predicted_positions
@@ -61,10 +65,17 @@ def compute_prediction_metrics(
         _normalize_text(prediction.updated_language_memory),
         _normalize_text(expected.updated_language_memory),
     ).ratio()
+    expected_completed = _normalize_text(expected.completed_objective)
+    predicted_completed = _normalize_text(prediction.completed_objective)
+    expected_has_completed = bool(expected_completed)
+    predicted_has_completed = bool(predicted_completed)
     return {
         "objective_exact_match": float(prediction.current_objective == expected.current_objective),
         "objective_normalized_match": float(
             _normalize_text(prediction.current_objective) == _normalize_text(expected.current_objective)
+        ),
+        "horizon_objective_normalized_match": float(
+            _normalize_text(prediction.horizon_current_objective) == _normalize_text(expected.horizon_current_objective)
         ),
         "subtask_progress_mae": _optional_float_mae(prediction.subtask_progress, expected.subtask_progress),
         "subtask_progress_accuracy_0_1": _optional_float_within(
@@ -81,6 +92,16 @@ def compute_prediction_metrics(
         "goal_query_accuracy": float(_normalize_text(prediction.goal_query) == _normalize_text(expected.goal_query)),
         "keyframe_precision": precision,
         "keyframe_recall": recall,
+        "keyframe_f1": (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0,
+        "keyframe_event_recall": _keyframe_event_recall(prediction, sample),
+        "keyframe_event_duplicate_predictions": _keyframe_event_duplicate_predictions(prediction, sample),
+        "keyframe_event_timing_error": _keyframe_event_timing_error(prediction, sample),
+        "completed_objective_precision": float(
+            (not predicted_has_completed) or (expected_has_completed and predicted_completed == expected_completed)
+        ),
+        "completed_objective_recall": float(
+            (not expected_has_completed) or (predicted_has_completed and predicted_completed == expected_completed)
+        ),
         "language_memory_similarity": memory_similarity,
         "memory_drift": 1.0 - memory_similarity,
         "legacy_subtask_exact_match": float(prediction.current_subtask == expected.current_subtask),
@@ -89,7 +110,37 @@ def compute_prediction_metrics(
         ),
         "legacy_phase_accuracy": float(_normalize_text(prediction.phase) == _normalize_text(expected.phase)),
         "legacy_event_accuracy": _event_accuracy(prediction, sample),
-    }
+}
+
+
+def _keyframe_event_recall(prediction: HLMemoryPrediction, sample: ExportedHLMemorySample) -> float:
+    if not sample.keyframe_event_ids:
+        return 1.0
+    predicted = set(prediction.keyframe_candidate_positions)
+    expected = set(sample.keyframe_candidate_positions)
+    return float(bool(predicted & expected))
+
+
+def _keyframe_event_duplicate_predictions(prediction: HLMemoryPrediction, sample: ExportedHLMemorySample) -> float:
+    if not sample.keyframe_event_ids:
+        return 0.0
+    predicted_hits = set(prediction.keyframe_candidate_positions) & set(sample.keyframe_candidate_positions)
+    return float(max(len(predicted_hits) - 1, 0))
+
+
+def _keyframe_event_timing_error(prediction: HLMemoryPrediction, sample: ExportedHLMemorySample) -> float:
+    if not sample.keyframe_event_frame_indices:
+        return 0.0
+    position_lookup = {position: int(frame_index) for position, frame_index in enumerate(sample.recent_frame_indices, start=1)}
+    predicted_frames = [
+        position_lookup[position]
+        for position in prediction.keyframe_candidate_positions
+        if position in position_lookup
+    ]
+    if not predicted_frames:
+        return -1.0
+    canonical = int(sample.keyframe_event_frame_indices[0])
+    return float(min(abs(frame_index - canonical) for frame_index in predicted_frames))
 
 
 def evaluate_ablation_modes(
@@ -124,7 +175,12 @@ def run_offline_rollout(
             runtime_sample = state.runtime_sample(mode=mode)
             prediction = predict_fn(runtime_sample)
             prediction = state.postprocess_prediction(prediction, mode=mode)
-            metrics = compute_prediction_metrics(prediction, sample, target_protocol=hl_config.target_protocol)
+            metrics = compute_prediction_metrics(
+                prediction,
+                sample,
+                target_protocol=hl_config.target_protocol,
+                keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+            )
             for key, value in metrics.items():
                 totals[key] += value
             if on_prediction is not None:
@@ -222,6 +278,7 @@ def run_offline_rollout_batched(
                 prediction,
                 source_sample,
                 target_protocol=hl_config.target_protocol,
+                keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
             )
             for key, value in metrics.items():
                 totals[key] += value
@@ -272,6 +329,7 @@ class _EpisodeRolloutState:
         self.known_prior_steps = self.samples[0].step_prior if self.samples else ()
         self.known_prior_index = 0
         self.target_protocol = hl_config.target_protocol
+        self.keyframe_candidate_label_mode = hl_config.keyframe_candidate_label_mode
         self.language_memory = self._initial_language_memory()
         self.sample_index = 0
         self.sequence_ok = True
@@ -324,7 +382,12 @@ class _EpisodeRolloutState:
         source_sample = self.current_sample
         self.sequence_ok &= (
             _normalize_text(prediction.current_objective)
-            == _normalize_text(source_sample.target_prediction(target_protocol=self.target_protocol).current_objective)
+            == _normalize_text(
+                source_sample.target_prediction(
+                    target_protocol=self.target_protocol,
+                    keyframe_candidate_label_mode=self.keyframe_candidate_label_mode,
+                ).current_objective
+            )
         )
         if mode in ("language_memory_only", "full"):
             self.language_memory = prediction.updated_language_memory

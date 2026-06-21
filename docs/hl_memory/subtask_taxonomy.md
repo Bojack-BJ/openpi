@@ -121,12 +121,13 @@ Two merge modes are available:
 
 `horizon_current_objective` is classified but does not use lookahead merge. It is already a future label, and applying another future lookahead can double-advance the target.
 
-After the row-level pass, `--short-run-merge-max-frames 20` merges only compatible adjacent short runs. The second pass is source-aware:
+After the row-level pass, `--short-run-merge-max-frames 35` merges only compatible adjacent short runs. The second pass is source-aware:
 
 | Case | Behavior |
 | --- | --- |
 | Same action/object wording variants | Merge and prefer the shorter/general label, e.g. `Fold packaging box sides` -> `Fold packaging box` |
 | Very short `transport -> place` | Rewrite the combined run to the place objective |
+| Short `move above/over <support> -> place ...` staging boundary | Rewrite the combined run to the place objective even when the support object differs from the manipulated object |
 | Very short terminal `release -> reset` | Rewrite the release frames to the reset objective |
 | Very short bottle-cap `rotate/twist -> remove` tail | Rewrite the tail to `Loosen and remove the bottle cap/lid` |
 | Reset/wait/retract | Preserve |
