@@ -20,11 +20,17 @@ from tqdm.auto import tqdm
 import tyro
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.conditioning import configure_conditioning_model
+from openpi.hl_memory.conditioning import find_conditioning_model
+from openpi.hl_memory.conditioning import save_conditioning_state_if_available
 from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
 from openpi.hl_memory.data import FrameCache
 from openpi.hl_memory.data import load_video_clips_for_sample
 from openpi.hl_memory.data import load_exported_samples
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.keyframe_auxiliary import configure_keyframe_auxiliary_model
+from openpi.hl_memory.keyframe_auxiliary import find_keyframe_auxiliary_model
+from openpi.hl_memory.keyframe_auxiliary import save_keyframe_auxiliary_state
 from openpi.hl_memory.proprio import proprio_base_embedding_modules
 from openpi.hl_memory.proprio import save_proprio_state_if_available
 from openpi.hl_memory.proprio import temporarily_unwrap_proprio_embeddings
@@ -113,6 +119,28 @@ class TrainArgs:
     two_pass_training_proposal_noise_probability: float = 0.25
     two_pass_predict_loss_weight: float = 1.0
     two_pass_confirm_loss_weight: float = 1.0
+    keyframe_aux_hidden_dim: int = 512
+    keyframe_aux_timing_sigma_sec: float = 0.5
+    keyframe_aux_position_loss_weight: float = 0.0
+    keyframe_aux_event_loss_weight: float = 0.0
+    keyframe_aux_timing_loss_weight: float = 0.0
+    keyframe_aux_update_loss_weight: float = 0.0
+    keyframe_aux_event_pos_weight: float = 1.0
+    field_current_objective_loss_weight: float = 1.0
+    field_horizon_objective_loss_weight: float = 1.0
+    field_completed_objective_loss_weight: float = 1.0
+    progress_condition_enabled: bool = False
+    progress_condition_input_mode: str = "completed_only"
+    progress_condition_dim: int = 128
+    progress_condition_hidden_dim: int = 512
+    progress_condition_dropout: float = 0.3
+    progress_condition_predict_strength: float = 0.5
+    progress_condition_confirm_strength: float = 1.0
+    state_condition_enabled: bool = False
+    state_condition_mode: str = "film"
+    state_condition_dim: int = 128
+    state_condition_hidden_dim: int = 512
+    state_condition_dropout: float = 0.0
     learning_rate: float = 5e-6
     vision_tower_learning_rate: float | None = None
     weight_decay: float = 1e-4
@@ -148,6 +176,18 @@ class TrainArgs:
     profile_start_step: int = 1
     profile_trace_dir: pathlib.Path | None = None
     profile_record_shapes: bool = False
+
+
+def _keyframe_auxiliary_enabled(args: TrainArgs) -> bool:
+    weights = (
+        args.keyframe_aux_position_loss_weight,
+        args.keyframe_aux_event_loss_weight,
+        args.keyframe_aux_timing_loss_weight,
+        args.keyframe_aux_update_loss_weight,
+    )
+    if any(weight < 0.0 for weight in weights):
+        raise ValueError("Keyframe auxiliary loss weights must be non-negative.")
+    return any(weight > 0.0 for weight in weights)
 
 
 def main(args: TrainArgs) -> None:
@@ -207,6 +247,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         if is_main
         else None
     )
+    keyframe_aux_enabled = _keyframe_auxiliary_enabled(args)
     hl_config = HLMemoryConfig(
         vlm_backend=args.vlm_backend,
         vlm_variant=args.vlm_variant,
@@ -234,6 +275,21 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
         keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
         two_pass_training_proposal_noise_probability=args.two_pass_training_proposal_noise_probability,
+        keyframe_aux_enabled=keyframe_aux_enabled,
+        keyframe_aux_hidden_dim=args.keyframe_aux_hidden_dim,
+        keyframe_aux_timing_sigma_sec=args.keyframe_aux_timing_sigma_sec,
+        progress_condition_enabled=args.progress_condition_enabled,
+        progress_condition_input_mode=args.progress_condition_input_mode,
+        progress_condition_dim=args.progress_condition_dim,
+        progress_condition_hidden_dim=args.progress_condition_hidden_dim,
+        progress_condition_dropout=args.progress_condition_dropout,
+        progress_condition_predict_strength=args.progress_condition_predict_strength,
+        progress_condition_confirm_strength=args.progress_condition_confirm_strength,
+        state_condition_enabled=args.state_condition_enabled,
+        state_condition_mode=args.state_condition_mode,
+        state_condition_dim=args.state_condition_dim,
+        state_condition_hidden_dim=args.state_condition_hidden_dim,
+        state_condition_dropout=args.state_condition_dropout,
     )
     adapter = create_hf_adapter(hl_config)
     device = _resolve_training_device(args, distributed=distributed)
@@ -244,6 +300,36 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     if args.lora_enabled:
         loaded = dataclasses.replace(loaded, model=_apply_lora(loaded.model, args=args, is_main=is_main))
     _configure_vision_tower_training(loaded.model, args=args, is_main=is_main)
+    if keyframe_aux_enabled:
+        loaded = dataclasses.replace(
+            loaded,
+            model=configure_keyframe_auxiliary_model(
+                loaded.model,
+                hidden_dim=args.keyframe_aux_hidden_dim,
+                num_positions=hl_config.recent_frames_length,
+                checkpoint_dir=args.local_vlm_ckpt_path,
+            ),
+        )
+        if is_main:
+            logging.info(
+                "Enabled keyframe auxiliary losses: position=%g event=%g timing=%g update=%g",
+                args.keyframe_aux_position_loss_weight,
+                args.keyframe_aux_event_loss_weight,
+                args.keyframe_aux_timing_loss_weight,
+                args.keyframe_aux_update_loss_weight,
+            )
+    loaded = dataclasses.replace(
+        loaded,
+        model=configure_conditioning_model(loaded.model, hl_config, checkpoint_dir=args.local_vlm_ckpt_path),
+    )
+    if is_main and (hl_config.progress_condition_enabled or hl_config.state_condition_enabled):
+        logging.info(
+            "Enabled HL FiLM conditioning: progress=%s mode=%s state=%s state_mode=%s",
+            hl_config.progress_condition_enabled,
+            hl_config.progress_condition_input_mode,
+            hl_config.state_condition_enabled,
+            hl_config.state_condition_mode,
+        )
     if distributed and args.distributed_strategy == "fsdp":
         _align_fsdp_parameter_dtypes(loaded.model, args=args, is_main=is_main)
     loaded.model.train()
@@ -353,6 +439,14 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                             inputs,
                             two_pass_predict_weight=args.two_pass_predict_loss_weight,
                             two_pass_confirm_weight=args.two_pass_confirm_loss_weight,
+                            keyframe_aux_position_weight=args.keyframe_aux_position_loss_weight,
+                            keyframe_aux_event_weight=args.keyframe_aux_event_loss_weight,
+                            keyframe_aux_timing_weight=args.keyframe_aux_timing_loss_weight,
+                            keyframe_aux_update_weight=args.keyframe_aux_update_loss_weight,
+                            keyframe_aux_event_pos_weight=args.keyframe_aux_event_pos_weight,
+                            field_current_objective_weight=args.field_current_objective_loss_weight,
+                            field_horizon_objective_weight=args.field_horizon_objective_loss_weight,
+                            field_completed_objective_weight=args.field_completed_objective_loss_weight,
                         )
                         _accumulate_loss_metrics(
                             step_loss_metrics,
@@ -480,6 +574,14 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     device=device,
                     two_pass_predict_loss_weight=args.two_pass_predict_loss_weight,
                     two_pass_confirm_loss_weight=args.two_pass_confirm_loss_weight,
+                    keyframe_aux_position_loss_weight=args.keyframe_aux_position_loss_weight,
+                    keyframe_aux_event_loss_weight=args.keyframe_aux_event_loss_weight,
+                    keyframe_aux_timing_loss_weight=args.keyframe_aux_timing_loss_weight,
+                    keyframe_aux_update_loss_weight=args.keyframe_aux_update_loss_weight,
+                    keyframe_aux_event_pos_weight=args.keyframe_aux_event_pos_weight,
+                    field_current_objective_loss_weight=args.field_current_objective_loss_weight,
+                    field_horizon_objective_loss_weight=args.field_horizon_objective_loss_weight,
+                    field_completed_objective_loss_weight=args.field_completed_objective_loss_weight,
                 )
                 logged_val_metrics = (
                     _mean_metric_dict_across_ranks(val_metrics, device=device) if distributed else val_metrics
@@ -1044,6 +1146,14 @@ def _evaluate_loss(
     device: torch.device,
     two_pass_predict_loss_weight: float,
     two_pass_confirm_loss_weight: float,
+    keyframe_aux_position_loss_weight: float,
+    keyframe_aux_event_loss_weight: float,
+    keyframe_aux_timing_loss_weight: float,
+    keyframe_aux_update_loss_weight: float,
+    keyframe_aux_event_pos_weight: float,
+    field_current_objective_loss_weight: float,
+    field_horizon_objective_loss_weight: float,
+    field_completed_objective_loss_weight: float,
 ) -> dict[str, float]:
     if num_batches <= 0:
         raise ValueError("--val-batches must be positive when validation is enabled.")
@@ -1073,6 +1183,14 @@ def _evaluate_loss(
                     inputs,
                     two_pass_predict_weight=two_pass_predict_loss_weight,
                     two_pass_confirm_weight=two_pass_confirm_loss_weight,
+                    keyframe_aux_position_weight=keyframe_aux_position_loss_weight,
+                    keyframe_aux_event_weight=keyframe_aux_event_loss_weight,
+                    keyframe_aux_timing_weight=keyframe_aux_timing_loss_weight,
+                    keyframe_aux_update_weight=keyframe_aux_update_loss_weight,
+                    keyframe_aux_event_pos_weight=keyframe_aux_event_pos_weight,
+                    field_current_objective_weight=field_current_objective_loss_weight,
+                    field_horizon_objective_weight=field_horizon_objective_loss_weight,
+                    field_completed_objective_weight=field_completed_objective_loss_weight,
                 )
                 loss_value = float(loss.detach().cpu())
                 if not math.isfinite(loss_value):
@@ -1261,8 +1379,23 @@ def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryCon
             if not is_main:
                 return
             output_dir.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(output_dir, state_dict=state_dict)
+            auxiliary_model = find_keyframe_auxiliary_model(model)
+            conditioning_model = find_conditioning_model(model)
+            base_state_dict = (
+                _base_model_state_dict(state_dict)
+                if auxiliary_model is not None or conditioning_model is not None
+                else state_dict
+            )
+            model.save_pretrained(output_dir, state_dict=base_state_dict)
         save_proprio_state_if_available(model, output_dir, hl_config)
+        save_conditioning_state_if_available(model, output_dir, hl_config, full_state_dict=state_dict)
+        save_keyframe_auxiliary_state(
+            model,
+            output_dir,
+            hidden_dim=train_args.keyframe_aux_hidden_dim,
+            num_positions=hl_config.recent_frames_length,
+            full_state_dict=state_dict,
+        )
     else:
         if not is_main:
             return
@@ -1271,6 +1404,13 @@ def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryCon
         with temporarily_unwrap_proprio_embeddings(model):
             model.save_pretrained(output_dir)
         save_proprio_state_if_available(model, output_dir, hl_config)
+        save_conditioning_state_if_available(model, output_dir, hl_config)
+        save_keyframe_auxiliary_state(
+            model,
+            output_dir,
+            hidden_dim=train_args.keyframe_aux_hidden_dim,
+            num_positions=hl_config.recent_frames_length,
+        )
     loaded.processor.save_pretrained(output_dir)
     metadata = {
         "hl_memory_config": dataclasses.asdict(hl_config),
@@ -1280,6 +1420,28 @@ def _save_checkpoint(*, output_dir: pathlib.Path, loaded, hl_config: HLMemoryCon
         },
     }
     (output_dir / "hl_memory_train_metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=True) + "\n")
+
+
+def _base_model_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    excluded = (
+        "auxiliary_head.",
+        "progress_encoder.",
+        "progress_film.",
+        "state_encoder.",
+        "state_film.",
+    )
+    result = {}
+    for key, value in state_dict.items():
+        if any(marker in key for marker in excluded):
+            continue
+        stripped = key
+        while stripped.startswith("base_model."):
+            stripped = stripped.removeprefix("base_model.")
+        if stripped != key or "base_model." in key:
+            result[stripped] = value
+    if not result:
+        raise ValueError("Could not extract base VLM parameters from wrapped checkpoint state.")
+    return result
 
 
 def _is_fsdp_model(model: torch.nn.Module) -> bool:

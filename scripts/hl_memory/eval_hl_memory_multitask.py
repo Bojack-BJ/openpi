@@ -60,6 +60,18 @@ class EvalArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    progress_condition_enabled: bool = False
+    progress_condition_input_mode: str = "completed_only"
+    progress_condition_dim: int = 128
+    progress_condition_hidden_dim: int = 512
+    progress_condition_dropout: float = 0.3
+    progress_condition_predict_strength: float = 0.5
+    progress_condition_confirm_strength: float = 1.0
+    state_condition_enabled: bool = False
+    state_condition_mode: str = "film"
+    state_condition_dim: int = 128
+    state_condition_hidden_dim: int = 512
+    state_condition_dropout: float = 0.0
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
     keyframe_candidate_label_mode: str = "event_band"
@@ -102,6 +114,18 @@ def main(args: EvalArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        progress_condition_enabled=args.progress_condition_enabled,
+        progress_condition_input_mode=args.progress_condition_input_mode,
+        progress_condition_dim=args.progress_condition_dim,
+        progress_condition_hidden_dim=args.progress_condition_hidden_dim,
+        progress_condition_dropout=args.progress_condition_dropout,
+        progress_condition_predict_strength=args.progress_condition_predict_strength,
+        progress_condition_confirm_strength=args.progress_condition_confirm_strength,
+        state_condition_enabled=args.state_condition_enabled,
+        state_condition_mode=args.state_condition_mode,
+        state_condition_dim=args.state_condition_dim,
+        state_condition_hidden_dim=args.state_condition_hidden_dim,
+        state_condition_dropout=args.state_condition_dropout,
         keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
         keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
         keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
@@ -323,7 +347,7 @@ def _run_sample_context_eval(
 def _with_ablation_context(sample, *, mode, memory, frame_lookup, language_memory):
     runtime_language_memory = language_memory if mode in ("language_memory_only", "full") else DEFAULT_LANGUAGE_MEMORY
     if mode in ("keyframe_memory_only", "full"):
-        memory_indices = tuple(index for index in memory.visible_indices(sample.recent_frame_indices) if index in frame_lookup)
+        memory_indices = tuple(index for index in memory.selected_indices() if index in frame_lookup)
         memory_paths = tuple(frame_lookup[index] for index in memory_indices)
     else:
         memory_indices = ()

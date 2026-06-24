@@ -687,8 +687,10 @@ def _export_episode(
             recent_robot_states = tuple(state for state, _ in extracted_states)
             recent_robot_state_masks = tuple(mask for _, mask in extracted_states)
             robot_state_dim_names = _fastumi_state_dim_names(proprio_state_dim)
+        # Historical keyframes are a typed source independent of the recent clip.
+        # Keep accepted keyframes even when their frames also occur in the recent window.
         memory_frame_indices = tuple(
-            index for index in keyframe_memory.visible_indices(recent_local_indices) if global_indices[index] in frame_cache
+            index for index in keyframe_memory.selected_indices() if global_indices[index] in frame_cache
         )
         memory_frame_paths = tuple(frame_cache[global_indices[index]] for index in memory_frame_indices)
 

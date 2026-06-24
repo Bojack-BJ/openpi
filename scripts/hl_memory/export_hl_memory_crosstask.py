@@ -220,7 +220,9 @@ def _export_episode(
                 for second_index in recent_indices
             )
             memory_frame_indices = tuple(
-                second_index for second_index in keyframe_memory.visible_indices(recent_indices) if (video_id, second_index) in frame_cache
+                second_index
+                for second_index in keyframe_memory.selected_indices()
+                if (video_id, second_index) in frame_cache
             )
             memory_frame_paths = tuple(frame_cache[(video_id, second_index)] for second_index in memory_frame_indices)
 

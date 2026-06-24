@@ -410,7 +410,7 @@ def _with_ablation_context(
 ) -> ExportedHLMemorySample:
     runtime_language_memory = language_memory if mode in ("language_memory_only", "full") else DEFAULT_LANGUAGE_MEMORY
     if mode in ("keyframe_memory_only", "full"):
-        memory_indices = tuple(index for index in memory.visible_indices(sample.recent_frame_indices) if index in frame_lookup)
+        memory_indices = tuple(index for index in memory.selected_indices() if index in frame_lookup)
         memory_paths = tuple(frame_lookup[index] for index in memory_indices)
     else:
         memory_indices = ()

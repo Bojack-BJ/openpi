@@ -228,6 +228,7 @@ def test_debug_text_lines_include_progress_and_advance_state():
         language_memory_after="after",
         memory_seconds_before=(),
         memory_seconds_after=(),
+        memory_seconds_input=(),
         keyframe_candidate_seconds=(),
         state_update="",
         ground_truth_subtask=None,

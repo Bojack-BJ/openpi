@@ -6,17 +6,37 @@ from PIL import Image
 import pytest
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.conditioning import render_progress_condition_text
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
 from openpi.hl_memory.hf_adapter import HLVLMGeneration
 from openpi.hl_memory.hf_adapter import Qwen25HLAdapter
+from openpi.hl_memory.hf_adapter import Qwen3VLHLAdapter
+from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.hf_adapter import _candidate_evidence_clips
+from openpi.hl_memory.hf_adapter import _build_batched_field_ids
+from openpi.hl_memory.hf_adapter import _keyframe_auxiliary_targets_for_sample
 from openpi.hl_memory.hf_adapter import _parse_completed_objective_text
 from openpi.hl_memory.proprio import PROPRIO_FRAME_TOKEN
 from openpi.hl_memory.proprio import PROPRIO_SUMMARY_TOKEN
 from openpi.hl_memory.proprio import build_proprio_batch
 from openpi.hl_memory.proprio import render_proprio_token_text
 from openpi.hl_memory.schema import HLMemoryPrediction
+
+
+def test_create_hf_adapter_routes_qwen3_vl_backend():
+    adapter = create_hf_adapter(HLMemoryConfig(vlm_backend="qwen3_vl"))
+
+    assert isinstance(adapter, Qwen3VLHLAdapter)
+
+
+class _CharOffsetTokenizer:
+    def __call__(self, text: str, *, add_special_tokens: bool = False, return_offsets_mapping: bool = False):
+        assert not add_special_tokens
+        encoded = {"input_ids": [ord(char) for char in text]}
+        if return_offsets_mapping:
+            encoded["offset_mapping"] = [(index, index + 1) for index in range(len(text))]
+        return encoded
 
 
 def test_qwen_video_metadata_uses_configured_recent_sample_rate():
@@ -66,6 +86,46 @@ def test_memer_objective_target_text_is_minimal_and_uses_current_and_horizon_lab
         "horizon_current_objective": "horizon objective",
         "keyframe_candidate_positions": [2],
     }
+
+
+def test_field_ids_allow_chat_template_suffix_tokens():
+    import torch
+
+    target_text = '{"current_objective":"pick","horizon_current_objective":"place"}'
+    target_ids = [ord(char) for char in target_text]
+    labels = torch.tensor([[-100, *target_ids, 999]], dtype=torch.long)
+
+    field_ids = _build_batched_field_ids(
+        tokenizer=_CharOffsetTokenizer(),
+        labels=labels,
+        target_texts=(target_text,),
+    )
+
+    assert field_ids is not None
+    assert field_ids.shape == labels.shape
+    assert field_ids[0, 0].item() == -1
+    assert field_ids[0, -1].item() == -1
+    assert bool((field_ids[0, 1:-1] != -1).any())
+
+
+def test_field_ids_skip_when_supervised_tokens_do_not_match_target_text(caplog):
+    import logging
+    import torch
+
+    target_text = '{"current_objective":"pick"}'
+    target_ids = [ord(char) for char in target_text]
+    target_ids[3] += 1
+    labels = torch.tensor([[-100, *target_ids]], dtype=torch.long)
+
+    with caplog.at_level(logging.WARNING):
+        field_ids = _build_batched_field_ids(
+            tokenizer=_CharOffsetTokenizer(),
+            labels=labels,
+            target_texts=(target_text,),
+        )
+
+    assert field_ids is None
+    assert "supervised target tokens do not match target_text" in caplog.text
 
 
 def test_subtask_keyframe_target_text_is_minimal_and_uses_current_objective():
@@ -138,6 +198,50 @@ def test_keyframe_gated_memory_target_text_uses_completed_objective():
     }
 
 
+def test_keyframe_auxiliary_targets_align_proposal_with_history_update():
+    config = HLMemoryConfig(
+        keyframe_aux_enabled=True,
+        recent_frames_length=4,
+        training_fps=20.0,
+        keyframe_aux_timing_sigma_sec=0.5,
+    )
+    sample = ExportedHLMemorySample(
+        sample_id="sample",
+        episode_index=0,
+        step_index=0,
+        frame_index=20,
+        instruction="task",
+        language_memory="",
+        updated_language_memory="",
+        current_subtask="place",
+        phase="place",
+        target_query="",
+        goal_query="",
+        keyframe_candidate_positions=(3,),
+        memory_frame_paths=(),
+        memory_frame_indices=(),
+        memory_valid_length=0,
+        recent_frame_paths=("0.png", "1.png", "2.png", "3.png"),
+        recent_frame_indices=(5, 10, 15, 20),
+        recent_valid_length=4,
+        keyframe_event_ids=("episode:0:event:1",),
+        keyframe_event_frame_indices=(20,),
+    )
+
+    add_target = _keyframe_auxiliary_targets_for_sample(sample, config=config, enabled=True)
+    duplicate_target = _keyframe_auxiliary_targets_for_sample(
+        dataclasses.replace(sample, memory_frame_indices=(20,)),
+        config=config,
+        enabled=True,
+    )
+
+    assert add_target["event_target"] == 1.0
+    assert add_target["update_target"] == 1
+    assert duplicate_target["update_target"] == 2
+    assert add_target["canonical_position"] == 3.0
+    assert max(range(4), key=lambda index: add_target["position_targets"][index]) == 3
+
+
 def test_typed_mask_target_matches_single_pass_keyframe_gated_target():
     sample = ExportedHLMemorySample(
         sample_id="sample",
@@ -168,6 +272,28 @@ def test_typed_mask_target_matches_single_pass_keyframe_gated_target():
     )
 
     assert json.loads(typed_mask.build_target_text(sample)) == json.loads(single_pass.build_target_text(sample))
+
+
+def test_keyframe_gated_system_prompt_assigns_evidence_by_output_role():
+    adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="keyframe_gated_memory"))
+
+    prompt = adapter.build_system_prompt()
+
+    assert "recent observation clip as the primary visual evidence" in prompt
+    assert "historical memory only as non-Markovian context" in prompt
+    assert "Select keyframe candidates only from the recent observation clip" in prompt
+    assert "visually confirms completion" in prompt
+
+
+def test_two_pass_system_prompt_separates_proposal_and_confirmation():
+    adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="keyframe_gated_memory_two_pass"))
+
+    prompt = adapter.build_system_prompt()
+
+    assert "In Pass A" in prompt
+    assert "propose recent keyframe evidence" in prompt
+    assert "In Pass B" in prompt
+    assert "only from the proposed candidate evidence" in prompt
 
 
 def test_keyframe_gated_memory_prompt_uses_completed_event_log_without_free_memory_target():
@@ -243,6 +369,91 @@ def test_keyframe_gated_two_pass_targets_are_typed():
         "keyframe_candidate_positions": [2],
     }
     assert pass_b == {"completed_objective": "place toast"}
+
+
+def test_film_progress_two_pass_splits_current_and_horizon_targets():
+    adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="memer_film_progress_two_pass"))
+    sample = ExportedHLMemorySample(
+        sample_id="sample",
+        episode_index=0,
+        step_index=0,
+        frame_index=0,
+        instruction="task",
+        language_memory="Completed events: grasp toast.",
+        updated_language_memory="must not be supervised",
+        current_subtask="place toast",
+        phase="place toast",
+        target_query="",
+        goal_query="",
+        keyframe_candidate_positions=(2,),
+        memory_frame_paths=(),
+        memory_frame_indices=(),
+        memory_valid_length=0,
+        recent_frame_paths=("recent.png",),
+        recent_frame_indices=(0,),
+        recent_valid_length=1,
+        current_objective="place toast",
+        horizon_current_objective="grasp steak",
+        keyframe_label=True,
+    )
+
+    current = json.loads(adapter._build_two_pass_target_text(sample, stage="predict"))
+    horizon = json.loads(adapter._build_two_pass_target_text(sample, stage="horizon"))
+    confirm = json.loads(adapter._build_two_pass_target_text(sample, stage="confirm"))
+
+    assert current == {"current_objective": "place toast", "keyframe_candidate_positions": [2]}
+    assert horizon == {"horizon_current_objective": "grasp steak"}
+    assert confirm == {"completed_objective": "place toast"}
+
+
+def test_film_progress_pass_a_prompt_hides_raw_memory_text():
+    adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="memer_film_progress_two_pass"))
+    sample = _minimal_sample()
+    sample = dataclasses.replace(
+        sample,
+        language_memory="Completed events: leaked completed text.\nCurrent objective: leaked current.",
+    )
+    clips = LoadedVideoClips(
+        memory_frames=(),
+        recent_frames=(Image.new("RGB", (8, 6)),),
+        memory_valid_length=0,
+        recent_valid_length=1,
+    )
+
+    prompt = adapter._build_keyframe_gated_two_pass_predict_prompt(sample, clips)
+
+    assert "leaked completed text" not in prompt
+    assert "leaked current" not in prompt
+    assert "learned low-bandwidth condition" in prompt
+
+
+def test_progress_condition_completed_only_drops_current_like_fields():
+    config = HLMemoryConfig(
+        target_protocol="memer_film_progress_two_pass",
+        progress_condition_enabled=True,
+        progress_condition_input_mode="completed_only",
+    )
+    sample = dataclasses.replace(
+        _minimal_sample(),
+        language_memory=(
+            "Task progress: toast has been placed.\n"
+            "Current objective: leaked current objective.\n"
+            "Phase: leaked phase.\n"
+            "Completed events: toast placed."
+        ),
+        current_objective="gt current must not leak",
+        phase="gt phase must not leak",
+        task_progress="gt task progress must not leak",
+    )
+
+    text = render_progress_condition_text(sample, config)
+
+    assert "toast has been placed" in text
+    assert "toast placed" in text
+    assert "leaked current objective" not in text
+    assert "leaked phase" not in text
+    assert "gt current must not leak" not in text
+    assert "gt task progress must not leak" not in text
 
 
 def test_two_pass_confirm_clip_contains_only_candidate_frames():

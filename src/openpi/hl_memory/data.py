@@ -233,6 +233,7 @@ class ExportedHLMemorySample:
             "keyframe_gated_memory",
             "keyframe_gated_memory_typed_mask",
             "keyframe_gated_memory_two_pass",
+            "memer_film_progress_two_pass",
         }:
             objective = self.current_objective or self.current_subtask
             horizon_objective = self.horizon_current_objective or objective

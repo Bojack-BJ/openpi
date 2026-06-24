@@ -24,6 +24,21 @@ def test_qwen3_5_4b_variant_sets_model_id():
     assert config.resolved_model_id == "Qwen/Qwen3.5-4B"
 
 
+def test_qwen3_vl_defaults_to_4b_model_id():
+    config = HLMemoryConfig(vlm_backend="qwen3_vl")
+
+    assert config.vlm_variant == "qwen3_vl_4b"
+    assert config.resolved_model_id == "Qwen/Qwen3-VL-4B-Instruct"
+    assert config.supports_runtime_backend
+
+
+def test_qwen3_vl_4b_alias_sets_model_id():
+    config = HLMemoryConfig(vlm_backend="qwen3_vl", vlm_variant="4b")
+
+    assert config.vlm_variant == "qwen3_vl_4b"
+    assert config.resolved_model_id == "Qwen/Qwen3-VL-4B-Instruct"
+
+
 def test_qwen3_5_27b_variant_sets_model_id():
     config = HLMemoryConfig(vlm_backend="qwen3_5_vl", vlm_variant="27b")
 
@@ -34,6 +49,11 @@ def test_qwen3_5_27b_variant_sets_model_id():
 def test_qwen3_5_rejects_unknown_variant():
     with pytest.raises(ValueError, match="qwen3_5_vl"):
         HLMemoryConfig(vlm_backend="qwen3_5_vl", vlm_variant="qwen3_5_9b")
+
+
+def test_qwen3_vl_rejects_unknown_variant():
+    with pytest.raises(ValueError, match="qwen3_vl"):
+        HLMemoryConfig(vlm_backend="qwen3_vl", vlm_variant="qwen3_vl_8b")
 
 
 def test_thinking_budget_must_be_positive():
@@ -116,6 +136,18 @@ def test_target_protocol_accepts_keyframe_gated_memory_two_pass():
     assert config.target_protocol == "keyframe_gated_memory_two_pass"
 
 
+def test_target_protocol_accepts_memer_film_progress_two_pass():
+    config = HLMemoryConfig(
+        target_protocol="memer_film_progress_two_pass",
+        progress_condition_enabled=True,
+        state_condition_enabled=True,
+    )
+
+    assert config.target_protocol == "memer_film_progress_two_pass"
+    assert config.progress_condition_input_mode == "completed_only"
+    assert config.state_condition_mode == "film"
+
+
 def test_typed_mask_protocol_requires_qwen25():
     config = HLMemoryConfig(
         vlm_backend="qwen2_5_vl",
@@ -123,11 +155,12 @@ def test_typed_mask_protocol_requires_qwen25():
     )
     assert config.target_protocol == "keyframe_gated_memory_typed_mask"
 
-    with pytest.raises(ValueError, match="only supported"):
-        HLMemoryConfig(
-            vlm_backend="qwen3_5_vl",
-            target_protocol="keyframe_gated_memory_typed_mask",
-        )
+    for backend in ("qwen3_5_vl", "qwen3_vl"):
+        with pytest.raises(ValueError, match="only supported"):
+            HLMemoryConfig(
+                vlm_backend=backend,
+                target_protocol="keyframe_gated_memory_typed_mask",
+            )
 
 
 def test_two_pass_training_proposal_noise_probability_is_validated():
@@ -154,3 +187,20 @@ def test_proprio_config_accepts_soft_token_modes():
 def test_proprio_config_rejects_unknown_token_mode():
     with pytest.raises(ValueError, match="proprio_token_mode"):
         HLMemoryConfig(proprio_enabled=True, proprio_token_mode="none")  # type: ignore[arg-type]
+
+
+def test_keyframe_auxiliary_config_validates_dimensions_and_timing_sigma():
+    config = HLMemoryConfig(
+        keyframe_aux_enabled=True,
+        keyframe_aux_hidden_dim=256,
+        keyframe_aux_timing_sigma_sec=0.25,
+    )
+
+    assert config.keyframe_aux_enabled is True
+    assert config.keyframe_aux_hidden_dim == 256
+    assert config.keyframe_aux_timing_sigma_sec == 0.25
+
+    with pytest.raises(ValueError, match="keyframe_aux_hidden_dim"):
+        HLMemoryConfig(keyframe_aux_hidden_dim=0)
+    with pytest.raises(ValueError, match="keyframe_aux_timing_sigma_sec"):
+        HLMemoryConfig(keyframe_aux_timing_sigma_sec=0.0)

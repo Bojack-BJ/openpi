@@ -53,6 +53,18 @@ class EvalArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    progress_condition_enabled: bool = False
+    progress_condition_input_mode: str = "completed_only"
+    progress_condition_dim: int = 128
+    progress_condition_hidden_dim: int = 512
+    progress_condition_dropout: float = 0.3
+    progress_condition_predict_strength: float = 0.5
+    progress_condition_confirm_strength: float = 1.0
+    state_condition_enabled: bool = False
+    state_condition_mode: str = "film"
+    state_condition_dim: int = 128
+    state_condition_hidden_dim: int = 512
+    state_condition_dropout: float = 0.0
     output_json: pathlib.Path | None = None
     prediction_jsonl: pathlib.Path | None = None
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -123,6 +135,18 @@ def main(args: EvalArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        progress_condition_enabled=args.progress_condition_enabled,
+        progress_condition_input_mode=args.progress_condition_input_mode,
+        progress_condition_dim=args.progress_condition_dim,
+        progress_condition_hidden_dim=args.progress_condition_hidden_dim,
+        progress_condition_dropout=args.progress_condition_dropout,
+        progress_condition_predict_strength=args.progress_condition_predict_strength,
+        progress_condition_confirm_strength=args.progress_condition_confirm_strength,
+        state_condition_enabled=args.state_condition_enabled,
+        state_condition_mode=args.state_condition_mode,
+        state_condition_dim=args.state_condition_dim,
+        state_condition_hidden_dim=args.state_condition_hidden_dim,
+        state_condition_dropout=args.state_condition_dropout,
     )
     logging.info("[stage] creating adapter")
     adapter = create_hf_adapter(hl_config)

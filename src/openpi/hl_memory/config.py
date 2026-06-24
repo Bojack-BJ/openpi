@@ -4,7 +4,7 @@ import dataclasses
 from typing import Literal
 
 
-HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl"]
+HLVLMBackend = Literal["paligemma", "qwen2_5_vl", "qwen3_5_vl", "qwen3_vl"]
 Precision = Literal["bfloat16", "float16", "float32"]
 HLVLMParallelMode = Literal["none", "device_map", "tensor_parallel"]
 HLTargetProtocol = Literal[
@@ -18,14 +18,18 @@ HLTargetProtocol = Literal[
     "keyframe_gated_memory",
     "keyframe_gated_memory_typed_mask",
     "keyframe_gated_memory_two_pass",
+    "memer_film_progress_two_pass",
 ]
 HLProprioTokenMode = Literal["per_frame", "summary", "per_frame_plus_summary"]
 HLKeyframeCandidateLabelMode = Literal["canonical", "event_band"]
+HLProgressConditionInputMode = Literal["completed_only", "structured", "full"]
+HLStateConditionMode = Literal["off", "film", "token", "both"]
 
 _DEFAULT_VARIANTS: dict[HLVLMBackend, str | None] = {
     "paligemma": None,
     "qwen2_5_vl": "qwen2_5_3b",
     "qwen3_5_vl": "qwen3_5_2b",
+    "qwen3_vl": "qwen3_vl_4b",
 }
 
 _MODEL_IDS_BY_VARIANT: dict[str, str] = {
@@ -34,6 +38,7 @@ _MODEL_IDS_BY_VARIANT: dict[str, str] = {
     "qwen3_5_2b": "Qwen/Qwen3.5-2B",
     "qwen3_5_4b": "Qwen/Qwen3.5-4B",
     "qwen3_5_27b": "Qwen/Qwen3.5-27B",
+    "qwen3_vl_4b": "Qwen/Qwen3-VL-4B-Instruct",
 }
 
 _VARIANT_ALIASES: dict[str, str] = {
@@ -43,9 +48,12 @@ _VARIANT_ALIASES: dict[str, str] = {
     "qwen35_2b": "qwen3_5_2b",
     "qwen35_4b": "qwen3_5_4b",
     "qwen35_27b": "qwen3_5_27b",
+    "qwen3vl_4b": "qwen3_vl_4b",
+    "qwen3-vl-4b": "qwen3_vl_4b",
+    "qwen3_vl_4b": "qwen3_vl_4b",
 }
 
-_SUPPORTED_RUNTIME_BACKENDS = {"qwen2_5_vl", "qwen3_5_vl"}
+_SUPPORTED_RUNTIME_BACKENDS = {"qwen2_5_vl", "qwen3_5_vl", "qwen3_vl"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,6 +89,21 @@ class HLMemoryConfig:
     keyframe_event_band_after_sec: float = 0.5
     keyframe_candidate_label_mode: HLKeyframeCandidateLabelMode = "event_band"
     two_pass_training_proposal_noise_probability: float = 0.25
+    keyframe_aux_enabled: bool = False
+    keyframe_aux_hidden_dim: int = 512
+    keyframe_aux_timing_sigma_sec: float = 0.5
+    progress_condition_enabled: bool = False
+    progress_condition_input_mode: HLProgressConditionInputMode = "completed_only"
+    progress_condition_dim: int = 128
+    progress_condition_hidden_dim: int = 512
+    progress_condition_dropout: float = 0.3
+    progress_condition_predict_strength: float = 0.5
+    progress_condition_confirm_strength: float = 1.0
+    state_condition_enabled: bool = False
+    state_condition_mode: HLStateConditionMode = "film"
+    state_condition_dim: int = 128
+    state_condition_hidden_dim: int = 512
+    state_condition_dropout: float = 0.0
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
@@ -100,15 +123,19 @@ class HLMemoryConfig:
             "keyframe_gated_memory",
             "keyframe_gated_memory_typed_mask",
             "keyframe_gated_memory_two_pass",
+            "memer_film_progress_two_pass",
         }:
             raise ValueError(
                 "`target_protocol` must be one of `hl_v1`, `memer_objective`, `subtask_keyframe`, "
                 "`known_prior_tracker`, `objective_memory_state`, `objective_last_objective`, or "
                 "`objective_prev_stage`, `keyframe_gated_memory`, `keyframe_gated_memory_typed_mask`, or "
-                "`keyframe_gated_memory_two_pass`."
+                "`keyframe_gated_memory_two_pass`, or `memer_film_progress_two_pass`."
             )
         if self.target_protocol == "keyframe_gated_memory_typed_mask" and self.vlm_backend != "qwen2_5_vl":
-            raise ValueError("`keyframe_gated_memory_typed_mask` is only supported by `qwen2_5_vl`.")
+            raise ValueError(
+                "`keyframe_gated_memory_typed_mask` is only supported by `qwen2_5_vl` until the target backend "
+                "passes the 4D-mask probe."
+            )
         if self.proprio_token_mode not in {"per_frame", "summary", "per_frame_plus_summary"}:
             raise ValueError("`proprio_token_mode` must be one of `per_frame`, `summary`, or `per_frame_plus_summary`.")
         if self.keyframe_candidate_label_mode not in {"canonical", "event_band"}:
@@ -119,6 +146,32 @@ class HLMemoryConfig:
             raise ValueError("keyframe_event_band_after_sec must be non-negative.")
         if not 0.0 <= self.two_pass_training_proposal_noise_probability <= 1.0:
             raise ValueError("two_pass_training_proposal_noise_probability must be in [0, 1].")
+        if self.keyframe_aux_hidden_dim <= 0:
+            raise ValueError("keyframe_aux_hidden_dim must be positive.")
+        if self.keyframe_aux_timing_sigma_sec <= 0.0:
+            raise ValueError("keyframe_aux_timing_sigma_sec must be positive.")
+        if self.progress_condition_input_mode not in {"completed_only", "structured", "full"}:
+            raise ValueError(
+                "`progress_condition_input_mode` must be one of `completed_only`, `structured`, or `full`."
+            )
+        if self.progress_condition_dim <= 0:
+            raise ValueError("progress_condition_dim must be positive.")
+        if self.progress_condition_hidden_dim <= 0:
+            raise ValueError("progress_condition_hidden_dim must be positive.")
+        if not 0.0 <= self.progress_condition_dropout <= 1.0:
+            raise ValueError("progress_condition_dropout must be in [0, 1].")
+        if self.progress_condition_predict_strength < 0.0:
+            raise ValueError("progress_condition_predict_strength must be non-negative.")
+        if self.progress_condition_confirm_strength < 0.0:
+            raise ValueError("progress_condition_confirm_strength must be non-negative.")
+        if self.state_condition_mode not in {"off", "film", "token", "both"}:
+            raise ValueError("`state_condition_mode` must be one of `off`, `film`, `token`, or `both`.")
+        if self.state_condition_dim <= 0:
+            raise ValueError("state_condition_dim must be positive.")
+        if self.state_condition_hidden_dim <= 0:
+            raise ValueError("state_condition_hidden_dim must be positive.")
+        if not 0.0 <= self.state_condition_dropout <= 1.0:
+            raise ValueError("state_condition_dropout must be in [0, 1].")
         if self.proprio_state_dim <= 0:
             raise ValueError("proprio_state_dim must be positive.")
         if self.proprio_hidden_dim <= 0:
@@ -187,7 +240,8 @@ def _resolve_variant(vlm_backend: HLVLMBackend, variant: str | None) -> str | No
     if variant is None:
         return _DEFAULT_VARIANTS[vlm_backend]
 
-    normalized = _VARIANT_ALIASES.get(variant.lower(), variant.lower())
+    variant_lower = variant.lower()
+    normalized = _VARIANT_ALIASES.get(variant_lower, variant_lower)
     if vlm_backend == "paligemma":
         if normalized not in {"paligemma", "none"}:
             raise ValueError(f"`vlm_backend=paligemma` does not support variant `{variant}`.")
@@ -201,6 +255,15 @@ def _resolve_variant(vlm_backend: HLVLMBackend, variant: str | None) -> str | No
             raise ValueError(
                 "`vlm_backend=qwen3_5_vl` supports `vlm_variant=qwen3_5_2b`, `qwen3_5_4b`, "
                 "or `qwen3_5_27b` (aliases: `2b`, `4b`, `27b`)."
+            )
+        return normalized
+    if vlm_backend == "qwen3_vl":
+        if variant_lower == "4b":
+            normalized = "qwen3_vl_4b"
+        if normalized not in {"qwen3_vl_4b"}:
+            raise ValueError(
+                "`vlm_backend=qwen3_vl` currently supports `vlm_variant=qwen3_vl_4b` "
+                "(aliases: `4b`, `qwen3vl_4b`, `qwen3-vl-4b`)."
             )
         return normalized
     raise ValueError(f"Unsupported HL VLM backend: {vlm_backend}")

@@ -41,13 +41,27 @@ _KEYFRAME_GATED_PROTOCOLS = {
     "keyframe_gated_memory",
     "keyframe_gated_memory_typed_mask",
     "keyframe_gated_memory_two_pass",
+    "memer_film_progress_two_pass",
 }
 
 
 @dataclasses.dataclass(frozen=True)
+class AcceptedKeyframeEvent:
+    completed_objective: str
+    keyframe_second: float
+
+
+@dataclasses.dataclass(frozen=True)
 class KeyframeGatedRolloutState:
-    completed_events: tuple[str, ...] = ()
-    accepted_keyframe_seconds: tuple[float, ...] = ()
+    accepted_events: tuple[AcceptedKeyframeEvent, ...] = ()
+
+    @property
+    def completed_events(self) -> tuple[str, ...]:
+        return tuple(event.completed_objective for event in self.accepted_events if event.completed_objective)
+
+    @property
+    def accepted_keyframe_seconds(self) -> tuple[float, ...]:
+        return tuple(event.keyframe_second for event in self.accepted_events)
 
 
 @dataclasses.dataclass
@@ -141,6 +155,18 @@ class ZeroShotArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    progress_condition_enabled: bool = False
+    progress_condition_input_mode: str = "completed_only"
+    progress_condition_dim: int = 128
+    progress_condition_hidden_dim: int = 512
+    progress_condition_dropout: float = 0.3
+    progress_condition_predict_strength: float = 0.5
+    progress_condition_confirm_strength: float = 1.0
+    state_condition_enabled: bool = False
+    state_condition_mode: str = "film"
+    state_condition_dim: int = 128
+    state_condition_hidden_dim: int = 512
+    state_condition_dropout: float = 0.0
     proprio_norm_stats_path: pathlib.Path | None = None
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
@@ -209,6 +235,18 @@ def main(args: ZeroShotArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        progress_condition_enabled=args.progress_condition_enabled,
+        progress_condition_input_mode=args.progress_condition_input_mode,
+        progress_condition_dim=args.progress_condition_dim,
+        progress_condition_hidden_dim=args.progress_condition_hidden_dim,
+        progress_condition_dropout=args.progress_condition_dropout,
+        progress_condition_predict_strength=args.progress_condition_predict_strength,
+        progress_condition_confirm_strength=args.progress_condition_confirm_strength,
+        state_condition_enabled=args.state_condition_enabled,
+        state_condition_mode=args.state_condition_mode,
+        state_condition_dim=args.state_condition_dim,
+        state_condition_hidden_dim=args.state_condition_hidden_dim,
+        state_condition_dropout=args.state_condition_dropout,
         keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
         keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
         keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
@@ -519,10 +557,21 @@ def _run_rollout(
     recent_step_sec = _resolved_recent_step_sec(args)
     memory_seconds = tuple(parse_seconds_argument(args.memory_seconds))
     keyframe_vote_seconds = list(memory_seconds)
-    keyframe_gated_state = KeyframeGatedRolloutState(
-        completed_events=_parse_completed_event_log(args.language_memory),
-        accepted_keyframe_seconds=memory_seconds,
+    parsed_completed_events = _parse_completed_event_log(args.language_memory)
+    paired_initial_events = tuple(
+        AcceptedKeyframeEvent(
+            completed_objective=parsed_completed_events[index] if index < len(parsed_completed_events) else "",
+            keyframe_second=second,
+        )
+        for index, second in enumerate(memory_seconds)
     )
+    if len(parsed_completed_events) > len(memory_seconds):
+        logging.warning(
+            "Ignoring initial completed events without paired keyframe seconds: completed_events=%d memory_seconds=%d.",
+            len(parsed_completed_events),
+            len(memory_seconds),
+        )
+    keyframe_gated_state = KeyframeGatedRolloutState(accepted_events=paired_initial_events)
     known_prior_steps = _known_prior_steps(args)
     known_prior_index = _initial_known_prior_index(args, known_prior_steps)
     known_prior_stall_steps = 0
@@ -939,6 +988,7 @@ def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]
         "objective_prev_stage",
         "keyframe_gated_memory",
         "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
     }:
         payload["horizon_current_objective"] = prediction.horizon_current_objective
     if protocol == "objective_memory_state":
@@ -1006,10 +1056,10 @@ def _update_keyframe_gated_rollout_state(
     representative_second = max(candidate_seconds)
     normalized_completed = _normalize_text(completed_objective)
     duplicate_seconds = [
-        second
-        for event, second in zip(state.completed_events, state.accepted_keyframe_seconds, strict=False)
-        if _normalize_text(event) == normalized_completed
-        and abs(representative_second - second) < merge_distance_sec
+        event.keyframe_second
+        for event in state.accepted_events
+        if _normalize_text(event.completed_objective) == normalized_completed
+        and abs(representative_second - event.keyframe_second) < merge_distance_sec
     ]
     if duplicate_seconds:
         return state, {
@@ -1022,17 +1072,15 @@ def _update_keyframe_gated_rollout_state(
             "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
         }
 
-    completed_events = (*state.completed_events, completed_objective)
-    accepted_keyframe_seconds = update_rollout_memory_seconds(
-        (*state.accepted_keyframe_seconds, representative_second),
-        (),
-        memory_length=memory_length,
-        merge_distance_sec=merge_distance_sec,
+    accepted_events = (
+        *state.accepted_events,
+        AcceptedKeyframeEvent(
+            completed_objective=completed_objective,
+            keyframe_second=representative_second,
+        ),
     )
-    new_state = KeyframeGatedRolloutState(
-        completed_events=completed_events,
-        accepted_keyframe_seconds=accepted_keyframe_seconds,
-    )
+    accepted_events = accepted_events[-memory_length:] if memory_length > 0 else ()
+    new_state = KeyframeGatedRolloutState(accepted_events=accepted_events)
     return new_state, {
         "accepted": True,
         "reason": "accepted_completed_objective_with_keyframes",

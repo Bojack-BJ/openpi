@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import inspect
 import json
 import logging
+import math
 import pathlib
 import time
 from collections.abc import Mapping
@@ -13,8 +15,22 @@ import torch
 from PIL import Image
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.conditioning import build_conditioning_batch
+from openpi.hl_memory.conditioning import CONDITIONING_STATE_FILENAME
+from openpi.hl_memory.conditioning import configure_conditioning_model
+from openpi.hl_memory.conditioning import HL_CONDITION_STAGE_IDS_KEY
+from openpi.hl_memory.conditioning import STAGE_CONFIRM
+from openpi.hl_memory.conditioning import STAGE_HORIZON
+from openpi.hl_memory.conditioning import STAGE_PREDICT
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_ANCHOR_POSITIONS_KEY
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_CANONICAL_POSITIONS_KEY
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_EVENT_TARGETS_KEY
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_MASK_KEY
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_POSITION_TARGETS_KEY
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_UPDATE_TARGETS_KEY
+from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_VALID_POSITIONS_KEY
 from openpi.hl_memory.proprio import configure_model_for_proprio
 from openpi.hl_memory.proprio import load_proprio_state_if_available
 from openpi.hl_memory.proprio import render_proprio_token_text
@@ -27,6 +43,8 @@ from openpi.hl_memory.training_loss import HL_LOSS_FIELD_IDS_BY_NAME
 
 
 _TYPED_MASK_PROTOCOL = "keyframe_gated_memory_typed_mask"
+_FILM_PROGRESS_TWO_PASS_PROTOCOL = "memer_film_progress_two_pass"
+_TWO_PASS_PROTOCOLS = {"keyframe_gated_memory_two_pass", _FILM_PROGRESS_TWO_PASS_PROTOCOL}
 
 
 def create_hf_adapter(config: HLMemoryConfig) -> "BaseHLVLMAdapter":
@@ -39,6 +57,8 @@ def create_hf_adapter(config: HLMemoryConfig) -> "BaseHLVLMAdapter":
         return Qwen25HLAdapter(config)
     if config.vlm_backend == "qwen3_5_vl":
         return Qwen35HLAdapter(config)
+    if config.vlm_backend == "qwen3_vl":
+        return Qwen3VLHLAdapter(config)
     raise ValueError(f"Unsupported HL VLM backend: {config.vlm_backend}")
 
 
@@ -90,6 +110,8 @@ class BaseHLVLMAdapter:
             model = self._load_peft_model(transformers, peft_adapter_path, torch_dtype=torch_dtype)
         configure_model_for_proprio(model, processor, self.config)
         load_proprio_state_if_available(model, pathlib.Path(pretrained_path))
+        if (pathlib.Path(pretrained_path) / CONDITIONING_STATE_FILENAME).is_file():
+            model = configure_conditioning_model(model, self.config, checkpoint_dir=pathlib.Path(pretrained_path))
         logging.info("[stage] model weights loaded in %.1fs", time.perf_counter() - model_started_at)
         if self._uses_parallel_model_loading():
             logging.info(
@@ -115,7 +137,7 @@ class BaseHLVLMAdapter:
         *,
         device: str | torch.device,
     ) -> Mapping[str, torch.Tensor]:
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return self.prepare_training_batch_inputs(loaded, [sample], [clips], device=device)
         prompt_inputs = self._encode_prompt_only(loaded.processor, sample, clips)
         full_inputs = self._encode_prompt_and_target(loaded.processor, sample, clips)
@@ -136,6 +158,7 @@ class BaseHLVLMAdapter:
         )
         if field_ids is not None:
             tensors[HL_FIELD_IDS_KEY] = field_ids.to(input_device)
+        self._add_keyframe_auxiliary_targets(tensors, [sample], labels=labels, device=input_device)
         self._apply_typed_training_mask(
             loaded,
             tensors,
@@ -147,8 +170,12 @@ class BaseHLVLMAdapter:
             self.config,
             device=input_device,
         )
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
-            tensors["_hl_stage_ids"] = torch.tensor((0, 1), dtype=torch.long, device=input_device)
+        self._add_conditioning_inputs(
+            tensors,
+            loaded=loaded,
+            samples=[sample],
+            device=input_device,
+        )
         return tensors
 
     def prepare_training_batch_inputs(
@@ -197,6 +224,7 @@ class BaseHLVLMAdapter:
         )
         if field_ids is not None:
             tensors[HL_FIELD_IDS_KEY] = field_ids.to(input_device)
+        self._add_keyframe_auxiliary_targets(tensors, samples, labels=labels, device=input_device)
         self._apply_typed_training_mask(
             loaded,
             tensors,
@@ -210,15 +238,136 @@ class BaseHLVLMAdapter:
                 apply_proposal_noise=apply_proposal_noise,
             ),
             self.config,
-                device=input_device,
-            )
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
-            tensors["_hl_stage_ids"] = torch.tensor(
-                [stage for _ in samples for stage in (0, 1)],
+            device=input_device,
+        )
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
+            stage_pattern = self._two_pass_stage_id_pattern()
+            stage_ids = torch.tensor(
+                [stage for _ in samples for stage in stage_pattern],
                 dtype=torch.long,
                 device=input_device,
+            )
+            tensors["_hl_stage_ids"] = stage_ids
+        else:
+            stage_ids = None
+        self._add_conditioning_inputs(
+            tensors,
+            loaded=loaded,
+            samples=self._encoded_samples_for_training(
+                samples,
+                clips,
+                apply_proposal_noise=apply_proposal_noise,
+            ),
+            device=input_device,
+            stage_ids=stage_ids,
         )
         return tensors
+
+    def _add_conditioning_inputs(
+        self,
+        tensors: dict[str, torch.Tensor],
+        *,
+        loaded: LoadedHLVLM,
+        samples: list[ExportedHLMemorySample],
+        device: torch.device,
+        stage_ids: torch.Tensor | None = None,
+    ) -> None:
+        if not (self.config.progress_condition_enabled or self.config.state_condition_enabled):
+            return
+        tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
+        tensors.update(
+            build_conditioning_batch(
+                samples,
+                self.config,
+                tokenizer,
+                device=device,
+                stage_ids=stage_ids,
+            )
+        )
+
+    def _add_keyframe_auxiliary_targets(
+        self,
+        tensors: dict[str, torch.Tensor],
+        samples: list[ExportedHLMemorySample],
+        *,
+        labels: torch.Tensor,
+        device: torch.device,
+    ) -> None:
+        if not self.config.keyframe_aux_enabled:
+            return
+        if self.config.target_protocol not in {
+            "memer_objective",
+            "subtask_keyframe",
+            "keyframe_gated_memory",
+            "keyframe_gated_memory_typed_mask",
+            "keyframe_gated_memory_two_pass",
+            _FILM_PROGRESS_TWO_PASS_PROTOCOL,
+        }:
+            raise ValueError(
+                "Keyframe auxiliary loss requires a protocol that predicts keyframe_candidate_positions."
+            )
+        rows: list[tuple[ExportedHLMemorySample, bool]] = []
+        for sample in samples:
+            rows.append((sample, True))
+            if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+                rows.append((sample, False))
+            elif self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                rows.append((sample, False))
+                rows.append((sample, False))
+        if len(rows) != labels.shape[0]:
+            raise ValueError(
+                f"Keyframe auxiliary row mismatch: built {len(rows)} rows for labels {tuple(labels.shape)}."
+            )
+        anchors = []
+        for row_labels in labels:
+            supervised = torch.nonzero(row_labels != -100, as_tuple=False).flatten()
+            if supervised.numel() == 0:
+                raise ValueError("Keyframe auxiliary loss requires at least one supervised target token per row.")
+            anchors.append(max(0, int(supervised[0].item()) - 1))
+
+        targets = [
+            _keyframe_auxiliary_targets_for_sample(
+                sample,
+                config=self.config,
+                enabled=enabled,
+            )
+            for sample, enabled in rows
+        ]
+        tensors[KEYFRAME_AUX_ANCHOR_POSITIONS_KEY] = torch.tensor(
+            anchors,
+            dtype=torch.long,
+            device=device,
+        )
+        tensors[KEYFRAME_AUX_MASK_KEY] = torch.tensor(
+            [target["enabled"] for target in targets],
+            dtype=torch.bool,
+            device=device,
+        )
+        tensors[KEYFRAME_AUX_POSITION_TARGETS_KEY] = torch.tensor(
+            [target["position_targets"] for target in targets],
+            dtype=torch.float32,
+            device=device,
+        )
+        tensors[KEYFRAME_AUX_EVENT_TARGETS_KEY] = torch.tensor(
+            [target["event_target"] for target in targets],
+            dtype=torch.float32,
+            device=device,
+        )
+        tensors[KEYFRAME_AUX_UPDATE_TARGETS_KEY] = torch.tensor(
+            [target["update_target"] for target in targets],
+            dtype=torch.long,
+            device=device,
+        )
+        tensors[KEYFRAME_AUX_CANONICAL_POSITIONS_KEY] = torch.tensor(
+            [target["canonical_position"] for target in targets],
+            dtype=torch.float32,
+            device=device,
+        )
+        tensors[KEYFRAME_AUX_VALID_POSITIONS_KEY] = torch.tensor(
+            [target["valid_positions"] for target in targets],
+            dtype=torch.bool,
+            device=device,
+        )
 
     def _training_target_texts(
         self,
@@ -228,13 +377,29 @@ class BaseHLVLMAdapter:
         apply_two_pass_training_noise: bool,
     ) -> tuple[str, ...]:
         del clips, apply_two_pass_training_noise
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             texts: list[str] = []
             for sample in samples:
                 texts.append(self._build_two_pass_target_text(sample, stage="predict"))
+                if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                    texts.append(self._build_two_pass_target_text(sample, stage="horizon"))
                 texts.append(self._build_two_pass_target_text(sample, stage="confirm"))
             return tuple(texts)
         return tuple(self.build_target_text(sample) for sample in samples)
+
+    def _two_pass_stage_id_pattern(self) -> tuple[int, ...]:
+        if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+            return (STAGE_PREDICT, STAGE_HORIZON, STAGE_CONFIRM)
+        return (STAGE_PREDICT, STAGE_CONFIRM)
+
+    def _two_pass_stage_id(self, stage: str) -> int:
+        if stage == "predict":
+            return STAGE_PREDICT
+        if stage == "confirm":
+            return STAGE_CONFIRM
+        if stage == "horizon":
+            return STAGE_HORIZON
+        raise ValueError(f"Unsupported two-pass stage: {stage!r}")
 
     def _apply_typed_training_mask(
         self,
@@ -293,7 +458,7 @@ class BaseHLVLMAdapter:
     ) -> HLVLMGeneration:
         if self.config.target_protocol == _TYPED_MASK_PROTOCOL:
             return self._generate_typed_mask_prediction(loaded, sample, clips, device=device)
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return self._generate_two_pass_prediction(loaded, sample, clips, device=device)
         inputs = self._encode_prompt_only(loaded.processor, sample, clips)
         input_device = self._resolve_input_device(loaded.model, device)
@@ -351,7 +516,7 @@ class BaseHLVLMAdapter:
                 self.generate_prediction(loaded, sample, clip, device=device)
                 for sample, clip in zip(samples, clips, strict=True)
             ]
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return [self.generate_prediction(loaded, sample, clip, device=device) for sample, clip in zip(samples, clips, strict=True)]
         inputs = self._encode_batch_prompt_only(loaded.processor, samples, clips)
         input_device = self._resolve_input_device(loaded.model, device)
@@ -485,7 +650,7 @@ class BaseHLVLMAdapter:
         *,
         apply_proposal_noise: bool,
     ) -> list[ExportedHLMemorySample]:
-        if self.config.target_protocol != "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol not in _TWO_PASS_PROTOCOLS:
             return samples
         encoded_samples: list[ExportedHLMemorySample] = []
         for sample, clip in zip(samples, clips, strict=True):
@@ -493,18 +658,24 @@ class BaseHLVLMAdapter:
                 self._training_pass_a_prediction(sample, clip)
                 if apply_proposal_noise
                 else sample.target_prediction(
-                    target_protocol="keyframe_gated_memory_two_pass",
+                    target_protocol=self.config.target_protocol,
                     keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
                 )
             )
-            encoded_samples.extend(
-                (
-                    sample,
+            encoded_samples.append(sample)
+            if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                encoded_samples.append(
                     self._two_pass_stage_sample(
                         sample,
-                        stage="confirm",
-                        pass_a_prediction=pass_a_prediction,
-                    ),
+                        stage="horizon",
+                        pass_a_prediction=None,
+                    )
+                )
+            encoded_samples.append(
+                self._two_pass_stage_sample(
+                    sample,
+                    stage="confirm",
+                    pass_a_prediction=pass_a_prediction,
                 )
             )
         return encoded_samples
@@ -525,12 +696,30 @@ class BaseHLVLMAdapter:
             pass_a_prediction=None,
             device=device,
         )
+        pass_horizon = None
+        if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+            pass_horizon = self._generate_two_pass_stage(
+                loaded,
+                sample,
+                clips,
+                stage="horizon",
+                pass_a_prediction=None,
+                device=device,
+            )
+            pass_a = HLVLMGeneration(
+                prediction=dataclasses.replace(
+                    pass_a.prediction,
+                    horizon_current_objective=pass_horizon.prediction.horizon_current_objective,
+                ),
+                raw_output=pass_a.raw_output,
+                parse_error=pass_a.parse_error or pass_horizon.parse_error,
+            )
         if not pass_a.prediction.keyframe_candidate_positions:
             prediction = dataclasses.replace(pass_a.prediction, completed_objective="")
             return HLVLMGeneration(
                 prediction=prediction.with_recent_position_limit(clips.recent_valid_length),
                 raw_output=json.dumps(
-                    {"pass_a": pass_a.raw_output, "pass_b": None},
+                    {"pass_a": pass_a.raw_output, "pass_horizon": None if pass_horizon is None else pass_horizon.raw_output, "pass_b": None},
                     ensure_ascii=True,
                     separators=(",", ":"),
                 ),
@@ -548,7 +737,7 @@ class BaseHLVLMAdapter:
         return HLVLMGeneration(
             prediction=prediction.with_recent_position_limit(clips.recent_valid_length),
             raw_output=json.dumps(
-                {"pass_a": pass_a.raw_output, "pass_b": pass_b.raw_output},
+                {"pass_a": pass_a.raw_output, "pass_horizon": None if pass_horizon is None else pass_horizon.raw_output, "pass_b": pass_b.raw_output},
                 ensure_ascii=True,
                 separators=(",", ":"),
             ),
@@ -591,6 +780,15 @@ class BaseHLVLMAdapter:
             if isinstance(value, torch.Tensor)
         }
         set_model_proprio_batch(loaded.model, [stage_sample], self.config, device=input_device)
+        generation_inputs.update(
+            build_conditioning_batch(
+                [stage_sample],
+                self.config,
+                getattr(loaded.processor, "tokenizer", loaded.processor),
+                device=input_device,
+                stage_ids=torch.tensor([self._two_pass_stage_id(stage)], dtype=torch.long, device=input_device),
+            )
+        )
         tokenizer = getattr(loaded.processor, "tokenizer", loaded.processor)
         generation_kwargs: dict[str, Any] = {}
         pad_token_id = getattr(tokenizer, "pad_token_id", None)
@@ -629,6 +827,29 @@ class BaseHLVLMAdapter:
                 ),
                 raw_output=decoded,
             )
+        if stage == "horizon":
+            try:
+                horizon_objective = _parse_horizon_objective_text(decoded)
+            except ValueError as exc:
+                parse_error = f"{type(exc).__name__}: {exc}"
+                logging.warning(
+                    "HL VLM horizon stage output could not be parsed as JSON; using fallback horizon. raw_output=%r",
+                    decoded[:1000],
+                )
+                fallback = self._fallback_prediction(sample)
+                return HLVLMGeneration(
+                    prediction=dataclasses.replace(
+                        fallback,
+                        horizon_current_objective=fallback.horizon_current_objective or fallback.current_objective,
+                    ),
+                    raw_output=decoded,
+                    parse_error=parse_error,
+                )
+            fallback = self._fallback_prediction(sample)
+            return HLVLMGeneration(
+                prediction=dataclasses.replace(fallback, horizon_current_objective=horizon_objective),
+                raw_output=decoded,
+            )
         try:
             prediction = HLMemoryPrediction.from_json(decoded).with_recent_position_limit(clips.recent_valid_length)
             return HLVLMGeneration(prediction=prediction, raw_output=decoded)
@@ -652,12 +873,12 @@ class BaseHLVLMAdapter:
         stage: str,
         pass_a_prediction: HLMemoryPrediction | None,
     ) -> LoadedVideoClips:
-        if stage == "predict":
+        if stage in {"predict", "horizon"}:
             return clips
         if stage != "confirm":
             raise ValueError(f"Unsupported two-pass stage: {stage!r}")
         prediction = pass_a_prediction or sample.target_prediction(
-            target_protocol="keyframe_gated_memory_two_pass",
+            target_protocol=self.config.target_protocol,
             keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
         )
         return _candidate_evidence_clips(clips, prediction.keyframe_candidate_positions)
@@ -669,12 +890,12 @@ class BaseHLVLMAdapter:
         stage: str,
         pass_a_prediction: HLMemoryPrediction | None,
     ) -> ExportedHLMemorySample:
-        if stage == "predict":
+        if stage in {"predict", "horizon"}:
             return sample
         if stage != "confirm":
             raise ValueError(f"Unsupported two-pass stage: {stage!r}")
         prediction = pass_a_prediction or sample.target_prediction(
-            target_protocol="keyframe_gated_memory_two_pass",
+            target_protocol=self.config.target_protocol,
             keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
         )
         indices = _valid_candidate_indices(
@@ -703,7 +924,7 @@ class BaseHLVLMAdapter:
         clips: LoadedVideoClips,
     ) -> HLMemoryPrediction:
         prediction = sample.target_prediction(
-            target_protocol="keyframe_gated_memory_two_pass",
+            target_protocol=self.config.target_protocol,
             keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
         )
         probability = self.config.two_pass_training_proposal_noise_probability
@@ -782,7 +1003,7 @@ class BaseHLVLMAdapter:
             return proprio_prefix + object_context + self._build_known_prior_tracker_prompt(sample, clips)
         if self.config.target_protocol in {"keyframe_gated_memory", _TYPED_MASK_PROTOCOL}:
             return proprio_prefix + object_context + self._build_keyframe_gated_memory_prompt(sample, clips)
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return proprio_prefix + object_context + self._build_keyframe_gated_two_pass_predict_prompt(sample, clips)
         if self.config.target_protocol in {
             "objective_memory_state",
@@ -909,6 +1130,28 @@ class BaseHLVLMAdapter:
         )
 
     def build_system_prompt(self) -> str:
+        thinking_instruction = (
+            f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
+            "valid JSON object after the thinking text."
+            if self.config.enable_thinking
+            else "Do not output chain-of-thought or analysis text. Output only valid JSON."
+        )
+        if self.config.target_protocol in {"keyframe_gated_memory", _TYPED_MASK_PROTOCOL}:
+            return (
+                "You are a robot high-level state and event-memory module. Use the recent observation clip as the "
+                "primary visual evidence for current and horizon objectives. Use historical memory only as "
+                "non-Markovian context, not as a substitute for the current visual state. Select keyframe candidates "
+                "only from the recent observation clip. Commit a completed objective only when nominated recent "
+                f"keyframe evidence visually confirms completion. {thinking_instruction}"
+            )
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
+            return (
+                "You are a robot high-level two-pass state and event-memory module. In Pass A, predict current and "
+                "horizon objectives and propose recent keyframe evidence from the recent observation clip. In the FiLM "
+                "progress protocol, horizon is predicted by an independent prompt so it cannot read current target tokens. In Pass B, "
+                "confirm a completed event only from the proposed candidate evidence. Use historical memory only as "
+                f"global progress context. {thinking_instruction}"
+            )
         if self.config.target_protocol in {
             "memer_objective",
             "subtask_keyframe",
@@ -916,27 +1159,12 @@ class BaseHLVLMAdapter:
             "objective_memory_state",
             "objective_last_objective",
             "objective_prev_stage",
-            "keyframe_gated_memory",
-            _TYPED_MASK_PROTOCOL,
-            "keyframe_gated_memory_two_pass",
         }:
-            thinking_instruction = (
-                f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
-                "valid JSON object after the thinking text."
-                if self.config.enable_thinking
-                else "Do not output chain-of-thought or analysis text. Output only valid JSON."
-            )
             return (
-                "You are a robot high-level objective classifier and visual memory selector. Use the ordered "
-                "historical keyframes and recent observation clip to predict the short-horizon executable objective "
-                f"for the robot. {thinking_instruction}"
+                "You are a robot high-level objective predictor. Use recent visual evidence as the primary source for "
+                "the current executable objective, and use historical memory or task priors only as context for global "
+                f"progress. Select keyframes only from the recent observation clip when requested. {thinking_instruction}"
             )
-        thinking_instruction = (
-            f"If thinking is used, keep it under {self.config.thinking_budget_tokens} tokens and place exactly one "
-            "valid JSON object after the thinking text."
-            if self.config.enable_thinking
-            else "Do not output chain-of-thought or analysis text. Output only valid JSON."
-        )
         return (
             "You are a robot high-level memory policy. Your job is to choose the next language subtask for a "
             "low-level robot controller and to select task-relevant keyframes for future memory. Be concise, "
@@ -972,7 +1200,7 @@ class BaseHLVLMAdapter:
                 ensure_ascii=True,
                 separators=(",", ":"),
             )
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return self._build_two_pass_target_text(sample, stage="predict")
         if self.config.target_protocol in {
             "objective_memory_state",
@@ -1043,6 +1271,8 @@ class BaseHLVLMAdapter:
             "`horizon_current_objective` must be the short executable robot instruction expected a few frames later.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
+            "These positions are relative to the recent observation clip, not absolute frame ids and not historical "
+            "memory clip positions.\n"
             "Select only recent frames that should be kept as long-term visual memory for future decisions; return [] if none.\n"
             "Do not include progress, language memory, notes, markdown, explanation text, or extra keys.\n"
             f"{thinking_instruction}"
@@ -1077,6 +1307,8 @@ class BaseHLVLMAdapter:
             "`horizon_current_objective` must be the short executable robot instruction expected a few frames later.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
+            "These positions are relative to the recent observation clip, not absolute frame ids and not historical "
+            "memory clip positions. The runtime maps each position to the corresponding recent frame for state updates.\n"
             "`completed_objective` must be empty unless the recent window contains a visually confirmed event that should "
             "be committed to long-term memory. When non-empty, it must describe the completed objective represented by "
             "the nominated keyframe(s).\n"
@@ -1098,6 +1330,25 @@ class BaseHLVLMAdapter:
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
         completed_event_log = sample.language_memory.strip() or "No accepted completed event yet."
+        if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+            return (
+                "[Pass A: visual current prediction]\n"
+                "You receive accepted historical keyframes and a recent observation window.\n"
+                "Use the recent observation window as the primary evidence for the current objective and keyframe "
+                "proposal. Long-term progress is provided only through a learned low-bandwidth condition, not as "
+                "raw text in this prompt.\n"
+                f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
+                f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+                f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
+                "is the last/current valid frame.\n"
+                "Return exactly one JSON object with keys `current_objective` and `keyframe_candidate_positions`.\n"
+                "`current_objective` must be one short executable robot instruction suitable for the low-level VLA.\n"
+                "`keyframe_candidate_positions` is a high-recall proposal list for recent frames that may represent an event. "
+                f"Valid positions are integers from 1 to {clips.recent_valid_length} inclusive. Return [] if there is no event evidence.\n"
+                "Do not output `horizon_current_objective`, `completed_objective`, memory text, progress, notes, markdown, or extra keys.\n"
+                f"{thinking_instruction}"
+                f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
+            )
         return (
             "[Pass A: visual prediction]\n"
             "You receive accepted historical keyframes and a recent observation window.\n"
@@ -1112,10 +1363,39 @@ class BaseHLVLMAdapter:
             "`keyframe_candidate_positions`.\n"
             "`keyframe_candidate_positions` is a high-recall proposal list for recent frames that may represent an event. "
             f"Valid positions are integers from 1 to {clips.recent_valid_length} inclusive. Return [] if there is no event evidence.\n"
+            "These positions are relative to the recent observation clip, not absolute frame ids and not historical "
+            "memory clip positions.\n"
             "Do not output `completed_objective`, memory text, progress, notes, markdown, or extra keys in Pass A.\n"
             f"{thinking_instruction}"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
             f"Completed-event log: {completed_event_log}\n"
+        )
+
+    def _build_film_progress_horizon_prompt(
+        self,
+        sample: ExportedHLMemorySample,
+        clips: LoadedVideoClips,
+    ) -> str:
+        thinking_instruction = (
+            "Thinking is enabled. If you produce private reasoning, keep it brief and finish with exactly one final "
+            "JSON object.\n"
+            if self.config.enable_thinking
+            else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
+        )
+        return (
+            "[Pass A2: independent horizon prediction]\n"
+            "You receive accepted historical keyframes and a recent observation window.\n"
+            "Predict the short-horizon objective a few frames after the last valid recent frame. Do not rely on any "
+            "generated current-objective text; infer the horizon directly from the recent visual sequence, task "
+            "instruction, and learned low-bandwidth progress/state conditions.\n"
+            f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
+            f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
+            "is the last/current valid frame.\n"
+            "Return exactly one JSON object with the single key `horizon_current_objective`.\n"
+            "`horizon_current_objective` must be one short executable robot instruction expected a few frames later.\n"
+            "Do not output `current_objective`, keyframes, completed events, memory text, markdown, or extra keys.\n"
+            f"{thinking_instruction}"
+            f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
         )
 
     def _build_keyframe_gated_two_pass_confirm_prompt(
@@ -1132,6 +1412,11 @@ class BaseHLVLMAdapter:
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
         completed_event_log = sample.language_memory.strip() or "No accepted completed event yet."
+        completed_event_line = (
+            ""
+            if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL
+            else f"Completed-event log: {completed_event_log}\n"
+        )
         pass_a_payload = {
             "keyframe_candidate_positions": list(pass_a_prediction.keyframe_candidate_positions),
         }
@@ -1148,7 +1433,7 @@ class BaseHLVLMAdapter:
             "represented by the candidate keyframe(s). Do not invent the next step.\n"
             f"{thinking_instruction}"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
-            f"Completed-event log: {completed_event_log}\n"
+            f"{completed_event_line}"
             "Pass A routing metadata (semantic objective text is intentionally hidden to prevent teacher-forcing "
             "leakage into completion confirmation): "
             f"{json.dumps(pass_a_payload, ensure_ascii=True, separators=(',', ':'))}\n"
@@ -1162,16 +1447,31 @@ class BaseHLVLMAdapter:
         pass_a_prediction: HLMemoryPrediction | None = None,
     ) -> str:
         prediction = sample.target_prediction(
-            target_protocol="keyframe_gated_memory_two_pass",
+            target_protocol=self.config.target_protocol,
             keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
         )
         if stage == "predict":
+            if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                return json.dumps(
+                    {
+                        "current_objective": prediction.current_objective,
+                        "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                )
             return json.dumps(
                 {
                     "current_objective": prediction.current_objective,
                     "horizon_current_objective": prediction.horizon_current_objective,
                     "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
                 },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        if stage == "horizon":
+            return json.dumps(
+                {"horizon_current_objective": prediction.horizon_current_objective},
                 ensure_ascii=True,
                 separators=(",", ":"),
             )
@@ -1487,7 +1787,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         sample: ExportedHLMemorySample,
         clips: LoadedVideoClips,
     ) -> Mapping[str, Any]:
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return self._encode_batch_prompt_only(processor, [sample], [clips])
         rendered = self._render_messages(processor, sample, clips, include_target=False)
         return self._encode_processor_inputs(processor, rendered, clips)
@@ -1498,7 +1798,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         sample: ExportedHLMemorySample,
         clips: LoadedVideoClips,
     ) -> Mapping[str, Any]:
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return self._encode_batch_prompt_and_target(processor, [sample], [clips])
         rendered = self._render_messages(processor, sample, clips, include_target=True)
         return self._encode_processor_inputs(processor, rendered, clips)
@@ -1552,7 +1852,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         *,
         apply_two_pass_training_noise: bool = False,
     ) -> Mapping[str, Any]:
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             rendered: list[str] = []
             expanded_clips: list[LoadedVideoClips] = []
             for sample, clip in zip(samples, clips, strict=True):
@@ -1560,7 +1860,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                     self._training_pass_a_prediction(sample, clip)
                     if apply_two_pass_training_noise
                     else sample.target_prediction(
-                        target_protocol="keyframe_gated_memory_two_pass",
+                        target_protocol=self.config.target_protocol,
                         keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
                     )
                 )
@@ -1585,6 +1885,16 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                         include_target=False,
                     )
                 )
+                if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                    rendered.append(
+                        self._render_two_pass_messages(
+                            processor,
+                            sample,
+                            predict_clip,
+                            stage="horizon",
+                            include_target=False,
+                        )
+                    )
                 rendered.append(
                     self._render_two_pass_messages(
                         processor,
@@ -1595,7 +1905,10 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                         pass_a_prediction=pass_a_prediction,
                     )
                 )
-                expanded_clips.extend((predict_clip, confirm_clip))
+                if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                    expanded_clips.extend((predict_clip, predict_clip, confirm_clip))
+                else:
+                    expanded_clips.extend((predict_clip, confirm_clip))
             return self._encode_batch_processor_inputs(processor, rendered, expanded_clips)
         rendered = [
             self._render_messages(processor, sample, clip, include_target=False)
@@ -1611,7 +1924,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
         *,
         apply_two_pass_training_noise: bool = False,
     ) -> Mapping[str, Any]:
-        if self.config.target_protocol == "keyframe_gated_memory_two_pass":
+        if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             rendered: list[str] = []
             expanded_clips: list[LoadedVideoClips] = []
             for sample, clip in zip(samples, clips, strict=True):
@@ -1619,7 +1932,7 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                     self._training_pass_a_prediction(sample, clip)
                     if apply_two_pass_training_noise
                     else sample.target_prediction(
-                        target_protocol="keyframe_gated_memory_two_pass",
+                        target_protocol=self.config.target_protocol,
                         keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
                     )
                 )
@@ -1644,6 +1957,16 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                         include_target=True,
                     )
                 )
+                if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                    rendered.append(
+                        self._render_two_pass_messages(
+                            processor,
+                            sample,
+                            predict_clip,
+                            stage="horizon",
+                            include_target=True,
+                        )
+                    )
                 rendered.append(
                     self._render_two_pass_messages(
                         processor,
@@ -1654,7 +1977,10 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                         pass_a_prediction=pass_a_prediction,
                     )
                 )
-                expanded_clips.extend((predict_clip, confirm_clip))
+                if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
+                    expanded_clips.extend((predict_clip, predict_clip, confirm_clip))
+                else:
+                    expanded_clips.extend((predict_clip, confirm_clip))
             return self._encode_batch_processor_inputs(processor, rendered, expanded_clips)
         rendered = [
             self._render_messages(processor, sample, clip, include_target=True)
@@ -1789,9 +2115,17 @@ class Qwen25HLAdapter(BaseHLVLMAdapter):
                 "Recent observation clip, ordered oldest to newest. "
                 "The last valid frame is the current state to predict."
             )
+        elif stage == "horizon":
+            stage_sample = sample
+            prompt = self._build_film_progress_horizon_prompt(stage_sample, clips)
+            target = self._build_two_pass_target_text(stage_sample, stage="horizon")
+            clip_description = (
+                "Recent observation clip, ordered oldest to newest. "
+                "The last valid frame anchors the independent horizon prediction."
+            )
         elif stage == "confirm":
             pass_a_prediction = pass_a_prediction or sample.target_prediction(
-                target_protocol="keyframe_gated_memory_two_pass",
+                target_protocol=self.config.target_protocol,
                 keyframe_candidate_label_mode=self.config.keyframe_candidate_label_mode,
             )
             stage_sample = self._two_pass_stage_sample(
@@ -1900,6 +2234,18 @@ class Qwen35HLAdapter(Qwen25HLAdapter):
             )
 
 
+class Qwen3VLHLAdapter(Qwen35HLAdapter):
+    """HF adapter for the official Qwen3-VL family.
+
+    Qwen3-VL uses the same high-level Hugging Face image-text auto model API
+    as the Qwen3.5-VL checkpoints used by the existing adapter. Keep it as a
+    separate class so backend-specific probes and mask support can be added
+    without changing Qwen3.5 behavior.
+    """
+
+    pass
+
+
 def _model_compute_dtype(model: torch.nn.Module) -> torch.dtype:
     config = getattr(model, "config", None)
     for attribute in ("torch_dtype", "dtype"):
@@ -1924,16 +2270,18 @@ def _compute_qwen25_position_ids(
     model_inputs: Mapping[str, torch.Tensor],
 ) -> torch.Tensor:
     qwen_model = _find_qwen25_multimodal_model(model)
-    return qwen_model.compute_3d_position_ids(
-        input_ids=input_ids,
-        image_grid_thw=model_inputs.get("image_grid_thw"),
-        video_grid_thw=model_inputs.get("video_grid_thw"),
-        inputs_embeds=None,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        second_per_grid_ts=model_inputs.get("second_per_grid_ts"),
-        mm_token_type_ids=model_inputs.get("mm_token_type_ids"),
-    )
+    kwargs = {
+        "input_ids": input_ids,
+        "image_grid_thw": model_inputs.get("image_grid_thw"),
+        "video_grid_thw": model_inputs.get("video_grid_thw"),
+        "inputs_embeds": None,
+        "attention_mask": attention_mask,
+        "past_key_values": None,
+        "second_per_grid_ts": model_inputs.get("second_per_grid_ts"),
+        "mm_token_type_ids": model_inputs.get("mm_token_type_ids"),
+    }
+    accepted = set(inspect.signature(qwen_model.compute_3d_position_ids).parameters)
+    return qwen_model.compute_3d_position_ids(**{key: value for key, value in kwargs.items() if key in accepted})
 
 
 def _find_qwen25_multimodal_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -1981,6 +2329,16 @@ def _parse_completed_objective_text(text: str) -> str:
     objective = data["completed_objective"]
     if not isinstance(objective, str):
         raise ValueError("Pass B `completed_objective` must be a string.")
+    return objective.strip()
+
+
+def _parse_horizon_objective_text(text: str) -> str:
+    data = _extract_json_dict(text)
+    if set(data) != {"horizon_current_objective"}:
+        raise ValueError("Horizon output must contain exactly the `horizon_current_objective` key.")
+    objective = data["horizon_current_objective"]
+    if not isinstance(objective, str):
+        raise ValueError("Horizon `horizon_current_objective` must be a string.")
     return objective.strip()
 
 
@@ -2035,6 +2393,26 @@ def _build_batched_field_ids(
         if target_field_ids is None:
             return None
         supervised_positions = torch.nonzero(labels[row_index] != -100, as_tuple=False).flatten().cpu()
+        target_token_ids = _target_text_token_ids(tokenizer, target_text)
+        if target_token_ids is None:
+            return None
+        supervised_token_ids = labels[row_index, supervised_positions].detach().cpu().tolist()
+        if supervised_token_ids[: len(target_token_ids)] != target_token_ids:
+            logging.warning(
+                "Skipping HL field loss breakdown; supervised target tokens do not match target_text. "
+                "row=%d supervised_tokens=%d target_tokens=%d first_mismatch=%s",
+                row_index,
+                len(supervised_token_ids),
+                len(target_token_ids),
+                _first_mismatched_token_index(supervised_token_ids, target_token_ids),
+            )
+            return None
+        if len(supervised_token_ids) > len(target_token_ids):
+            logging.debug(
+                "HL field loss breakdown ignores %d supervised chat-template suffix tokens for row=%d.",
+                len(supervised_token_ids) - len(target_token_ids),
+                row_index,
+            )
         assign_count = min(int(supervised_positions.numel()), len(target_field_ids))
         if assign_count > 0:
             row_field_ids[supervised_positions[:assign_count]] = torch.as_tensor(
@@ -2043,6 +2421,100 @@ def _build_batched_field_ids(
             )
         rows.append(row_field_ids)
     return torch.stack(rows, dim=0)
+
+
+def _target_text_token_ids(tokenizer: Any, target_text: str) -> list[int] | None:
+    try:
+        encoded = tokenizer(target_text, add_special_tokens=False)
+    except Exception as exc:  # pragma: no cover - tokenizer-specific fallback.
+        logging.warning("Skipping HL field loss breakdown; target_text tokenization failed: %s", exc)
+        return None
+    token_ids = encoded.get("input_ids") if isinstance(encoded, Mapping) else None
+    if token_ids is None:
+        logging.warning("Skipping HL field loss breakdown; tokenizer did not return input_ids.")
+        return None
+    if token_ids and isinstance(token_ids[0], list):
+        token_ids = token_ids[0]
+    return [int(token_id) for token_id in token_ids]
+
+
+def _first_mismatched_token_index(left: list[int], right: list[int]) -> int | str:
+    for index, (left_token, right_token) in enumerate(zip(left, right, strict=False)):
+        if left_token != right_token:
+            return index
+    if len(left) != len(right):
+        return min(len(left), len(right))
+    return "none"
+
+
+def _keyframe_auxiliary_targets_for_sample(
+    sample: ExportedHLMemorySample,
+    *,
+    config: HLMemoryConfig,
+    enabled: bool,
+) -> dict[str, Any]:
+    num_positions = config.recent_frames_length
+    valid_length = min(sample.recent_valid_length, len(sample.recent_frame_indices), num_positions)
+    valid_positions = [index < valid_length for index in range(num_positions)]
+    event_positive = bool(sample.keyframe_event_ids or sample.keyframe_candidate_positions)
+
+    canonical_frame: int | None = None
+    if sample.keyframe_event_frame_indices:
+        canonical_frame = int(sample.keyframe_event_frame_indices[0])
+    elif sample.keyframe_label is True:
+        canonical_frame = int(sample.frame_index)
+
+    canonical_position = -1.0
+    if canonical_frame is not None and valid_length > 0:
+        nearest_index = min(
+            range(valid_length),
+            key=lambda index: abs(int(sample.recent_frame_indices[index]) - canonical_frame),
+        )
+        canonical_position = float(nearest_index)
+
+    position_targets = [0.0] * num_positions
+    if event_positive and valid_length > 0:
+        sigma_frames = max(config.keyframe_aux_timing_sigma_sec * config.training_fps, 1e-6)
+        if canonical_frame is not None:
+            weights = [
+                math.exp(
+                    -0.5
+                    * ((float(sample.recent_frame_indices[index]) - canonical_frame) / sigma_frames) ** 2
+                )
+                for index in range(valid_length)
+            ]
+        else:
+            candidate_indices = [
+                position - 1
+                for position in sample.keyframe_candidate_positions
+                if 1 <= position <= valid_length
+            ]
+            weights = [
+                max(
+                    (
+                        math.exp(-0.5 * ((index - candidate_index) / max(config.recent_sample_hz, 1.0)) ** 2)
+                        for candidate_index in candidate_indices
+                    ),
+                    default=0.0,
+                )
+                for index in range(valid_length)
+            ]
+        total = sum(weights)
+        if total > 0.0:
+            position_targets[:valid_length] = [weight / total for weight in weights]
+
+    update_target = 0  # reject
+    if event_positive and canonical_frame is not None and canonical_frame <= sample.frame_index:
+        update_target = 2 if canonical_frame in sample.memory_frame_indices else 1
+
+    return {
+        "enabled": bool(enabled),
+        "position_targets": position_targets,
+        "event_target": float(event_positive),
+        "update_target": update_target,
+        "canonical_position": canonical_position,
+        "valid_positions": valid_positions,
+    }
 
 
 def _target_text_field_ids(tokenizer: Any, target_text: str) -> list[int] | None:

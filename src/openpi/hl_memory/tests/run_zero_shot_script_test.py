@@ -8,6 +8,7 @@ from scripts.hl_memory.run_hl_memory_zero_shot import _protocol_prediction_paylo
 from scripts.hl_memory.run_hl_memory_zero_shot import _render_completed_event_log
 from scripts.hl_memory.run_hl_memory_zero_shot import _update_keyframe_gated_rollout_state
 from scripts.hl_memory.run_hl_memory_zero_shot import _write_json_atomic
+from scripts.hl_memory.run_hl_memory_zero_shot import AcceptedKeyframeEvent
 from scripts.hl_memory.run_hl_memory_zero_shot import KeyframeGatedRolloutState
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.schema import HLMemoryPrediction
@@ -89,7 +90,9 @@ def test_keyframe_gated_state_accepts_completed_objective_with_keyframes():
 
 
 def test_keyframe_gated_state_rejects_near_duplicate_completed_objective():
-    state = KeyframeGatedRolloutState(completed_events=("place toast",), accepted_keyframe_seconds=(1.0,))
+    state = KeyframeGatedRolloutState(
+        accepted_events=(AcceptedKeyframeEvent("place toast", 1.0),),
+    )
 
     next_state, update = _update_keyframe_gated_rollout_state(
         state,
@@ -105,7 +108,9 @@ def test_keyframe_gated_state_rejects_near_duplicate_completed_objective():
 
 
 def test_keyframe_gated_state_accepts_far_duplicate_completed_objective():
-    state = KeyframeGatedRolloutState(completed_events=("place toast",), accepted_keyframe_seconds=(1.0,))
+    state = KeyframeGatedRolloutState(
+        accepted_events=(AcceptedKeyframeEvent("place toast", 1.0),),
+    )
 
     next_state, update = _update_keyframe_gated_rollout_state(
         state,
@@ -132,6 +137,39 @@ def test_keyframe_gated_state_compacts_event_band_candidates_to_one_second():
     assert update["accepted"] is True
     assert update["representative_keyframe_second"] == 1.5
     assert next_state.accepted_keyframe_seconds == (1.5,)
+
+
+def test_keyframe_gated_state_trims_events_and_seconds_together():
+    state = KeyframeGatedRolloutState(
+        accepted_events=(
+            AcceptedKeyframeEvent("first", 1.0),
+            AcceptedKeyframeEvent("second", 2.0),
+        ),
+    )
+
+    next_state, update = _update_keyframe_gated_rollout_state(
+        state,
+        prediction=_gated_prediction(completed_objective="third", keyframe_positions=(1,)),
+        candidate_seconds=(3.0,),
+        memory_length=2,
+        merge_distance_sec=1.0,
+    )
+
+    assert update["accepted"] is True
+    assert next_state.completed_events == ("second", "third")
+    assert next_state.accepted_keyframe_seconds == (2.0, 3.0)
+
+
+def test_keyframe_gated_state_keeps_unnamed_historical_keyframes_out_of_event_log():
+    state = KeyframeGatedRolloutState(
+        accepted_events=(
+            AcceptedKeyframeEvent("", 1.0),
+            AcceptedKeyframeEvent("place toast", 2.0),
+        ),
+    )
+
+    assert state.completed_events == ("place toast",)
+    assert state.accepted_keyframe_seconds == (1.0, 2.0)
 
 
 def test_completed_event_log_preserves_repeated_events():

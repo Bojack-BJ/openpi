@@ -151,7 +151,8 @@ def build_zero_shot_clips_from_video(
             recent_step_sec=recent_step_sec,
             explicit_seconds=recent_seconds,
         )
-        if memory_seconds is not None:
+        explicit_memory_seconds = memory_seconds is not None
+        if explicit_memory_seconds:
             resolved_memory_seconds = _sorted_unique_seconds(memory_seconds)
         elif auto_memory:
             resolved_memory_seconds = build_auto_memory_seconds(
@@ -161,7 +162,8 @@ def build_zero_shot_clips_from_video(
             )
         else:
             resolved_memory_seconds = []
-        resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
+        if not explicit_memory_seconds:
+            resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
 
         memory_frames = [
             _compose_single_view_frame(
@@ -219,7 +221,8 @@ def build_zero_shot_clips_from_video_paths(
             recent_step_sec=recent_step_sec,
             explicit_seconds=recent_seconds,
         )
-        if memory_seconds is not None:
+        explicit_memory_seconds = memory_seconds is not None
+        if explicit_memory_seconds:
             resolved_memory_seconds = _sorted_unique_seconds(memory_seconds)
         elif auto_memory:
             resolved_memory_seconds = build_auto_memory_seconds(
@@ -229,7 +232,8 @@ def build_zero_shot_clips_from_video_paths(
             )
         else:
             resolved_memory_seconds = []
-        resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
+        if not explicit_memory_seconds:
+            resolved_memory_seconds = _filter_visible_memory_seconds(resolved_memory_seconds, resolved_recent_seconds)
 
         memory_frames = [
             _read_composed_multiview_frame(
@@ -587,6 +591,7 @@ def save_prediction_debug_panel(
         language_memory_after=language_memory_after or prediction.updated_language_memory,
         memory_seconds_before=memory_seconds_before,
         memory_seconds_after=memory_seconds_after,
+        memory_seconds_input=selection.memory_seconds,
         keyframe_candidate_seconds=keyframe_candidate_seconds,
         state_update=state_update,
         ground_truth_subtask=ground_truth_subtask,
@@ -662,6 +667,7 @@ def _build_debug_text_lines(
     language_memory_after: str,
     memory_seconds_before: Iterable[float],
     memory_seconds_after: Iterable[float],
+    memory_seconds_input: Iterable[float],
     keyframe_candidate_seconds: Iterable[float],
     state_update: str,
     ground_truth_subtask: str | None,
@@ -686,6 +692,7 @@ def _build_debug_text_lines(
         "keyframe_gated_memory",
         "keyframe_gated_memory_typed_mask",
         "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
     }
     lines.append(("Visual prediction" if is_keyframe_gated else "Output", "section"))
     _append_wrapped_debug_line(lines, "Current objective", prediction.current_objective, style="accent", max_lines=3)
@@ -718,13 +725,19 @@ def _build_debug_text_lines(
     )
     _append_wrapped_debug_line(
         lines,
-        "Historical keyframe secs before",
+        "Historical state keyframes before",
         _format_seconds(memory_seconds_before),
         style="muted",
     )
     _append_wrapped_debug_line(
         lines,
-        "Historical keyframe secs after",
+        "Historical clip input",
+        _format_seconds(memory_seconds_input),
+        style="muted",
+    )
+    _append_wrapped_debug_line(
+        lines,
+        "Historical state keyframes after",
         _format_seconds(memory_seconds_after),
         style="muted",
     )
@@ -734,7 +747,18 @@ def _build_debug_text_lines(
         lines.append(("", ""))
         lines.append(("State before", "section"))
         _append_wrapped_debug_line(lines, "Completed event log", state_input or "none", max_lines=5)
-        _append_wrapped_debug_line(lines, "Historical keyframes", _format_seconds(memory_seconds_before), max_lines=3)
+        _append_wrapped_debug_line(
+            lines,
+            "Historical state keyframes",
+            _format_seconds(memory_seconds_before),
+            max_lines=3,
+        )
+        _append_wrapped_debug_line(
+            lines,
+            "Historical clip input",
+            _format_seconds(memory_seconds_input),
+            max_lines=3,
+        )
         lines.append(("", ""))
         lines.append(("State update", "section"))
         _append_wrapped_debug_line(lines, "Update", state_update or "none", max_lines=4, style="accent")
@@ -756,6 +780,7 @@ def _debug_state_input_label(target_protocol: str) -> str | None:
         "keyframe_gated_memory": "Completed event log",
         "keyframe_gated_memory_typed_mask": "Completed event log",
         "keyframe_gated_memory_two_pass": "Completed event log",
+        "memer_film_progress_two_pass": "Completed event log",
     }.get(target_protocol)
 
 
@@ -773,6 +798,7 @@ def _debug_state_output(
         "keyframe_gated_memory",
         "keyframe_gated_memory_typed_mask",
         "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
     }:
         return ("Completed objective", prediction.completed_objective)
     return None

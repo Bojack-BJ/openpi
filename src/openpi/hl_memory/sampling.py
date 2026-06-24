@@ -33,10 +33,13 @@ def sample_keyframe_stratified(
         raise ValueError(
             "--keyframe-confirm-positive-sample-ratio cannot exceed --keyframe-positive-sample-ratio."
         )
-    if keyframe_confirm_positive_sample_ratio > 0.0 and target_protocol != "keyframe_gated_memory_two_pass":
+    if keyframe_confirm_positive_sample_ratio > 0.0 and target_protocol not in {
+        "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
+    }:
         raise ValueError(
             "--keyframe-confirm-positive-sample-ratio is only supported by "
-            "--target-protocol keyframe_gated_memory_two_pass."
+            "--target-protocol keyframe_gated_memory_two_pass or memer_film_progress_two_pass."
         )
 
     if keyframe_positive_sample_ratio <= 0.0:
