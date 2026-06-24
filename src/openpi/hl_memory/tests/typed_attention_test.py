@@ -28,16 +28,18 @@ class _FakeTokenizer:
             return [30, 31]
         if text == "completed_objective":
             return [31]
+        if text in {"Completed-event log:", "Completed-event log"}:
+            return [60]
         return []
 
 
-def test_completed_objective_cannot_attend_recent_visual_but_can_attend_prompt_bridge():
+def test_typed_mask_blocks_recent_bridge_and_field_shortcuts():
     input_ids = torch.tensor(
-        [[1, 10, 11, 11, 12, 2, 10, 11, 11, 12, 3, 4, 20, 50, 21, 51, 25, 52, 30, 31, 40]]
+        [[1, 10, 11, 11, 12, 2, 10, 11, 11, 12, 3, 60, 4, 20, 50, 21, 51, 25, 52, 30, 31, 40]]
     )
     attention_mask = torch.ones_like(input_ids)
     labels = torch.full_like(input_ids, -100)
-    labels[:, 12:] = input_ids[:, 12:]
+    labels[:, 13:] = input_ids[:, 13:]
 
     additive_mask, spans = build_qwen25_typed_attention_mask(
         input_ids=input_ids,
@@ -49,20 +51,38 @@ def test_completed_objective_cannot_attend_recent_visual_but_can_attend_prompt_b
 
     blocked = torch.finfo(torch.float32).min
     assert spans[0] is not None
+    assert spans[0].memory_source_start == 1
+    assert spans[0].memory_source_end == 5
     assert spans[0].recent_source_start == 6
     assert spans[0].recent_source_end == 10
-    assert spans[0].target_start == 12
-    assert spans[0].current_objective_start == 12
-    assert spans[0].horizon_objective_start == 14
-    assert spans[0].horizon_objective_end == 16
-    assert spans[0].completed_objective_start == 18
-    assert torch.all(additive_mask[0, 0, 14:16, 12:14] == blocked)
-    assert torch.all(additive_mask[0, 0, 18:, 6:10] == blocked)
-    assert torch.all(additive_mask[0, 0, 18:, 10:12] == 0)
-    assert additive_mask[0, 0, 12, 7] == 0
-    assert additive_mask[0, 0, 14, 12] == blocked
-    assert additive_mask[0, 0, 14, 7] == 0
-    assert additive_mask[0, 0, 12, 13] == blocked
+    assert spans[0].post_recent_text_start == 10
+    assert spans[0].post_recent_text_end == 13
+    assert spans[0].completed_event_log_start == 11
+    assert spans[0].completed_event_log_end == 13
+    assert spans[0].target_start == 13
+    assert spans[0].current_objective_start == 13
+    assert spans[0].current_objective_end == 15
+    assert spans[0].horizon_objective_start == 15
+    assert spans[0].horizon_objective_end == 17
+    assert spans[0].keyframe_positions_start == 17
+    assert spans[0].keyframe_positions_end == 19
+    assert spans[0].completed_objective_start == 19
+    assert torch.all(additive_mask[0, 0, 10:13, 6:10] == blocked)
+    assert torch.all(additive_mask[0, 0, 15:17, 13:15] == blocked)
+    assert torch.all(additive_mask[0, 0, 17:19, 1:5] == blocked)
+    assert torch.all(additive_mask[0, 0, 17:19, 11:13] == blocked)
+    assert torch.all(additive_mask[0, 0, 17:19, 13:17] == blocked)
+    assert torch.all(additive_mask[0, 0, 19:, 6:10] == blocked)
+    assert torch.all(additive_mask[0, 0, 19:, 13:17] == blocked)
+    assert torch.all(additive_mask[0, 0, 19:, 10:13] == 0)
+    assert torch.all(additive_mask[0, 0, 19:, 17:19] == 0)
+    assert additive_mask[0, 0, 13, 7] == 0
+    assert additive_mask[0, 0, 15, 13] == blocked
+    assert additive_mask[0, 0, 15, 7] == 0
+    assert additive_mask[0, 0, 17, 7] == 0
+    assert additive_mask[0, 0, 17, 10] == 0
+    assert additive_mask[0, 0, 17, 11] == blocked
+    assert additive_mask[0, 0, 13, 14] == blocked
 
 
 def test_generation_mask_activates_horizon_before_completed_field_is_generated():
@@ -110,7 +130,8 @@ def test_generation_mask_activates_horizon_before_completed_field_is_generated()
 
     assert completed_spans[0] is not None
     assert completed_mask[0, 0, -1, 5] == blocked
-    assert completed_mask[0, 0, -1, len(prompt_ids)] == 0
+    assert completed_mask[0, 0, -1, len(prompt_ids)] == blocked
+    assert completed_mask[0, 0, -1, len(prompt_ids) + 4] == 0
 
 
 def test_padding_queries_and_keys_remain_blocked():

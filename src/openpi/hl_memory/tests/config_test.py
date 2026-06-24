@@ -148,19 +148,19 @@ def test_target_protocol_accepts_memer_film_progress_two_pass():
     assert config.state_condition_mode == "film"
 
 
-def test_typed_mask_protocol_requires_qwen25():
-    config = HLMemoryConfig(
-        vlm_backend="qwen2_5_vl",
-        target_protocol="keyframe_gated_memory_typed_mask",
-    )
-    assert config.target_protocol == "keyframe_gated_memory_typed_mask"
+def test_typed_mask_protocol_accepts_qwen25_and_qwen3_vl():
+    for backend in ("qwen2_5_vl", "qwen3_vl"):
+        config = HLMemoryConfig(
+            vlm_backend=backend,
+            target_protocol="keyframe_gated_memory_typed_mask",
+        )
+        assert config.target_protocol == "keyframe_gated_memory_typed_mask"
 
-    for backend in ("qwen3_5_vl", "qwen3_vl"):
-        with pytest.raises(ValueError, match="only supported"):
-            HLMemoryConfig(
-                vlm_backend=backend,
-                target_protocol="keyframe_gated_memory_typed_mask",
-            )
+    with pytest.raises(ValueError, match="only supported"):
+        HLMemoryConfig(
+            vlm_backend="qwen3_5_vl",
+            target_protocol="keyframe_gated_memory_typed_mask",
+        )
 
 
 def test_two_pass_training_proposal_noise_probability_is_validated():

@@ -131,10 +131,13 @@ class HLMemoryConfig:
                 "`objective_prev_stage`, `keyframe_gated_memory`, `keyframe_gated_memory_typed_mask`, or "
                 "`keyframe_gated_memory_two_pass`, or `memer_film_progress_two_pass`."
             )
-        if self.target_protocol == "keyframe_gated_memory_typed_mask" and self.vlm_backend != "qwen2_5_vl":
+        if self.target_protocol == "keyframe_gated_memory_typed_mask" and self.vlm_backend not in {
+            "qwen2_5_vl",
+            "qwen3_vl",
+        }:
             raise ValueError(
-                "`keyframe_gated_memory_typed_mask` is only supported by `qwen2_5_vl` until the target backend "
-                "passes the 4D-mask probe."
+                "`keyframe_gated_memory_typed_mask` is only supported by `qwen2_5_vl` and `qwen3_vl`; "
+                "Qwen3.5-VL uses two-pass/staged decoding instead of 4D typed masks."
             )
         if self.proprio_token_mode not in {"per_frame", "summary", "per_frame_plus_summary"}:
             raise ValueError("`proprio_token_mode` must be one of `per_frame`, `summary`, or `per_frame_plus_summary`.")

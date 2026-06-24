@@ -10,16 +10,26 @@ COMPLETED_OBJECTIVE_FIELD = "completed_objective"
 CURRENT_OBJECTIVE_FIELD = "current_objective"
 HORIZON_OBJECTIVE_FIELD = "horizon_current_objective"
 KEYFRAME_POSITIONS_FIELD = "keyframe_candidate_positions"
+COMPLETED_EVENT_LOG_MARKER = "Completed-event log:"
 
 
 @dataclasses.dataclass(frozen=True)
 class TypedAttentionSpans:
+    memory_source_start: int
+    memory_source_end: int
     recent_source_start: int
     recent_source_end: int
+    post_recent_text_start: int
+    post_recent_text_end: int
+    completed_event_log_start: int | None
+    completed_event_log_end: int | None
     target_start: int
     current_objective_start: int
+    current_objective_end: int
     horizon_objective_start: int
     horizon_objective_end: int
+    keyframe_positions_start: int | None
+    keyframe_positions_end: int | None
     completed_objective_start: int | None
 
 
@@ -34,9 +44,16 @@ def build_qwen25_typed_attention_mask(
 ) -> tuple[torch.Tensor, tuple[TypedAttentionSpans | None, ...]]:
     """Build a 4D additive causal mask for keyframe-gated Qwen2.5 decoding.
 
-    Horizon target rows cannot attend the teacher-forced current-objective
-    target field. Completed-objective rows cannot directly attend the recent
-    visual source span. Source prompt context remains visible to both fields.
+    The mask is intentionally stricter than plain causal masking:
+
+    * post-recent prompt text cannot itself attend the recent visual span, so it
+      cannot become an indirect bridge into completed-objective rows.
+    * horizon rows cannot attend the teacher-forced current-objective field.
+    * keyframe rows cannot attend historical memory, completed-event log text,
+      or current/horizon target fields; keyframe proposal stays recent-dominant.
+    * completed rows cannot attend the full recent clip or current/horizon
+      target fields. They may still attend keyframe candidate tokens, historical
+      memory, task/progress text, and candidate-evidence prompts.
     """
     if input_ids.ndim != 2 or attention_mask.ndim != 2:
         raise ValueError("input_ids and attention_mask must both have shape [batch, sequence].")
@@ -68,6 +85,7 @@ def build_qwen25_typed_attention_mask(
     horizon_marker_candidates = _field_marker_candidates(tokenizer, HORIZON_OBJECTIVE_FIELD)
     keyframe_marker_candidates = _field_marker_candidates(tokenizer, KEYFRAME_POSITIONS_FIELD)
     completed_marker_candidates = _field_marker_candidates(tokenizer, COMPLETED_OBJECTIVE_FIELD)
+    completed_log_marker_candidates = _text_marker_candidates(tokenizer, COMPLETED_EVENT_LOG_MARKER)
 
     spans: list[TypedAttentionSpans | None] = []
     for batch_index in range(input_ids.shape[0]):
@@ -89,20 +107,49 @@ def build_qwen25_typed_attention_mask(
             horizon_marker_candidates=horizon_marker_candidates,
             keyframe_marker_candidates=keyframe_marker_candidates,
             completed_marker_candidates=completed_marker_candidates,
+            completed_log_marker_candidates=completed_log_marker_candidates,
         )
         spans.append(span)
         if span is None:
             continue
         allow[
             batch_index,
+            span.post_recent_text_start : span.post_recent_text_end,
+            span.recent_source_start : span.recent_source_end,
+        ] = False
+        allow[
+            batch_index,
             span.horizon_objective_start : span.horizon_objective_end,
             span.current_objective_start : span.horizon_objective_start,
         ] = False
+        if span.keyframe_positions_start is not None:
+            keyframe_rows = slice(span.keyframe_positions_start, span.keyframe_positions_end)
+            allow[
+                batch_index,
+                keyframe_rows,
+                span.memory_source_start : span.memory_source_end,
+            ] = False
+            if span.completed_event_log_start is not None and span.completed_event_log_end is not None:
+                allow[
+                    batch_index,
+                    keyframe_rows,
+                    span.completed_event_log_start : span.completed_event_log_end,
+                ] = False
+            allow[
+                batch_index,
+                keyframe_rows,
+                span.current_objective_start : span.horizon_objective_end,
+            ] = False
         if span.completed_objective_start is not None:
             allow[
                 batch_index,
                 span.completed_objective_start :,
                 span.recent_source_start : span.recent_source_end,
+            ] = False
+            allow[
+                batch_index,
+                span.completed_objective_start :,
+                span.current_objective_start : span.horizon_objective_end,
             ] = False
 
     additive_mask = torch.zeros(
@@ -126,6 +173,7 @@ def _locate_typed_spans(
     horizon_marker_candidates: tuple[tuple[int, ...], ...],
     keyframe_marker_candidates: tuple[tuple[int, ...], ...],
     completed_marker_candidates: tuple[tuple[int, ...], ...],
+    completed_log_marker_candidates: tuple[tuple[int, ...], ...],
 ) -> TypedAttentionSpans | None:
     valid_positions = torch.nonzero(row_valid, as_tuple=False).flatten().tolist()
     if not valid_positions:
@@ -140,6 +188,24 @@ def _locate_typed_spans(
     video_runs = _contiguous_token_runs(row_ids, row_valid, video_token_id, stop=target_start)
     if len(video_runs) < 2:
         raise ValueError(f"Expected memory and recent video token runs before target, found {len(video_runs)}.")
+
+    memory_video_start, memory_video_end = video_runs[0]
+    memory_source_start = _nearest_token_before(
+        row_ids,
+        token_id=vision_start_token_id,
+        start=first_valid,
+        stop=memory_video_start,
+    )
+    if memory_source_start is None:
+        memory_source_start = memory_video_start
+    memory_source_end_token = _nearest_token_after(
+        row_ids,
+        token_id=vision_end_token_id,
+        start=memory_video_end,
+        stop=target_start,
+    )
+    memory_source_end = memory_video_end if memory_source_end_token is None else memory_source_end_token + 1
+
     recent_video_start, recent_video_end = video_runs[1]
     recent_source_start = _nearest_token_before(
         row_ids,
@@ -156,6 +222,15 @@ def _locate_typed_spans(
         stop=target_start,
     )
     recent_source_end = recent_video_end if recent_source_end_token is None else recent_source_end_token + 1
+    post_recent_text_start = recent_source_end
+    post_recent_text_end = target_start
+    completed_log_start = _find_first_subsequence(
+        row_ids,
+        completed_log_marker_candidates,
+        start=post_recent_text_start,
+        stop=target_start,
+    )
+    completed_log_end = target_start if completed_log_start is not None else None
 
     current_start = _find_first_subsequence(
         row_ids,
@@ -184,13 +259,24 @@ def _locate_typed_spans(
         start=horizon_start + 1,
         stop=last_valid_exclusive,
     )
+    current_end = horizon_start
+    keyframe_end = completed_start if completed_start is not None else last_valid_exclusive
     return TypedAttentionSpans(
+        memory_source_start=memory_source_start,
+        memory_source_end=memory_source_end,
         recent_source_start=recent_source_start,
         recent_source_end=recent_source_end,
+        post_recent_text_start=post_recent_text_start,
+        post_recent_text_end=post_recent_text_end,
+        completed_event_log_start=completed_log_start,
+        completed_event_log_end=completed_log_end,
         target_start=target_start,
         current_objective_start=current_start,
+        current_objective_end=current_end,
         horizon_objective_start=horizon_start,
         horizon_objective_end=horizon_end,
+        keyframe_positions_start=keyframe_start,
+        keyframe_positions_end=keyframe_end if keyframe_start is not None else None,
         completed_objective_start=completed_start,
     )
 
@@ -227,6 +313,18 @@ def _field_marker_candidates(tokenizer: Any, field_name: str) -> tuple[tuple[int
             candidates.append(token_ids)
     if not candidates:
         raise ValueError(f"Tokenizer produced no marker tokens for field {field_name!r}.")
+    return tuple(candidates)
+
+
+def _text_marker_candidates(tokenizer: Any, marker: str) -> tuple[tuple[int, ...], ...]:
+    encoder = getattr(tokenizer, "encode", None)
+    if encoder is None:
+        raise ValueError("Tokenizer must expose encode() for typed prompt span detection.")
+    candidates: list[tuple[int, ...]] = []
+    for text in (marker, marker.rstrip(":")):
+        token_ids = tuple(int(value) for value in encoder(text, add_special_tokens=False))
+        if token_ids and token_ids not in candidates:
+            candidates.append(token_ids)
     return tuple(candidates)
 
 
