@@ -7,6 +7,9 @@ import torch
 
 
 COMPLETED_OBJECTIVE_FIELD = "completed_objective"
+CURRENT_OBJECTIVE_FIELD = "current_objective"
+HORIZON_OBJECTIVE_FIELD = "horizon_current_objective"
+KEYFRAME_POSITIONS_FIELD = "keyframe_candidate_positions"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -14,7 +17,10 @@ class TypedAttentionSpans:
     recent_source_start: int
     recent_source_end: int
     target_start: int
-    completed_objective_start: int
+    current_objective_start: int
+    horizon_objective_start: int
+    horizon_objective_end: int
+    completed_objective_start: int | None
 
 
 def build_qwen25_typed_attention_mask(
@@ -28,9 +34,9 @@ def build_qwen25_typed_attention_mask(
 ) -> tuple[torch.Tensor, tuple[TypedAttentionSpans | None, ...]]:
     """Build a 4D additive causal mask for keyframe-gated Qwen2.5 decoding.
 
-    The `completed_objective` target rows cannot directly attend to the recent
-    visual source span. They can still attend prior generated target fields, so
-    current/horizon/keyframe predictions become the compressed proposal path.
+    Horizon target rows cannot attend the teacher-forced current-objective
+    target field. Completed-objective rows cannot directly attend the recent
+    visual source span. Source prompt context remains visible to both fields.
     """
     if input_ids.ndim != 2 or attention_mask.ndim != 2:
         raise ValueError("input_ids and attention_mask must both have shape [batch, sequence].")
@@ -58,7 +64,10 @@ def build_qwen25_typed_attention_mask(
     video_token_id = _resolve_special_token_id(tokenizer, "video_token_id", "<|video_pad|>")
     vision_start_token_id = _resolve_special_token_id(tokenizer, "vision_start_token_id", "<|vision_start|>")
     vision_end_token_id = _resolve_special_token_id(tokenizer, "vision_end_token_id", "<|vision_end|>")
-    marker_candidates = _field_marker_candidates(tokenizer, COMPLETED_OBJECTIVE_FIELD)
+    current_marker_candidates = _field_marker_candidates(tokenizer, CURRENT_OBJECTIVE_FIELD)
+    horizon_marker_candidates = _field_marker_candidates(tokenizer, HORIZON_OBJECTIVE_FIELD)
+    keyframe_marker_candidates = _field_marker_candidates(tokenizer, KEYFRAME_POSITIONS_FIELD)
+    completed_marker_candidates = _field_marker_candidates(tokenizer, COMPLETED_OBJECTIVE_FIELD)
 
     spans: list[TypedAttentionSpans | None] = []
     for batch_index in range(input_ids.shape[0]):
@@ -76,16 +85,25 @@ def build_qwen25_typed_attention_mask(
             video_token_id=video_token_id,
             vision_start_token_id=vision_start_token_id,
             vision_end_token_id=vision_end_token_id,
-            marker_candidates=marker_candidates,
+            current_marker_candidates=current_marker_candidates,
+            horizon_marker_candidates=horizon_marker_candidates,
+            keyframe_marker_candidates=keyframe_marker_candidates,
+            completed_marker_candidates=completed_marker_candidates,
         )
         spans.append(span)
         if span is None:
             continue
         allow[
             batch_index,
-            span.completed_objective_start :,
-            span.recent_source_start : span.target_start,
+            span.horizon_objective_start : span.horizon_objective_end,
+            span.current_objective_start : span.horizon_objective_start,
         ] = False
+        if span.completed_objective_start is not None:
+            allow[
+                batch_index,
+                span.completed_objective_start :,
+                span.recent_source_start : span.recent_source_end,
+            ] = False
 
     additive_mask = torch.zeros(
         (input_ids.shape[0], 1, sequence_length, sequence_length),
@@ -104,7 +122,10 @@ def _locate_typed_spans(
     video_token_id: int,
     vision_start_token_id: int,
     vision_end_token_id: int,
-    marker_candidates: tuple[tuple[int, ...], ...],
+    current_marker_candidates: tuple[tuple[int, ...], ...],
+    horizon_marker_candidates: tuple[tuple[int, ...], ...],
+    keyframe_marker_candidates: tuple[tuple[int, ...], ...],
+    completed_marker_candidates: tuple[tuple[int, ...], ...],
 ) -> TypedAttentionSpans | None:
     valid_positions = torch.nonzero(row_valid, as_tuple=False).flatten().tolist()
     if not valid_positions:
@@ -136,18 +157,40 @@ def _locate_typed_spans(
     )
     recent_source_end = recent_video_end if recent_source_end_token is None else recent_source_end_token + 1
 
-    completed_start = _find_first_subsequence(
+    current_start = _find_first_subsequence(
         row_ids,
-        marker_candidates,
+        current_marker_candidates,
         start=target_start,
         stop=last_valid_exclusive,
     )
-    if completed_start is None:
+    horizon_start = _find_first_subsequence(
+        row_ids,
+        horizon_marker_candidates,
+        start=target_start,
+        stop=last_valid_exclusive,
+    )
+    if current_start is None or horizon_start is None:
         return None
+    keyframe_start = _find_first_subsequence(
+        row_ids,
+        keyframe_marker_candidates,
+        start=horizon_start + 1,
+        stop=last_valid_exclusive,
+    )
+    horizon_end = keyframe_start if keyframe_start is not None else last_valid_exclusive
+    completed_start = _find_first_subsequence(
+        row_ids,
+        completed_marker_candidates,
+        start=horizon_start + 1,
+        stop=last_valid_exclusive,
+    )
     return TypedAttentionSpans(
         recent_source_start=recent_source_start,
         recent_source_end=recent_source_end,
         target_start=target_start,
+        current_objective_start=current_start,
+        horizon_objective_start=horizon_start,
+        horizon_objective_end=horizon_end,
         completed_objective_start=completed_start,
     )
 
