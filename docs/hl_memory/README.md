@@ -15,6 +15,7 @@ This folder contains the HL-memory pipeline and protocol notes split by topic.
 | [subtask_taxonomy.md](subtask_taxonomy.md) | 87-task fine subtask statistics and coarse atomic taxonomy |
 | [coarse_subtasks.md](coarse_subtasks.md) | Coarse label generation rules and commands |
 | [experiment_settings.md](experiment_settings.md) | Experiment matrix, current K086A settings, semantic judge notes |
+| [memory_shortcut_ablation.md](memory_shortcut_ablation.md) | Memory shortcut failure modes, tested findings, and recent-primary ablations |
 
 Backward-compatible top-level stubs:
 

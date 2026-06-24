@@ -96,6 +96,7 @@ Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 promp
 - `--target-protocol objective_prev_stage`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/previous_stage_objective`，prompt 额外输入 `previous_stage_objective`。用于测试模型是否能维护比 full memory 更轻的阶段状态。
 - `--target-protocol keyframe_gated_memory`：单 pass keyframe-gated target，监督 `current_objective/horizon_current_objective/keyframe_candidate_positions/completed_objective`。runtime 只在 `completed_objective` 非空且有 keyframe candidate 时更新 completed-event log。
 - `--target-protocol keyframe_gated_memory_two_pass`：two-pass typed target。训练时每个 sample 展开成 Pass A / Pass B 两条 VLM examples；Pass A 看 historical keyframes + 完整 recent window，只监督 current/horizon/keyframe proposal；Pass B 看 historical keyframes + candidate frames，只监督 canonical completed event，非 candidate recent frames 不进入 processor。训练时会对 GT proposal 做确定性位置扰动，并在 negative sample 上注入 false proposal，缩小 train/inference proposal exposure gap。Pass B prompt 不包含 GT current/horizon 文本。推理时 Pass A 无 candidate 会直接跳过 Pass B。
+- `--target-protocol keyframe_gated_memory_typed_mask`：仅 Qwen2.5-VL。保持 JSON 字段顺序不变，但 4D mask 会阻止 horizon target rows attend teacher-forced `current_objective` target field，同时阻止 completed rows 直接 attend recent visual tokens。Horizon 仍可看完整 prompt、historical memory 和 recent visual source，因此该 setting 用于测试 horizon 是否真正从视觉和状态上下文预测，而不是学习 `GT current -> GT horizon` 映射。Qwen3.5 不支持这条 4D mask 路径；需要严格隔离时使用独立 pass/head。
 - `--target-protocol known_prior_tracker`：监督 `current_objective/subtask_progress/should_advance_objective/keyframes`，用于已知 step prior 的状态机式对比实验；不建议作为当前主线。
 
 Keyframe candidate 默认使用 event-band 监督，而不是只在 coarse segment 末尾的单帧给正例：
@@ -109,6 +110,36 @@ Keyframe candidate 默认使用 event-band 监督，而不是只在 coarse segme
 - `--two-pass-predict-loss-weight 1.0 --two-pass-confirm-loss-weight 1.0`：先分别对每条 Pass A/Pass B target 的 token loss 求均值，再按 pass 权重聚合。这样较短的 completion JSON 不会被较长的 Pass A JSON 按 token 数稀释。
 
 `keyframe_label` 仍然是 canonical 单点，`keyframe_gated_memory.completed_objective` 也只在 canonical event 上非空；event band 只扩大 candidate proposal 的视觉监督，不会让 long-term memory 存入每个 band 帧。
+
+### Keyframe History Auxiliary Loss
+
+JSON token CE 只监督单个 recent window 的 `keyframe_candidate_positions`，不直接约束这些 proposals 经
+merge/dedup 后是否形成正确、紧凑的 historical keyframe list。可以启用训练期 auxiliary head，让同一个
+prompt hidden state额外预测：
+
+- recent clip 内的 keyframe position distribution；
+- 当前 window 是否命中 event band；
+- 本次 event 对 history state 的更新类型：`reject/add/duplicate`；
+- accepted timing 相对 canonical keyframe 的误差。
+
+生成协议、target JSON 和 rollout state machine 均不改变。Auxiliary head 从 assistant target 开始前的最后一个
+prompt hidden state读取特征，不读取 teacher-forced GT JSON。推荐起始配置：
+
+```bash
+  --keyframe-aux-position-loss-weight 0.5 \
+  --keyframe-aux-event-loss-weight 0.5 \
+  --keyframe-aux-timing-loss-weight 0.1 \
+  --keyframe-aux-update-loss-weight 0.5 \
+  --keyframe-aux-hidden-dim 512 \
+  --keyframe-aux-timing-sigma-sec 0.5 \
+  --keyframe-positive-sample-ratio 0.4
+```
+
+总 loss 为 language JSON CE 加四个加权 auxiliary losses。WandB 会记录
+`loss_aux_position/event/timing/update/total` 和 `loss_language`。Position target 以 canonical frame 为中心
+生成距离 soft label；history update target 根据当前 GT historical memory 判定 `reject/add/duplicate`。
+Checkpoint 额外保存 `hl_keyframe_auxiliary.pt` 和 `hl_keyframe_auxiliary_config.json`。所有 auxiliary weight
+保持 `0` 时完全禁用，不增加 hidden-state 输出和训练开销。
 
 采样按每个 source sample 独立做概率选择，不按 microbatch 内数量取整。这个区别在
 `batch_size=1` 时尤其重要：旧的 `round(batch_size * 0.4)` 会退化成 100% positive；
