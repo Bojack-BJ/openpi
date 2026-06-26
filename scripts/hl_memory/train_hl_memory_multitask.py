@@ -105,6 +105,7 @@ class TrainArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    typed_mask_suppress_language_memory: bool = False
     proprio_enabled: bool = False
     proprio_token_mode: str = "per_frame_plus_summary"
     proprio_state_dim: int = 14
@@ -128,13 +129,16 @@ class TrainArgs:
     keyframe_aux_event_pos_weight: float = 1.0
     field_current_objective_loss_weight: float = 1.0
     field_horizon_objective_loss_weight: float = 1.0
+    field_keyframe_candidate_positions_loss_weight: float = 0.1
     field_completed_objective_loss_weight: float = 1.0
+    field_template_loss_weight: float = 0.1
     progress_condition_enabled: bool = False
     progress_condition_input_mode: str = "completed_only"
     progress_condition_dim: int = 128
     progress_condition_hidden_dim: int = 512
     progress_condition_dropout: float = 0.3
     progress_condition_predict_strength: float = 0.5
+    progress_condition_horizon_strength: float | None = None
     progress_condition_confirm_strength: float = 1.0
     state_condition_enabled: bool = False
     state_condition_mode: str = "film"
@@ -179,6 +183,14 @@ class TrainArgs:
 
 
 def _keyframe_auxiliary_enabled(args: TrainArgs) -> bool:
+    supported_protocols = {
+        "memer_objective",
+        "subtask_keyframe",
+        "keyframe_gated_memory",
+        "keyframe_gated_memory_typed_mask",
+        "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
+    }
     weights = (
         args.keyframe_aux_position_loss_weight,
         args.keyframe_aux_event_loss_weight,
@@ -187,6 +199,8 @@ def _keyframe_auxiliary_enabled(args: TrainArgs) -> bool:
     )
     if any(weight < 0.0 for weight in weights):
         raise ValueError("Keyframe auxiliary loss weights must be non-negative.")
+    if args.target_protocol not in supported_protocols:
+        return False
     return any(weight > 0.0 for weight in weights)
 
 
@@ -265,6 +279,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        typed_mask_suppress_language_memory=args.typed_mask_suppress_language_memory,
         proprio_enabled=args.proprio_enabled,
         proprio_token_mode=args.proprio_token_mode,
         proprio_state_dim=args.proprio_state_dim,
@@ -284,6 +299,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         progress_condition_hidden_dim=args.progress_condition_hidden_dim,
         progress_condition_dropout=args.progress_condition_dropout,
         progress_condition_predict_strength=args.progress_condition_predict_strength,
+        progress_condition_horizon_strength=args.progress_condition_horizon_strength,
         progress_condition_confirm_strength=args.progress_condition_confirm_strength,
         state_condition_enabled=args.state_condition_enabled,
         state_condition_mode=args.state_condition_mode,
@@ -446,7 +462,9 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                             keyframe_aux_event_pos_weight=args.keyframe_aux_event_pos_weight,
                             field_current_objective_weight=args.field_current_objective_loss_weight,
                             field_horizon_objective_weight=args.field_horizon_objective_loss_weight,
+                            field_keyframe_candidate_positions_weight=args.field_keyframe_candidate_positions_loss_weight,
                             field_completed_objective_weight=args.field_completed_objective_loss_weight,
+                            field_template_weight=args.field_template_loss_weight,
                         )
                         _accumulate_loss_metrics(
                             step_loss_metrics,
@@ -581,7 +599,9 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     keyframe_aux_event_pos_weight=args.keyframe_aux_event_pos_weight,
                     field_current_objective_loss_weight=args.field_current_objective_loss_weight,
                     field_horizon_objective_loss_weight=args.field_horizon_objective_loss_weight,
+                    field_keyframe_candidate_positions_loss_weight=args.field_keyframe_candidate_positions_loss_weight,
                     field_completed_objective_loss_weight=args.field_completed_objective_loss_weight,
+                    field_template_loss_weight=args.field_template_loss_weight,
                 )
                 logged_val_metrics = (
                     _mean_metric_dict_across_ranks(val_metrics, device=device) if distributed else val_metrics
@@ -1153,7 +1173,9 @@ def _evaluate_loss(
     keyframe_aux_event_pos_weight: float,
     field_current_objective_loss_weight: float,
     field_horizon_objective_loss_weight: float,
+    field_keyframe_candidate_positions_loss_weight: float,
     field_completed_objective_loss_weight: float,
+    field_template_loss_weight: float,
 ) -> dict[str, float]:
     if num_batches <= 0:
         raise ValueError("--val-batches must be positive when validation is enabled.")
@@ -1190,7 +1212,9 @@ def _evaluate_loss(
                     keyframe_aux_event_pos_weight=keyframe_aux_event_pos_weight,
                     field_current_objective_weight=field_current_objective_loss_weight,
                     field_horizon_objective_weight=field_horizon_objective_loss_weight,
+                    field_keyframe_candidate_positions_weight=field_keyframe_candidate_positions_loss_weight,
                     field_completed_objective_weight=field_completed_objective_loss_weight,
+                    field_template_weight=field_template_loss_weight,
                 )
                 loss_value = float(loss.detach().cpu())
                 if not math.isfinite(loss_value):

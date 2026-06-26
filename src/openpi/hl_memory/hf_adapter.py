@@ -16,7 +16,6 @@ from PIL import Image
 
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.conditioning import build_conditioning_batch
-from openpi.hl_memory.conditioning import CONDITIONING_STATE_FILENAME
 from openpi.hl_memory.conditioning import configure_conditioning_model
 from openpi.hl_memory.conditioning import HL_CONDITION_STAGE_IDS_KEY
 from openpi.hl_memory.conditioning import STAGE_CONFIRM
@@ -39,6 +38,7 @@ from openpi.hl_memory.schema import HLMemoryPrediction
 from openpi.hl_memory.schema import render_language_memory_fields
 from openpi.hl_memory.typed_attention import build_qwen25_typed_attention_mask
 from openpi.hl_memory.training_loss import HL_FIELD_IDS_KEY
+from openpi.hl_memory.training_loss import HL_FIELD_VALUE_MASK_KEY
 from openpi.hl_memory.training_loss import HL_LOSS_FIELD_IDS_BY_NAME
 
 
@@ -110,7 +110,7 @@ class BaseHLVLMAdapter:
             model = self._load_peft_model(transformers, peft_adapter_path, torch_dtype=torch_dtype)
         configure_model_for_proprio(model, processor, self.config)
         load_proprio_state_if_available(model, pathlib.Path(pretrained_path))
-        if (pathlib.Path(pretrained_path) / CONDITIONING_STATE_FILENAME).is_file():
+        if self.config.progress_condition_enabled or self.config.state_condition_enabled:
             model = configure_conditioning_model(model, self.config, checkpoint_dir=pathlib.Path(pretrained_path))
         logging.info("[stage] model weights loaded in %.1fs", time.perf_counter() - model_started_at)
         if self._uses_parallel_model_loading():
@@ -151,13 +151,15 @@ class BaseHLVLMAdapter:
             if isinstance(value, torch.Tensor)
         }
         tensors["labels"] = labels.to(input_device)
-        field_ids = _build_batched_field_ids(
+        field_annotations = _build_batched_field_annotations(
             tokenizer=getattr(loaded.processor, "tokenizer", loaded.processor),
             labels=labels,
             target_texts=(self.build_target_text(sample),),
         )
-        if field_ids is not None:
+        if field_annotations is not None:
+            field_ids, field_value_mask = field_annotations
             tensors[HL_FIELD_IDS_KEY] = field_ids.to(input_device)
+            tensors[HL_FIELD_VALUE_MASK_KEY] = field_value_mask.to(input_device)
         self._add_keyframe_auxiliary_targets(tensors, [sample], labels=labels, device=input_device)
         self._apply_typed_training_mask(
             loaded,
@@ -217,13 +219,15 @@ class BaseHLVLMAdapter:
         }
         tensors["labels"] = labels.to(input_device)
         target_texts = self._training_target_texts(samples, clips, apply_two_pass_training_noise=apply_proposal_noise)
-        field_ids = _build_batched_field_ids(
+        field_annotations = _build_batched_field_annotations(
             tokenizer=getattr(loaded.processor, "tokenizer", loaded.processor),
             labels=labels,
             target_texts=target_texts,
         )
-        if field_ids is not None:
+        if field_annotations is not None:
+            field_ids, field_value_mask = field_annotations
             tensors[HL_FIELD_IDS_KEY] = field_ids.to(input_device)
+            tensors[HL_FIELD_VALUE_MASK_KEY] = field_value_mask.to(input_device)
         self._add_keyframe_auxiliary_targets(tensors, samples, labels=labels, device=input_device)
         self._apply_typed_training_mask(
             loaded,
@@ -900,7 +904,7 @@ class BaseHLVLMAdapter:
         )
         indices = _valid_candidate_indices(
             prediction.keyframe_candidate_positions,
-            sample.recent_valid_length,
+            _sample_recent_indexable_length(sample),
         )
         return dataclasses.replace(
             sample,
@@ -1286,7 +1290,11 @@ class BaseHLVLMAdapter:
             if self.config.enable_thinking
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
-        completed_event_log = sample.language_memory.strip() or "No accepted completed event yet."
+        completed_event_log = (
+            "No accepted completed event yet."
+            if self.config.typed_mask_suppress_language_memory and self.config.target_protocol == _TYPED_MASK_PROTOCOL
+            else sample.language_memory.strip() or "No accepted completed event yet."
+        )
         return (
             "You receive two ordered video clips.\n"
             "The first clip contains accepted historical keyframes from earlier in the episode.\n"
@@ -1429,6 +1437,7 @@ class BaseHLVLMAdapter:
             "approaching or in progress. If the evidence is ambiguous, output an empty completed objective.\n"
             f"The candidate evidence clip has {clips.recent_valid_length} valid proposed frames.\n"
             "Return exactly one JSON object with the single key `completed_objective`.\n"
+            "Use an empty string for no completed event; never output null.\n"
             "`completed_objective` must be empty unless the recent window contains a visually confirmed completed event "
             "represented by the candidate keyframe(s). Do not invent the next step.\n"
             f"{thinking_instruction}"
@@ -2327,6 +2336,8 @@ def _parse_completed_objective_text(text: str) -> str:
     if set(data) != {"completed_objective"}:
         raise ValueError("Pass B output must contain exactly the `completed_objective` key.")
     objective = data["completed_objective"]
+    if objective is None:
+        return ""
     if not isinstance(objective, str):
         raise ValueError("Pass B `completed_objective` must be a string.")
     return objective.strip()
@@ -2379,6 +2390,16 @@ def _build_batched_field_ids(
     labels: torch.Tensor,
     target_texts: tuple[str, ...],
 ) -> torch.Tensor | None:
+    annotations = _build_batched_field_annotations(tokenizer=tokenizer, labels=labels, target_texts=target_texts)
+    return None if annotations is None else annotations[0]
+
+
+def _build_batched_field_annotations(
+    *,
+    tokenizer: Any,
+    labels: torch.Tensor,
+    target_texts: tuple[str, ...],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
     if labels.shape[0] != len(target_texts):
         logging.warning(
             "Skipping HL field loss breakdown: labels rows=%d target_texts=%d.",
@@ -2387,11 +2408,14 @@ def _build_batched_field_ids(
         )
         return None
     rows: list[torch.Tensor] = []
+    value_rows: list[torch.Tensor] = []
     for row_index, target_text in enumerate(target_texts):
         row_field_ids = torch.full((labels.shape[1],), -1, dtype=torch.long)
-        target_field_ids = _target_text_field_ids(tokenizer, target_text)
-        if target_field_ids is None:
+        row_value_mask = torch.zeros((labels.shape[1],), dtype=torch.bool)
+        target_field_annotations = _target_text_field_ids_and_value_mask(tokenizer, target_text)
+        if target_field_annotations is None:
             return None
+        target_field_ids, target_value_mask = target_field_annotations
         supervised_positions = torch.nonzero(labels[row_index] != -100, as_tuple=False).flatten().cpu()
         target_token_ids = _target_text_token_ids(tokenizer, target_text)
         if target_token_ids is None:
@@ -2419,8 +2443,13 @@ def _build_batched_field_ids(
                 target_field_ids[:assign_count],
                 dtype=torch.long,
             )
+            row_value_mask[supervised_positions[:assign_count]] = torch.as_tensor(
+                target_value_mask[:assign_count],
+                dtype=torch.bool,
+            )
         rows.append(row_field_ids)
-    return torch.stack(rows, dim=0)
+        value_rows.append(row_value_mask)
+    return torch.stack(rows, dim=0), torch.stack(value_rows, dim=0)
 
 
 def _target_text_token_ids(tokenizer: Any, target_text: str) -> list[int] | None:
@@ -2518,9 +2547,14 @@ def _keyframe_auxiliary_targets_for_sample(
 
 
 def _target_text_field_ids(tokenizer: Any, target_text: str) -> list[int] | None:
+    annotations = _target_text_field_ids_and_value_mask(tokenizer, target_text)
+    return None if annotations is None else annotations[0]
+
+
+def _target_text_field_ids_and_value_mask(tokenizer: Any, target_text: str) -> tuple[list[int], list[bool]] | None:
     field_spans = _target_text_field_char_spans(target_text)
     if not field_spans:
-        return []
+        return [], []
     try:
         encoded = tokenizer(
             target_text,
@@ -2540,13 +2574,17 @@ def _target_text_field_ids(tokenizer: Any, target_text: str) -> list[int] | None
     if offsets and isinstance(offsets[0], list) and offsets[0] and isinstance(offsets[0][0], (list, tuple)):
         offsets = offsets[0]
     field_ids: list[int] = []
+    token_offsets: list[tuple[int, int]] = []
     for offset in offsets:
         if isinstance(offset, torch.Tensor):
             start, end = (int(value) for value in offset.tolist())
         else:
             start, end = int(offset[0]), int(offset[1])
+        token_offsets.append((start, end))
         field_ids.append(_field_id_for_char_range(start, end, field_spans))
-    return field_ids
+    value_spans = _target_text_field_value_char_spans(target_text)
+    value_mask = [_char_range_overlaps_spans(start, end, value_spans) for start, end in token_offsets]
+    return field_ids, value_mask
 
 
 def _target_text_field_char_spans(target_text: str) -> list[tuple[int, int, int]]:
@@ -2566,6 +2604,23 @@ def _target_text_field_char_spans(target_text: str) -> list[tuple[int, int, int]
     return spans
 
 
+def _target_text_field_value_char_spans(target_text: str) -> list[tuple[int, int, int]]:
+    spans: list[tuple[int, int, int]] = []
+    for field_start, field_end, field_id in _target_text_field_char_spans(target_text):
+        colon = target_text.find(":", field_start, field_end)
+        if colon < 0:
+            continue
+        value_start = colon + 1
+        while value_start < field_end and target_text[value_start].isspace():
+            value_start += 1
+        value_end = field_end
+        while value_end > value_start and target_text[value_end - 1] in " \n\r\t,":
+            value_end -= 1
+        if value_end > value_start:
+            spans.append((value_start, value_end, field_id))
+    return spans
+
+
 def _field_id_for_char_range(start: int, end: int, spans: list[tuple[int, int, int]]) -> int:
     if end <= start:
         return -1
@@ -2573,6 +2628,12 @@ def _field_id_for_char_range(start: int, end: int, spans: list[tuple[int, int, i
         if start < span_end and end > span_start:
             return field_id
     return -1
+
+
+def _char_range_overlaps_spans(start: int, end: int, spans: list[tuple[int, int, int]]) -> bool:
+    if end <= start:
+        return False
+    return any(start < span_end and end > span_start for span_start, span_end, _ in spans)
 
 
 def _as_peft_adapter_path(pretrained_path: str) -> pathlib.Path | None:
@@ -2830,6 +2891,23 @@ def _valid_candidate_indices(candidate_positions: tuple[int, ...], valid_length:
         if 0 <= int(position) - 1 < valid_length
     }
     return sorted(selected_indices)
+
+
+def _sample_recent_indexable_length(sample: ExportedHLMemorySample) -> int:
+    """Return the valid recent-frame prefix that can be safely sliced from sample metadata."""
+
+    lengths = [
+        max(int(sample.recent_valid_length), 0),
+        len(sample.recent_frame_paths),
+        len(sample.recent_frame_indices),
+    ]
+    if sample.recent_robot_states:
+        lengths.append(len(sample.recent_robot_states))
+    if sample.recent_robot_state_masks:
+        lengths.append(len(sample.recent_robot_state_masks))
+    if sample.recent_object_center_points:
+        lengths.append(len(sample.recent_object_center_points))
+    return min(lengths)
 
 
 def _stable_unit_interval(value: str) -> float:

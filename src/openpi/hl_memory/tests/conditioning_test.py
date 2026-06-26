@@ -8,6 +8,10 @@ from openpi.hl_memory.conditioning import HL_PROGRESS_ATTENTION_MASK_KEY
 from openpi.hl_memory.conditioning import HL_PROGRESS_INPUT_IDS_KEY
 from openpi.hl_memory.conditioning import HL_STATE_MASKS_KEY
 from openpi.hl_memory.conditioning import HL_STATE_VALUES_KEY
+from openpi.hl_memory.conditioning import STAGE_CONFIRM
+from openpi.hl_memory.conditioning import STAGE_HORIZON
+from openpi.hl_memory.conditioning import STAGE_PREDICT
+from openpi.hl_memory.conditioning import _stage_strengths
 from openpi.hl_memory.config import HLMemoryConfig
 
 
@@ -60,3 +64,17 @@ def test_conditioning_wrapper_accepts_progress_and_state_inputs():
     )
 
     assert outputs.logits.shape == (1, 3, 32)
+
+
+def test_stage_strengths_use_explicit_horizon_strength():
+    strengths = _stage_strengths(
+        torch.tensor([STAGE_PREDICT, STAGE_HORIZON, STAGE_CONFIRM]),
+        batch_size=3,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        predict_strength=0.25,
+        horizon_strength=0.5,
+        confirm_strength=1.0,
+    )
+
+    assert strengths.tolist() == [0.25, 0.5, 1.0]

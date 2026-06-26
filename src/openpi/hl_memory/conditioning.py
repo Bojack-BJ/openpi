@@ -144,6 +144,9 @@ class HLConditioningModel(torch.nn.Module):
     def get_output_embeddings(self):
         return self.base_model.get_output_embeddings()
 
+    def prepare_inputs_for_generation(self, *args, **kwargs):
+        return self.base_model.prepare_inputs_for_generation(*args, **kwargs)
+
     def resize_token_embeddings(self, *args, **kwargs):
         return self.base_model.resize_token_embeddings(*args, **kwargs)
 
@@ -222,6 +225,7 @@ class HLConditioningModel(torch.nn.Module):
                 device=hidden.device,
                 dtype=condition.dtype,
                 predict_strength=self.hl_config.progress_condition_predict_strength,
+                horizon_strength=self.hl_config.progress_condition_horizon_strength,
                 confirm_strength=self.hl_config.progress_condition_confirm_strength,
             )
             condition = condition * strength.unsqueeze(-1)
@@ -294,6 +298,7 @@ def save_conditioning_state_if_available(
         "progress_condition_hidden_dim": config.progress_condition_hidden_dim,
         "progress_condition_dropout": config.progress_condition_dropout,
         "progress_condition_predict_strength": config.progress_condition_predict_strength,
+        "progress_condition_horizon_strength": config.progress_condition_horizon_strength,
         "progress_condition_confirm_strength": config.progress_condition_confirm_strength,
         "state_condition_enabled": config.state_condition_enabled,
         "state_condition_mode": config.state_condition_mode,
@@ -404,6 +409,7 @@ def _stage_strengths(
     device: torch.device,
     dtype: torch.dtype,
     predict_strength: float,
+    horizon_strength: float,
     confirm_strength: float,
 ) -> torch.Tensor:
     if stage_ids is None:
@@ -411,10 +417,13 @@ def _stage_strengths(
     stage_ids = stage_ids.to(device=device)
     if stage_ids.shape != (batch_size,):
         raise ValueError(f"Expected condition stage ids shape {(batch_size,)}, got {tuple(stage_ids.shape)}.")
+    predict = torch.as_tensor(predict_strength, device=device, dtype=dtype)
+    horizon = torch.as_tensor(horizon_strength, device=device, dtype=dtype)
+    confirm = torch.as_tensor(confirm_strength, device=device, dtype=dtype)
     return torch.where(
         stage_ids == STAGE_CONFIRM,
-        torch.as_tensor(confirm_strength, device=device, dtype=dtype),
-        torch.as_tensor(predict_strength, device=device, dtype=dtype),
+        confirm,
+        torch.where(stage_ids == STAGE_HORIZON, horizon, predict),
     )
 
 

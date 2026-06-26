@@ -85,6 +85,30 @@ def test_typed_mask_blocks_recent_bridge_and_field_shortcuts():
     assert additive_mask[0, 0, 13, 14] == blocked
 
 
+def test_typed_mask_reports_missing_span_when_field_tokens_do_not_match():
+    input_ids = torch.tensor([[1, 10, 11, 12, 2, 10, 11, 12, 3, 20, 50, 21, 51]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = torch.full_like(input_ids, -100)
+    labels[:, 9:] = input_ids[:, 9:]
+
+    class _MissingFieldTokenizer(_FakeTokenizer):
+        def encode(self, text: str, *, add_special_tokens: bool) -> list[int]:
+            if text in {'"current_objective"', "current_objective"}:
+                return [998]
+            return super().encode(text, add_special_tokens=add_special_tokens)
+
+    additive_mask, spans = build_qwen25_typed_attention_mask(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=labels,
+        tokenizer=_MissingFieldTokenizer(),
+        dtype=torch.float32,
+    )
+
+    assert spans == (None,)
+    assert additive_mask.shape == (1, 1, input_ids.shape[1], input_ids.shape[1])
+
+
 def test_generation_mask_activates_horizon_before_completed_field_is_generated():
     tokenizer = _FakeTokenizer()
     prompt_ids = [1, 10, 11, 12, 2, 10, 11, 12, 3]

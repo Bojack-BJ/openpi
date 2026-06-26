@@ -149,6 +149,7 @@ class ZeroShotArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    typed_mask_suppress_language_memory: bool = False
     proprio_enabled: bool = False
     proprio_token_mode: str = "per_frame_plus_summary"
     proprio_state_dim: int = 14
@@ -161,6 +162,7 @@ class ZeroShotArgs:
     progress_condition_hidden_dim: int = 512
     progress_condition_dropout: float = 0.3
     progress_condition_predict_strength: float = 0.5
+    progress_condition_horizon_strength: float | None = None
     progress_condition_confirm_strength: float = 1.0
     state_condition_enabled: bool = False
     state_condition_mode: str = "film"
@@ -229,6 +231,7 @@ def main(args: ZeroShotArgs) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        typed_mask_suppress_language_memory=args.typed_mask_suppress_language_memory,
         proprio_enabled=args.proprio_enabled,
         proprio_token_mode=args.proprio_token_mode,
         proprio_state_dim=args.proprio_state_dim,
@@ -241,6 +244,7 @@ def main(args: ZeroShotArgs) -> None:
         progress_condition_hidden_dim=args.progress_condition_hidden_dim,
         progress_condition_dropout=args.progress_condition_dropout,
         progress_condition_predict_strength=args.progress_condition_predict_strength,
+        progress_condition_horizon_strength=args.progress_condition_horizon_strength,
         progress_condition_confirm_strength=args.progress_condition_confirm_strength,
         state_condition_enabled=args.state_condition_enabled,
         state_condition_mode=args.state_condition_mode,

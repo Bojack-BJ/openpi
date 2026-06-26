@@ -1,11 +1,14 @@
 import dataclasses
 import inspect
 import json
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
+import torch
 
 from openpi.hl_memory.config import HLMemoryConfig
+from openpi.hl_memory.conditioning import find_conditioning_model
 from openpi.hl_memory.conditioning import render_progress_condition_text
 from openpi.hl_memory.data import ExportedHLMemorySample
 from openpi.hl_memory.data import LoadedVideoClips
@@ -14,6 +17,7 @@ from openpi.hl_memory.hf_adapter import Qwen25HLAdapter
 from openpi.hl_memory.hf_adapter import Qwen3VLHLAdapter
 from openpi.hl_memory.hf_adapter import create_hf_adapter
 from openpi.hl_memory.hf_adapter import _candidate_evidence_clips
+from openpi.hl_memory.hf_adapter import _build_batched_field_annotations
 from openpi.hl_memory.hf_adapter import _build_batched_field_ids
 from openpi.hl_memory.hf_adapter import _keyframe_auxiliary_targets_for_sample
 from openpi.hl_memory.hf_adapter import _parse_completed_objective_text
@@ -28,6 +32,55 @@ def test_create_hf_adapter_routes_qwen3_vl_backend():
     adapter = create_hf_adapter(HLMemoryConfig(vlm_backend="qwen3_vl"))
 
     assert isinstance(adapter, Qwen3VLHLAdapter)
+
+
+class _TinyLoadModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(hidden_size=8)
+        self.embed_tokens = torch.nn.Embedding(32, 8)
+        self.model = torch.nn.Module()
+        self.model.norm = torch.nn.LayerNorm(8)
+        self.lm_head = torch.nn.Linear(8, 32)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def forward(self, input_ids):
+        return SimpleNamespace(logits=self.lm_head(self.model.norm(self.embed_tokens(input_ids))))
+
+
+def test_load_wraps_conditioning_when_enabled_without_conditioning_checkpoint(monkeypatch, tmp_path):
+    model = _TinyLoadModel()
+
+    class _FakeAutoProcessor:
+        @staticmethod
+        def from_pretrained(*_args, **_kwargs):
+            return SimpleNamespace(tokenizer=SimpleNamespace(padding_side="right"))
+
+    class _FakeTransformers:
+        AutoProcessor = _FakeAutoProcessor
+
+    class _TinyAdapter(Qwen25HLAdapter):
+        def _load_model(self, transformers, pretrained_path, *, torch_dtype):
+            del transformers, pretrained_path, torch_dtype
+            return model
+
+    monkeypatch.setattr("openpi.hl_memory.hf_adapter._import_transformers", lambda: _FakeTransformers)
+    config = HLMemoryConfig(
+        vlm_backend="qwen3_5_vl",
+        target_protocol="memer_film_progress_two_pass",
+        vlm_hf_model_id=str(tmp_path),
+        precision="float32",
+        progress_condition_enabled=True,
+    )
+
+    loaded = _TinyAdapter(config).load(device="cpu")
+
+    assert find_conditioning_model(loaded.model) is not None
 
 
 class _CharOffsetTokenizer:
@@ -106,6 +159,37 @@ def test_field_ids_allow_chat_template_suffix_tokens():
     assert field_ids[0, 0].item() == -1
     assert field_ids[0, -1].item() == -1
     assert bool((field_ids[0, 1:-1] != -1).any())
+
+
+def test_field_annotations_mark_only_json_values():
+    import torch
+
+    target_text = '{"current_objective":"pick","keyframe_candidate_positions":[2]}'
+    target_ids = [ord(char) for char in target_text]
+    labels = torch.tensor([[-100, *target_ids]], dtype=torch.long)
+
+    annotations = _build_batched_field_annotations(
+        tokenizer=_CharOffsetTokenizer(),
+        labels=labels,
+        target_texts=(target_text,),
+    )
+
+    assert annotations is not None
+    field_ids, value_mask = annotations
+    value_chars = {
+        chr(target_ids[index])
+        for index, is_value in enumerate(value_mask[0, 1:].tolist())
+        if is_value
+    }
+    template_chars = {
+        chr(target_ids[index])
+        for index, field_id in enumerate(field_ids[0, 1:].tolist())
+        if field_id != -1 and not value_mask[0, index + 1].item()
+    }
+    assert "p" in value_chars
+    assert "2" in value_chars
+    assert ":" not in value_chars
+    assert ":" in template_chars
 
 
 def test_field_ids_skip_when_supervised_tokens_do_not_match_target_text(caplog):
@@ -334,6 +418,50 @@ def test_keyframe_gated_memory_prompt_uses_completed_event_log_without_free_memo
     assert "must not be prompted as target" not in prompt
 
 
+def test_typed_mask_can_suppress_language_memory_for_no_raw_memory_ablation():
+    sample = ExportedHLMemorySample(
+        sample_id="sample",
+        episode_index=0,
+        step_index=0,
+        frame_index=0,
+        instruction="task",
+        language_memory="Completed events: shortcut text.",
+        updated_language_memory="",
+        current_subtask="place toast",
+        phase="place toast",
+        target_query="",
+        goal_query="",
+        keyframe_candidate_positions=(2,),
+        memory_frame_paths=(),
+        memory_frame_indices=(),
+        memory_valid_length=0,
+        recent_frame_paths=("recent.png",),
+        recent_frame_indices=(0,),
+        recent_valid_length=1,
+        current_objective="place toast",
+    )
+    clips = LoadedVideoClips(
+        memory_frames=(),
+        recent_frames=(object(),),
+        memory_valid_length=0,
+        recent_valid_length=1,
+    )
+    default_prompt = Qwen25HLAdapter(
+        HLMemoryConfig(vlm_backend="qwen2_5_vl", target_protocol="keyframe_gated_memory_typed_mask")
+    ).build_prompt(sample, clips)
+    suppressed_prompt = Qwen25HLAdapter(
+        HLMemoryConfig(
+            vlm_backend="qwen2_5_vl",
+            target_protocol="keyframe_gated_memory_typed_mask",
+            typed_mask_suppress_language_memory=True,
+        )
+    ).build_prompt(sample, clips)
+
+    assert "Completed-event log: Completed events: shortcut text." in default_prompt
+    assert "shortcut text" not in suppressed_prompt
+    assert "Completed-event log: No accepted completed event yet." in suppressed_prompt
+
+
 def test_keyframe_gated_two_pass_targets_are_typed():
     adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="keyframe_gated_memory_two_pass"))
     sample = ExportedHLMemorySample(
@@ -532,6 +660,7 @@ def test_two_pass_skips_confirm_generation_when_pass_a_has_no_candidates():
 
 def test_two_pass_completed_objective_parser_distinguishes_invalid_json_from_empty_negative():
     assert _parse_completed_objective_text('{"completed_objective":""}') == ""
+    assert _parse_completed_objective_text('{"completed_objective":null}') == ""
     with pytest.raises(ValueError, match="No JSON"):
         _parse_completed_objective_text("not json")
     with pytest.raises(ValueError, match="exactly"):

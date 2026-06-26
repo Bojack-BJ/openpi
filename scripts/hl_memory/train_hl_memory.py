@@ -50,6 +50,7 @@ class TrainArgs:
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
     target_protocol: str = "hl_v1"
+    typed_mask_suppress_language_memory: bool = False
     proprio_enabled: bool = False
     proprio_token_mode: str = "per_frame_plus_summary"
     proprio_state_dim: int = 14
@@ -144,6 +145,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         device_map=args.device_map,
         tensor_parallel_plan=args.tensor_parallel_plan,
         target_protocol=args.target_protocol,
+        typed_mask_suppress_language_memory=args.typed_mask_suppress_language_memory,
         proprio_enabled=args.proprio_enabled,
         proprio_token_mode=args.proprio_token_mode,
         proprio_state_dim=args.proprio_state_dim,

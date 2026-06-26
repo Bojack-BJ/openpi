@@ -111,13 +111,69 @@ Recommended training flags for this protocol:
 --state-condition-enabled \
 --state-condition-mode film \
 --state-condition-dim 128 \
---keyframe-aux-event-pos-weight 3.0 \
 --field-current-objective-loss-weight 1.5 \
 --field-horizon-objective-loss-weight 1.2 \
+--field-template-loss-weight 0.1 \
+--field-keyframe-candidate-positions-loss-weight 0.1 \
 --field-completed-objective-loss-weight 1.0
 ```
 
 Use `--progress-condition-input-mode full` only as an ablation. It can still encode answer priors if the memory text contains current-like fields.
+
+### Current FiLM Settings
+
+The current Qwen3.5 two-pass experiments use the same output protocol and differ only in how non-visual context is routed. All three settings keep raw completed-event log / language memory out of the Pass A prompt for `current_objective`, `horizon_current_objective`, and `keyframe_candidate_positions`.
+
+| Setting | Prompt input | FiLM / adapter input | Purpose |
+| --- | --- | --- | --- |
+| `recent_only` | Recent RGB clip + task instruction | none | Grounding baseline; tests whether recent video alone can recover the current phase. |
+| `progress_film` | Recent RGB clip + task instruction | compact completed-only progress state | Tests whether low-bandwidth memory prior improves ordering without raw text shortcut. |
+| `state_film` | Recent RGB clip + task instruction | continuous recent robot state / proprio vector | Tests whether low-level state helps visual grounding without textifying numbers. |
+
+`progress_film` should use `--progress-condition-input-mode completed_only` by default. It may include runtime-maintainable completed objectives or maintained summary state, but must not consume GT `current_subtask`, GT `phase`, GT `task_progress`, or GT current objective.
+
+`state_film` uses the state/proprio encoder as a continuous side channel. It should be compared against the older proprio-as-text/soft-token runs because the intended benefit is a shorter numeric path:
+
+```text
+state vector -> MLP -> FiLM -> field decoder
+```
+
+instead of:
+
+```text
+state numbers -> tokenizer/text tokens -> language model -> output tokens
+```
+
+The next natural ablation is `state_progress_film`, but it should be run after `recent_only`, `progress_film`, and `state_film` establish whether each side channel helps independently.
+
+### Keyframe Prediction Path
+
+The current preferred path is to let the VLM generate `keyframe_candidate_positions` in JSON and rebalance the JSON token loss:
+
+- JSON key/template tokens such as `"keyframe_candidate_positions":`, punctuation, brackets, commas, and field names get low template weight.
+- JSON value tokens inside each field get the field-specific weight.
+- `keyframe_candidate_positions` value tokens can therefore be trained without over-weighting repeated template syntax.
+
+This is preferable to relying on the first auxiliary head version as the main keyframe path. The auxiliary head is useful as a diagnostic, but it is intentionally shallow:
+
+```text
+final language hidden at anchor token -> LayerNorm -> Linear -> SiLU -> position/event/update heads
+```
+
+The anchor token is the token immediately before the assistant target starts. In code this is computed as `first supervised target token index - 1`. The hidden state comes from Qwen's final language-model norm, i.e. the final normalization layer of the text decoder stack before `lm_head`, not from the vision tower. This anchor sees the encoded prompt and video context, but it is still only one pooled text-position representation. If that representation does not preserve keyframe-local evidence, a small MLP head cannot recover it.
+
+For this reason, the default training path should keep auxiliary keyframe losses off unless explicitly testing the aux head:
+
+```bash
+--keyframe-aux-position-loss-weight 0.0 \
+--keyframe-aux-event-loss-weight 0.0 \
+--keyframe-aux-timing-loss-weight 0.0 \
+--keyframe-aux-update-loss-weight 0.0 \
+--field-template-loss-weight 0.1 \
+--field-keyframe-candidate-positions-loss-weight 0.1
+```
+
+If the aux head is revisited, it should be treated as a recall-oriented auxiliary regularizer, not a replacement for VLM JSON selection. Required improvements would be soft event targets / focal loss, stronger positive weighting, and top-K recall metrics instead of thresholding the event head into an empty prediction.
 
 Add a target protocol variant that predicts visual grounding before the objective, for example:
 

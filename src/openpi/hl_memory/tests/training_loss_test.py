@@ -5,6 +5,8 @@ import torch
 
 from openpi.hl_memory.training_loss import compute_hl_target_loss
 from openpi.hl_memory.training_loss import compute_hl_target_loss_with_metrics
+from openpi.hl_memory.training_loss import HL_FIELD_IDS_KEY
+from openpi.hl_memory.training_loss import HL_FIELD_VALUE_MASK_KEY
 from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_ANCHOR_POSITIONS_KEY
 from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_CANONICAL_POSITIONS_KEY
 from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_EVENT_TARGETS_KEY
@@ -75,6 +77,28 @@ def test_two_pass_loss_averages_each_stage_before_weighting():
     )
 
     assert loss.item() == pytest.approx(((expected_predict + 2 * expected_confirm) / 3).item())
+
+
+def test_field_loss_downweights_template_tokens_only():
+    logits = torch.tensor([[[0.0, 0.0], [0.0, 2.0], [2.0, 0.0]]])
+    labels = torch.tensor([[-100, 0, 1]])
+    inputs = {
+        "input_ids": torch.zeros_like(labels),
+        "labels": labels,
+        HL_FIELD_IDS_KEY: torch.tensor([[-1, 1, 1]]),
+        HL_FIELD_VALUE_MASK_KEY: torch.tensor([[False, False, True]]),
+    }
+    template_loss = torch.nn.functional.cross_entropy(logits[:, :1].reshape(-1, 2), torch.tensor([0]))
+    value_loss = torch.nn.functional.cross_entropy(logits[:, 1:2].reshape(-1, 2), torch.tensor([1]))
+
+    loss = compute_hl_target_loss(
+        _FixedLogitModel(logits),
+        inputs,
+        field_current_objective_weight=1.0,
+        field_template_weight=0.1,
+    )
+
+    assert loss.item() == pytest.approx(((0.1 * template_loss + value_loss) / 1.1).item())
 
 
 def test_keyframe_auxiliary_losses_are_added_to_language_loss():

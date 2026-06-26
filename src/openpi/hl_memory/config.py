@@ -98,12 +98,14 @@ class HLMemoryConfig:
     progress_condition_hidden_dim: int = 512
     progress_condition_dropout: float = 0.3
     progress_condition_predict_strength: float = 0.5
+    progress_condition_horizon_strength: float | None = None
     progress_condition_confirm_strength: float = 1.0
     state_condition_enabled: bool = False
     state_condition_mode: HLStateConditionMode = "film"
     state_condition_dim: int = 128
     state_condition_hidden_dim: int = 512
     state_condition_dropout: float = 0.0
+    typed_mask_suppress_language_memory: bool = False
 
     def __post_init__(self) -> None:
         if self.vlm_backend not in _DEFAULT_VARIANTS:
@@ -165,6 +167,10 @@ class HLMemoryConfig:
             raise ValueError("progress_condition_dropout must be in [0, 1].")
         if self.progress_condition_predict_strength < 0.0:
             raise ValueError("progress_condition_predict_strength must be non-negative.")
+        if self.progress_condition_horizon_strength is None:
+            object.__setattr__(self, "progress_condition_horizon_strength", self.progress_condition_predict_strength)
+        elif self.progress_condition_horizon_strength < 0.0:
+            raise ValueError("progress_condition_horizon_strength must be non-negative.")
         if self.progress_condition_confirm_strength < 0.0:
             raise ValueError("progress_condition_confirm_strength must be non-negative.")
         if self.state_condition_mode not in {"off", "film", "token", "both"}:

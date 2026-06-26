@@ -55,6 +55,7 @@ class KeyframeAuxiliaryModel(torch.nn.Module):
         )
         final_norm = _find_final_language_norm(base_model, hidden_size=_resolve_hidden_size(base_model))
         self._final_norm_ref = weakref.ref(final_norm)
+        self._last_auxiliary_outputs: dict[str, torch.Tensor] | None = None
 
     @property
     def config(self):
@@ -81,6 +82,7 @@ class KeyframeAuxiliaryModel(torch.nn.Module):
         hl_keyframe_aux_anchor_positions: torch.Tensor | None = None,
         **kwargs,
     ):
+        self._last_auxiliary_outputs = None
         captured: list[torch.Tensor] = []
         hook = None
         if hl_keyframe_aux_anchor_positions is not None:
@@ -115,6 +117,7 @@ class KeyframeAuxiliaryModel(torch.nn.Module):
             )
         row_indices = torch.arange(last_hidden.shape[0], device=last_hidden.device)
         auxiliary = self.auxiliary_head(last_hidden[row_indices, anchors])
+        self._last_auxiliary_outputs = auxiliary
         for name, value in auxiliary.items():
             setattr(outputs, f"hl_keyframe_aux_{name}", value)
         return outputs
@@ -242,12 +245,20 @@ def _find_final_language_norm(model: torch.nn.Module, *, hidden_size: int) -> to
     return (preferred or candidates)[-1][1]
 
 
-def auxiliary_outputs(outputs: Any) -> Mapping[str, torch.Tensor] | None:
+def auxiliary_outputs(outputs: Any, *, model: torch.nn.Module | None = None) -> Mapping[str, torch.Tensor] | None:
     position_logits = getattr(outputs, "hl_keyframe_aux_position_logits", None)
     event_logits = getattr(outputs, "hl_keyframe_aux_event_logits", None)
     update_logits = getattr(outputs, "hl_keyframe_aux_update_logits", None)
     if not all(isinstance(value, torch.Tensor) for value in (position_logits, event_logits, update_logits)):
-        return None
+        wrapped = find_keyframe_auxiliary_model(model) if model is not None else None
+        cached = getattr(wrapped, "_last_auxiliary_outputs", None) if wrapped is not None else None
+        if not isinstance(cached, Mapping):
+            return None
+        position_logits = cached.get("position_logits")
+        event_logits = cached.get("event_logits")
+        update_logits = cached.get("update_logits")
+        if not all(isinstance(value, torch.Tensor) for value in (position_logits, event_logits, update_logits)):
+            return None
     return {
         "position_logits": position_logits,
         "event_logits": event_logits,

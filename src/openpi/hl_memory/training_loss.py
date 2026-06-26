@@ -14,6 +14,7 @@ from openpi.hl_memory.keyframe_auxiliary import KEYFRAME_AUX_VALID_POSITIONS_KEY
 
 HL_STAGE_IDS_KEY = "_hl_stage_ids"
 HL_FIELD_IDS_KEY = "_hl_field_ids"
+HL_FIELD_VALUE_MASK_KEY = "_hl_field_value_mask"
 HL_LOSS_FIELD_IDS_BY_NAME = {
     "current_objective": 1,
     "horizon_current_objective": 2,
@@ -36,7 +37,9 @@ def compute_hl_target_loss(
     keyframe_aux_event_pos_weight: float = 1.0,
     field_current_objective_weight: float = 1.0,
     field_horizon_objective_weight: float = 1.0,
+    field_keyframe_candidate_positions_weight: float = 0.1,
     field_completed_objective_weight: float = 1.0,
+    field_template_weight: float = 0.1,
 ) -> torch.Tensor:
     if two_pass_predict_weight <= 0.0 or two_pass_confirm_weight <= 0.0:
         raise ValueError("Two-pass loss weights must be positive.")
@@ -52,7 +55,9 @@ def compute_hl_target_loss(
         keyframe_aux_event_pos_weight=keyframe_aux_event_pos_weight,
         field_current_objective_weight=field_current_objective_weight,
         field_horizon_objective_weight=field_horizon_objective_weight,
+        field_keyframe_candidate_positions_weight=field_keyframe_candidate_positions_weight,
         field_completed_objective_weight=field_completed_objective_weight,
+        field_template_weight=field_template_weight,
     )
     return loss
 
@@ -70,7 +75,9 @@ def compute_hl_target_loss_with_metrics(
     keyframe_aux_event_pos_weight: float = 1.0,
     field_current_objective_weight: float = 1.0,
     field_horizon_objective_weight: float = 1.0,
+    field_keyframe_candidate_positions_weight: float = 0.1,
     field_completed_objective_weight: float = 1.0,
+    field_template_weight: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     if two_pass_predict_weight <= 0.0 or two_pass_confirm_weight <= 0.0:
         raise ValueError("Two-pass loss weights must be positive.")
@@ -78,6 +85,7 @@ def compute_hl_target_loss_with_metrics(
     labels = inputs["labels"]
     stage_ids = inputs.get(HL_STAGE_IDS_KEY)
     field_ids = inputs.get(HL_FIELD_IDS_KEY)
+    field_value_mask = inputs.get(HL_FIELD_VALUE_MASK_KEY)
     model_inputs = {
         key: value
         for key, value in inputs.items()
@@ -128,20 +136,38 @@ def compute_hl_target_loss_with_metrics(
     if isinstance(field_ids, torch.Tensor):
         if effective_logits_to_keep is None:
             shifted_field_ids = field_ids[:, 1:]
+            shifted_field_value_mask = (
+                field_value_mask[:, 1:] if isinstance(field_value_mask, torch.Tensor) else None
+            )
         else:
             shifted_field_ids = torch.nn.functional.pad(field_ids, (0, 1), value=-1).index_select(
                 1,
                 effective_logits_to_keep + 1,
+            )
+            shifted_field_value_mask = (
+                torch.nn.functional.pad(field_value_mask, (0, 1), value=False).index_select(
+                    1,
+                    effective_logits_to_keep + 1,
+                )
+                if isinstance(field_value_mask, torch.Tensor)
+                else None
             )
         metrics.update(_field_loss_metrics(token_losses, supervised, shifted_field_ids))
         language_token_losses, language_supervised_weights = _apply_field_loss_weights(
             token_losses,
             supervised,
             shifted_field_ids,
+            shifted_field_value_mask,
             current_weight=field_current_objective_weight,
             horizon_weight=field_horizon_objective_weight,
+            keyframe_weight=field_keyframe_candidate_positions_weight,
             completed_weight=field_completed_objective_weight,
+            template_weight=field_template_weight,
         )
+        if auxiliary_enabled and "loss_field_keyframe_candidate_positions" in metrics:
+            metrics["loss_field_keyframe_candidate_positions_token_ce"] = metrics[
+                "loss_field_keyframe_candidate_positions"
+            ]
     else:
         language_token_losses = token_losses
         language_supervised_weights = supervised.to(dtype=token_losses.dtype)
@@ -166,6 +192,7 @@ def compute_hl_target_loss_with_metrics(
         stage_weighted_loss = (per_row_loss * row_weights).sum() / row_weights.sum()
 
     auxiliary_loss, auxiliary_metrics = _keyframe_auxiliary_loss(
+        model,
         outputs,
         inputs,
         position_weight=keyframe_aux_position_weight,
@@ -175,6 +202,8 @@ def compute_hl_target_loss_with_metrics(
         event_pos_weight=keyframe_aux_event_pos_weight,
     )
     metrics.update(auxiliary_metrics)
+    if auxiliary_enabled and "loss_aux_total" in auxiliary_metrics:
+        metrics["loss_field_keyframe_candidate_positions"] = auxiliary_metrics["loss_aux_total"]
     total_loss = stage_weighted_loss + auxiliary_loss
     metrics["loss_language"] = stage_weighted_loss
     metrics["loss"] = total_loss
@@ -182,6 +211,7 @@ def compute_hl_target_loss_with_metrics(
 
 
 def _keyframe_auxiliary_loss(
+    model: torch.nn.Module,
     outputs,
     inputs: dict[str, torch.Tensor],
     *,
@@ -200,7 +230,7 @@ def _keyframe_auxiliary_loss(
     zero = reference.sum() * 0.0
     if not any(weight > 0.0 for weight in weights):
         return zero, {}
-    auxiliary = auxiliary_outputs(outputs)
+    auxiliary = auxiliary_outputs(outputs, model=model)
     if auxiliary is None:
         raise ValueError(
             "Keyframe auxiliary loss is enabled, but the model did not return auxiliary logits. "
@@ -300,31 +330,51 @@ def _apply_field_loss_weights(
     token_losses: torch.Tensor,
     supervised: torch.Tensor,
     field_ids: torch.Tensor,
+    field_value_mask: torch.Tensor | None,
     *,
     current_weight: float,
     horizon_weight: float,
+    keyframe_weight: float,
     completed_weight: float,
+    template_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     for name, value in (
         ("field_current_objective_weight", current_weight),
         ("field_horizon_objective_weight", horizon_weight),
+        ("field_keyframe_candidate_positions_weight", keyframe_weight),
         ("field_completed_objective_weight", completed_weight),
+        ("field_template_weight", template_weight),
     ):
-        if value <= 0.0:
-            raise ValueError(f"{name} must be positive.")
+        if value < 0.0:
+            raise ValueError(f"{name} must be non-negative.")
     weights = supervised.to(dtype=token_losses.dtype)
+    if field_value_mask is None:
+        field_value_mask = field_ids >= 0
+    else:
+        field_value_mask = field_value_mask.to(device=field_ids.device, dtype=torch.bool)
+    field_template_mask = (field_ids >= 0) & ~field_value_mask
     weights = torch.where(
-        field_ids == HL_LOSS_FIELD_IDS_BY_NAME["current_objective"],
+        field_template_mask,
+        torch.as_tensor(template_weight, device=token_losses.device, dtype=token_losses.dtype),
+        weights,
+    )
+    weights = torch.where(
+        (field_ids == HL_LOSS_FIELD_IDS_BY_NAME["current_objective"]) & field_value_mask,
         torch.as_tensor(current_weight, device=token_losses.device, dtype=token_losses.dtype),
         weights,
     )
     weights = torch.where(
-        field_ids == HL_LOSS_FIELD_IDS_BY_NAME["horizon_current_objective"],
+        (field_ids == HL_LOSS_FIELD_IDS_BY_NAME["horizon_current_objective"]) & field_value_mask,
         torch.as_tensor(horizon_weight, device=token_losses.device, dtype=token_losses.dtype),
         weights,
     )
     weights = torch.where(
-        field_ids == HL_LOSS_FIELD_IDS_BY_NAME["completed_objective"],
+        (field_ids == HL_LOSS_FIELD_IDS_BY_NAME["keyframe_candidate_positions"]) & field_value_mask,
+        torch.as_tensor(keyframe_weight, device=token_losses.device, dtype=token_losses.dtype),
+        weights,
+    )
+    weights = torch.where(
+        (field_ids == HL_LOSS_FIELD_IDS_BY_NAME["completed_objective"]) & field_value_mask,
         torch.as_tensor(completed_weight, device=token_losses.device, dtype=token_losses.dtype),
         weights,
     )
