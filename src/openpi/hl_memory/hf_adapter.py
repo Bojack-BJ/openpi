@@ -719,7 +719,7 @@ class BaseHLVLMAdapter:
                 parse_error=pass_a.parse_error or pass_horizon.parse_error,
             )
         if not pass_a.prediction.keyframe_candidate_positions:
-            prediction = dataclasses.replace(pass_a.prediction, completed_objective="")
+            prediction = dataclasses.replace(pass_a.prediction, new_completed_objective="", completed_objective="")
             return HLVLMGeneration(
                 prediction=prediction.with_recent_position_limit(clips.recent_valid_length),
                 raw_output=json.dumps(
@@ -737,7 +737,12 @@ class BaseHLVLMAdapter:
             pass_a_prediction=pass_a.prediction,
             device=device,
         )
-        prediction = dataclasses.replace(pass_a.prediction, completed_objective=pass_b.prediction.completed_objective)
+        prediction = dataclasses.replace(
+            pass_a.prediction,
+            task_progress=pass_b.prediction.task_progress,
+            new_completed_objective=pass_b.prediction.new_completed_objective,
+            completed_objective=pass_b.prediction.new_completed_objective,
+        )
         return HLVLMGeneration(
             prediction=prediction.with_recent_position_limit(clips.recent_valid_length),
             raw_output=json.dumps(
@@ -809,7 +814,7 @@ class BaseHLVLMAdapter:
         decoded = tokenizer.decode(generated_ids[:, input_ids.shape[-1] :][0], skip_special_tokens=True)
         if stage == "confirm":
             try:
-                objective = _parse_completed_objective_text(decoded)
+                new_completed_objective, task_progress = _parse_completion_update_text(decoded)
             except ValueError as exc:
                 parse_error = f"{type(exc).__name__}: {exc}"
                 logging.warning(
@@ -819,6 +824,7 @@ class BaseHLVLMAdapter:
                 return HLVLMGeneration(
                     prediction=dataclasses.replace(
                         pass_a_prediction or self._fallback_prediction(sample),
+                        new_completed_objective="",
                         completed_objective="",
                     ),
                     raw_output=decoded,
@@ -827,7 +833,9 @@ class BaseHLVLMAdapter:
             return HLVLMGeneration(
                 prediction=dataclasses.replace(
                     pass_a_prediction or self._fallback_prediction(sample),
-                    completed_objective=objective,
+                    task_progress=task_progress,
+                    new_completed_objective=new_completed_objective,
+                    completed_objective=new_completed_objective,
                 ),
                 raw_output=decoded,
             )
@@ -1436,10 +1444,13 @@ class BaseHLVLMAdapter:
             "Use canonical/end-state evidence: contact/release/placement/operation must be visually completed, not merely "
             "approaching or in progress. If the evidence is ambiguous, output an empty completed objective.\n"
             f"The candidate evidence clip has {clips.recent_valid_length} valid proposed frames.\n"
-            "Return exactly one JSON object with the single key `completed_objective`.\n"
-            "Use an empty string for no completed event; never output null.\n"
-            "`completed_objective` must be empty unless the recent window contains a visually confirmed completed event "
-            "represented by the candidate keyframe(s). Do not invent the next step.\n"
+            "Return exactly one JSON object with keys `new_completed_objective` and `task_progress`.\n"
+            "`new_completed_objective` is the newly completed task shown by the candidate evidence; use an empty string "
+            "for no newly completed task and never output null.\n"
+            "`task_progress` is the updated cumulative completed-task history after applying `new_completed_objective`. "
+            "If there is no new completion, keep the prior completed-task history unchanged.\n"
+            "`new_completed_objective` must be empty unless the candidate evidence contains a visually confirmed completed "
+            "event represented by the candidate keyframe(s). Do not invent the next step.\n"
             f"{thinking_instruction}"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
             f"{completed_event_line}"
@@ -1485,13 +1496,14 @@ class BaseHLVLMAdapter:
                 separators=(",", ":"),
             )
         if stage == "confirm":
-            completed_objective = (
-                prediction.completed_objective
-                if pass_a_prediction is None or pass_a_prediction.keyframe_candidate_positions
-                else ""
-            )
+            has_candidates = pass_a_prediction is None or bool(pass_a_prediction.keyframe_candidate_positions)
+            new_completed_objective = prediction.new_completed_objective if has_candidates else ""
+            task_progress = prediction.task_progress if has_candidates else _previous_task_progress(sample)
             return json.dumps(
-                {"completed_objective": completed_objective},
+                {
+                    "new_completed_objective": new_completed_objective,
+                    "task_progress": task_progress,
+                },
                 ensure_ascii=True,
                 separators=(",", ":"),
             )
@@ -2343,6 +2355,27 @@ def _parse_completed_objective_text(text: str) -> str:
     return objective.strip()
 
 
+def _parse_completion_update_text(text: str) -> tuple[str, str]:
+    data = _extract_json_dict(text)
+    keys = set(data)
+    if keys == {"completed_objective"}:
+        objective = _parse_completed_objective_text(text)
+        return objective, ""
+    if keys != {"new_completed_objective", "task_progress"}:
+        raise ValueError(
+            "Pass B output must contain exactly `new_completed_objective` and `task_progress`."
+        )
+    objective = data["new_completed_objective"]
+    task_progress = data["task_progress"]
+    if objective is None:
+        objective = ""
+    if not isinstance(objective, str):
+        raise ValueError("Pass B `new_completed_objective` must be a string.")
+    if not isinstance(task_progress, str):
+        raise ValueError("Pass B `task_progress` must be a string.")
+    return objective.strip(), task_progress.strip() or "No completed subtask yet."
+
+
 def _parse_horizon_objective_text(text: str) -> str:
     data = _extract_json_dict(text)
     if set(data) != {"horizon_current_objective"}:
@@ -2741,6 +2774,11 @@ def _parse_ll_memory_fields(memory: str) -> dict[str, str]:
         key, value = line.split(":", 1)
         fields[key.strip().lower()] = value.strip()
     return fields
+
+
+def _previous_task_progress(sample: ExportedHLMemorySample) -> str:
+    fields = _parse_ll_memory_fields(sample.language_memory)
+    return fields.get("task progress", sample.language_memory.strip()).strip() or "No completed subtask yet."
 
 
 def _state_context_for_protocol(protocol: str, sample: ExportedHLMemorySample) -> tuple[str, str, str]:

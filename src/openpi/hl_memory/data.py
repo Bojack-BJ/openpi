@@ -83,6 +83,7 @@ class ExportedHLMemorySample:
     horizon_current_objective: str = ""
     horizon_current_subtask: str = ""
     horizon_phase: str = ""
+    new_completed_objective: str = ""
     last_objective: str = ""
     previous_stage_objective: str = ""
     recent_robot_states: tuple[tuple[float, ...], ...] = ()
@@ -131,6 +132,9 @@ class ExportedHLMemorySample:
             horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
             horizon_current_subtask=str(data.get("horizon_current_subtask", "")).strip(),
             horizon_phase=str(data.get("horizon_phase", "")).strip(),
+            new_completed_objective=str(
+                data.get("new_completed_objective", data.get("completed_objective", ""))
+            ).strip(),
             last_objective=str(data.get("last_objective", "")).strip(),
             previous_stage_objective=str(data.get("previous_stage_objective", "")).strip(),
             recent_robot_states=_parse_float_matrix(data.get("recent_robot_states", ())),
@@ -177,6 +181,7 @@ class ExportedHLMemorySample:
             "horizon_current_objective": self.horizon_current_objective,
             "horizon_current_subtask": self.horizon_current_subtask,
             "horizon_phase": self.horizon_phase,
+            "new_completed_objective": self.new_completed_objective,
             "last_objective": self.last_objective,
             "previous_stage_objective": self.previous_stage_objective,
             "recent_robot_states": [list(row) for row in self.recent_robot_states],
@@ -246,7 +251,9 @@ class ExportedHLMemorySample:
                 goal_query="",
                 current_objective=objective,
                 horizon_current_objective=horizon_objective,
-                completed_objective=objective if self.keyframe_label is True else "",
+                task_progress=self.task_progress,
+                new_completed_objective=self.new_completed_objective,
+                completed_objective=self.new_completed_objective,
             )
         if target_protocol == "memer_objective":
             objective = self.current_objective or self.current_subtask

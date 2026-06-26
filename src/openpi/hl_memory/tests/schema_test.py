@@ -55,8 +55,21 @@ def test_prediction_parses_completed_objective_when_present():
         '"completed_objective":"place toast","keyframe_candidate_positions":[2]}'
     )
 
+    assert parsed.new_completed_objective == "place toast"
     assert parsed.completed_objective == "place toast"
     assert parsed.to_dict(include_legacy=False)["completed_objective"] == "place toast"
+
+
+def test_prediction_parses_new_completed_objective_when_present():
+    parsed = HLMemoryPrediction.from_json(
+        '{"current_objective":"place toast","new_completed_objective":"place toast",'
+        '"task_progress":"Completed subtasks: place toast.","keyframe_candidate_positions":[2]}'
+    )
+
+    assert parsed.new_completed_objective == "place toast"
+    assert parsed.completed_objective == "place toast"
+    assert parsed.task_progress == "Completed subtasks: place toast."
+    assert parsed.to_dict(include_legacy=False)["new_completed_objective"] == "place toast"
 
 
 def test_prediction_parses_json_after_thinking_block():

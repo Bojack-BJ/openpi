@@ -21,6 +21,7 @@ from openpi.hl_memory.hf_adapter import _build_batched_field_annotations
 from openpi.hl_memory.hf_adapter import _build_batched_field_ids
 from openpi.hl_memory.hf_adapter import _keyframe_auxiliary_targets_for_sample
 from openpi.hl_memory.hf_adapter import _parse_completed_objective_text
+from openpi.hl_memory.hf_adapter import _parse_completion_update_text
 from openpi.hl_memory.proprio import PROPRIO_FRAME_TOKEN
 from openpi.hl_memory.proprio import PROPRIO_SUMMARY_TOKEN
 from openpi.hl_memory.proprio import build_proprio_batch
@@ -270,6 +271,7 @@ def test_keyframe_gated_memory_target_text_uses_completed_objective():
         current_objective="place toast",
         horizon_current_objective="grasp steak",
         keyframe_label=True,
+        new_completed_objective="place toast",
     )
 
     payload = json.loads(adapter.build_target_text(sample))
@@ -349,6 +351,8 @@ def test_typed_mask_target_matches_single_pass_keyframe_gated_target():
         current_objective="place toast",
         horizon_current_objective="grasp steak",
         keyframe_label=True,
+        task_progress="Completed subtasks: place toast.",
+        new_completed_objective="place toast",
     )
     single_pass = Qwen25HLAdapter(HLMemoryConfig(target_protocol="keyframe_gated_memory"))
     typed_mask = Qwen25HLAdapter(
@@ -486,6 +490,8 @@ def test_keyframe_gated_two_pass_targets_are_typed():
         current_objective="place toast",
         horizon_current_objective="grasp steak",
         keyframe_label=True,
+        task_progress="Completed subtasks: place toast.",
+        new_completed_objective="place toast",
     )
 
     pass_a = json.loads(adapter._build_two_pass_target_text(sample, stage="predict"))
@@ -496,7 +502,10 @@ def test_keyframe_gated_two_pass_targets_are_typed():
         "horizon_current_objective": "grasp steak",
         "keyframe_candidate_positions": [2],
     }
-    assert pass_b == {"completed_objective": "place toast"}
+    assert pass_b == {
+        "new_completed_objective": "place toast",
+        "task_progress": "Completed subtasks: place toast.",
+    }
 
 
 def test_film_progress_two_pass_splits_current_and_horizon_targets():
@@ -523,6 +532,8 @@ def test_film_progress_two_pass_splits_current_and_horizon_targets():
         current_objective="place toast",
         horizon_current_objective="grasp steak",
         keyframe_label=True,
+        task_progress="Completed subtasks: place toast.",
+        new_completed_objective="place toast",
     )
 
     current = json.loads(adapter._build_two_pass_target_text(sample, stage="predict"))
@@ -531,7 +542,10 @@ def test_film_progress_two_pass_splits_current_and_horizon_targets():
 
     assert current == {"current_objective": "place toast", "keyframe_candidate_positions": [2]}
     assert horizon == {"horizon_current_objective": "grasp steak"}
-    assert confirm == {"completed_objective": "place toast"}
+    assert confirm == {
+        "new_completed_objective": "place toast",
+        "task_progress": "Completed subtasks: place toast.",
+    }
 
 
 def test_film_progress_pass_a_prompt_hides_raw_memory_text():
@@ -667,6 +681,15 @@ def test_two_pass_completed_objective_parser_distinguishes_invalid_json_from_emp
         _parse_completed_objective_text('{"completed_objective":"","extra":1}')
     with pytest.raises(ValueError, match="must be a string"):
         _parse_completed_objective_text('{"completed_objective":false}')
+
+
+def test_two_pass_completion_update_parser_accepts_new_and_legacy_payloads():
+    assert _parse_completion_update_text(
+        '{"new_completed_objective":"place toast","task_progress":"Completed subtasks: place toast."}'
+    ) == ("place toast", "Completed subtasks: place toast.")
+    assert _parse_completion_update_text('{"completed_objective":"place toast"}') == ("place toast", "")
+    with pytest.raises(ValueError, match="exactly"):
+        _parse_completion_update_text('{"new_completed_objective":"place toast"}')
 
 
 def test_two_pass_confirm_sample_routes_only_candidate_aligned_proprio():

@@ -96,7 +96,10 @@ A large shortcut score with weak `recent_only` accuracy means the model is relyi
 - Horizon uses an independent prompt and target JSON, so it cannot autoregressively read generated `current_objective` tokens.
 - Progress FiLM encodes only runtime-maintainable state: completed-event log / maintained memory summary / last completed objective. It must not consume GT `current_subtask`, GT `phase`, GT `task_progress`, or GT current objective.
 - State/proprio FiLM encodes continuous `recent_robot_states`; it is separate from the old proprio soft-token path and does not require textifying numbers in the prompt.
-- Pass B receives candidate evidence frames plus stronger progress FiLM and predicts only `completed_objective`.
+- Pass B receives candidate evidence frames plus stronger progress FiLM and predicts
+  `new_completed_objective` plus the updated cumulative `task_progress`. The legacy
+  `completed_objective` field remains an alias for old eval/runtime code, but it is
+  not derived from `keyframe_label`.
 
 Recommended training flags for this protocol:
 

@@ -9,6 +9,7 @@ _NEW_PREDICTION_KEYS = {
     "current_objective",
     "relevant_objects",
     "notes",
+    "new_completed_objective",
     "completed_objective",
 }
 _LEGACY_PREDICTION_KEYS = {
@@ -35,6 +36,7 @@ class HLMemoryPrediction:
     horizon_current_objective: str = ""
     last_objective: str = ""
     previous_stage_objective: str = ""
+    new_completed_objective: str = ""
     completed_objective: str = ""
     sam_text_prompt: str = ""
     sam_point_xy: tuple[int, int] | None = None
@@ -62,6 +64,8 @@ class HLMemoryPrediction:
         )
         current_subtask = self.current_subtask.strip() or current_objective
         phase = self.phase.strip() or current_objective
+        new_completed_objective = (self.new_completed_objective or self.completed_objective).strip()
+        completed_objective = (self.completed_objective or new_completed_objective).strip()
         object.__setattr__(self, "task_progress", task_progress)
         object.__setattr__(self, "current_objective", current_objective)
         object.__setattr__(self, "current_subtask", current_subtask)
@@ -69,6 +73,8 @@ class HLMemoryPrediction:
         object.__setattr__(self, "relevant_objects", tuple(str(item).strip() for item in relevant_objects if str(item).strip()))
         object.__setattr__(self, "notes", notes)
         object.__setattr__(self, "updated_language_memory", updated_language_memory)
+        object.__setattr__(self, "new_completed_objective", new_completed_objective)
+        object.__setattr__(self, "completed_objective", completed_objective)
         for position in self.keyframe_candidate_positions:
             if position <= 0:
                 raise ValueError("keyframe_candidate_positions must be positive and 1-indexed.")
@@ -99,6 +105,8 @@ class HLMemoryPrediction:
             result["last_objective"] = self.last_objective
         if self.previous_stage_objective:
             result["previous_stage_objective"] = self.previous_stage_objective
+        if self.new_completed_objective:
+            result["new_completed_objective"] = self.new_completed_objective
         if self.completed_objective:
             result["completed_objective"] = self.completed_objective
         if self.sam_text_prompt:
@@ -171,6 +179,9 @@ class HLMemoryPrediction:
             horizon_current_objective=str(data.get("horizon_current_objective", "")).strip(),
             last_objective=str(data.get("last_objective", "")).strip(),
             previous_stage_objective=str(data.get("previous_stage_objective", "")).strip(),
+            new_completed_objective=str(
+                data.get("new_completed_objective", data.get("completed_objective", ""))
+            ).strip(),
             completed_objective=str(data.get("completed_objective", "")).strip(),
             sam_text_prompt=str(data.get("sam_text_prompt", data.get("sam_prompt", ""))).strip(),
             sam_point_xy=_parse_optional_point(

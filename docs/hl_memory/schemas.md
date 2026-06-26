@@ -93,7 +93,12 @@ visual memory:
 - `keyframe_event_ids` / `keyframe_event_frame_indices`: optional compact event
   metadata. Multiple samples can point to the same canonical event; rollout
   memory stores the merged canonical event, not every event-band frame.
-- `completed_objective`: non-empty only when `keyframe_label=true`.
+- `new_completed_objective`: newly completed task visible in this sample's
+  recent/current evidence. Empty means no new task should be committed.
+- `task_progress`: cumulative completed-task history after applying
+  `new_completed_objective`.
+- `completed_objective`: legacy alias for `new_completed_objective` used by
+  older runtime/eval code. Do not derive it directly from `keyframe_label`.
 - `historical_keyframe_seconds`: runtime state derived from previously accepted
   keyframe candidates.
 

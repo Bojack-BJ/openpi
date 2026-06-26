@@ -27,6 +27,7 @@ class SubtaskAnnotation:
     goal_query: str = ""
     task_progress: str = ""
     current_objective: str = ""
+    active_subtask: str = ""
     relevant_objects: tuple[str, ...] = ()
     notes: str = ""
     subtask_progress: float | None = None
@@ -85,6 +86,7 @@ class TaskProgressState:
     goal_query: str = ""
     task_progress: str = ""
     current_objective: str = ""
+    active_subtask: str = ""
     relevant_objects: tuple[str, ...] = ()
     notes: str = ""
 
@@ -223,13 +225,13 @@ def update_progress_state(
     failed_subtasks = list(state.failed_subtasks)
     recent_events = list(state.recent_events)
 
-    previous_objective = state.current_objective.strip()
+    previous_objective = (state.active_subtask or state.current_objective).strip()
+    current_completed_objective = (annotation.current_objective or annotation.current_subtask).strip()
     current_objective = (annotation.current_objective or annotation.phase or annotation.current_subtask).strip()
     if (
         previous_objective
-        and current_objective
-        and annotation.current_objective.strip()
-        and _normalize_objective(previous_objective) != _normalize_objective(current_objective)
+        and current_completed_objective
+        and _normalize_objective(previous_objective) != _normalize_objective(current_completed_objective)
         and _normalize_objective(previous_objective) != "continue the task"
     ):
         completed_subtasks.append(previous_objective)
@@ -252,6 +254,7 @@ def update_progress_state(
         goal_query=annotation.goal_query,
         task_progress=annotation.task_progress,
         current_objective=current_objective,
+        active_subtask=current_completed_objective,
         relevant_objects=annotation.relevant_objects
         or tuple(value for value in (annotation.target_query, annotation.goal_query) if value),
         notes=annotation.notes,

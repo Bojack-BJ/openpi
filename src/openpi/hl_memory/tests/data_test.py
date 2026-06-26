@@ -104,12 +104,14 @@ def test_target_prediction_can_use_canonical_keyframe_candidates():
     assert prediction.keyframe_candidate_positions == (2,)
 
 
-def test_keyframe_gated_memory_target_sets_completed_objective_from_keyframe_labels():
+def test_keyframe_gated_memory_target_uses_explicit_new_completed_objective():
     sample = _sample(
         current_objective="place toast on plate",
         horizon_current_objective="grasp steak",
         keyframe_candidate_positions=(2,),
         keyframe_label=True,
+        task_progress="Completed subtasks: place toast on plate.",
+        new_completed_objective="place toast on plate",
     )
 
     prediction = sample.target_prediction(target_protocol="keyframe_gated_memory")
@@ -117,15 +119,17 @@ def test_keyframe_gated_memory_target_sets_completed_objective_from_keyframe_lab
     assert prediction.current_objective == "place toast on plate"
     assert prediction.horizon_current_objective == "grasp steak"
     assert prediction.keyframe_candidate_positions == (2,)
+    assert prediction.task_progress == "Completed subtasks: place toast on plate."
+    assert prediction.new_completed_objective == "place toast on plate"
     assert prediction.completed_objective == "place toast on plate"
     assert prediction.updated_language_memory
 
 
-def test_keyframe_gated_memory_target_leaves_completed_objective_empty_without_keyframes():
+def test_keyframe_gated_memory_target_does_not_treat_keyframe_label_as_completion():
     sample = _sample(
         current_objective="place toast on plate",
         keyframe_candidate_positions=(2,),
-        keyframe_label=False,
+        keyframe_label=True,
     )
 
     prediction = sample.target_prediction(target_protocol="keyframe_gated_memory")

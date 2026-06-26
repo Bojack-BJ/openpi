@@ -695,9 +695,14 @@ def _export_episode(
         memory_frame_paths = tuple(frame_cache[global_indices[index]] for index in memory_frame_indices)
 
         current_language_memory = _render_export_memory(progress_state, mode=memory_render_mode)
+        previous_completed_subtasks = progress_state.completed_subtasks
         next_progress_state = update_progress_state(progress_state, annotation)
         updated_language_memory = _render_export_memory(next_progress_state, mode=memory_render_mode)
         next_memory_fields = render_language_memory_fields_from_state(next_progress_state)
+        new_completed_objective = _new_completed_objective(
+            previous_completed_subtasks,
+            next_progress_state.completed_subtasks,
+        )
         canonical_keyframe_positions = derive_keyframe_positions(episode_annotations, step_index, recent_local_indices)
         event_band_positions: tuple[int, ...] = ()
         keyframe_event_ids: tuple[str, ...] = ()
@@ -763,6 +768,7 @@ def _export_episode(
             horizon_current_objective=annotation.horizon_current_objective,
             horizon_current_subtask=annotation.horizon_current_subtask,
             horizon_phase=annotation.horizon_phase,
+            new_completed_objective=new_completed_objective,
             recent_robot_states=recent_robot_states,
             recent_robot_state_masks=recent_robot_state_masks,
             robot_state_dim_names=robot_state_dim_names,
@@ -793,6 +799,21 @@ def _render_export_memory(
     if mode == "completed-subtasks":
         return render_completed_subtasks_memory(state)
     return render_language_memory(state)
+
+
+def _new_completed_objective(
+    previous_completed_subtasks: tuple[str, ...],
+    next_completed_subtasks: tuple[str, ...],
+) -> str:
+    previous_count = len(previous_completed_subtasks)
+    if len(next_completed_subtasks) <= previous_count:
+        return ""
+    new_items = [
+        item.strip()
+        for item in next_completed_subtasks[previous_count:]
+        if item.strip()
+    ]
+    return "; ".join(new_items)
 
 
 def _default_export_memory(*, mode: Literal["dashboard", "completed-subtasks"]) -> str:

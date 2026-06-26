@@ -94,8 +94,8 @@ Loss 计算逻辑：输入序列是 `prompt + target JSON`，labels 会把 promp
 - `--target-protocol objective_memory_state`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/updated_language_memory`，prompt 额外输入 `language_memory`。用于测试模型是否能消费并更新 compact memory。
 - `--target-protocol objective_last_objective`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/last_objective`。不把 `last_objective` 放进 prompt；它是训练辅助输出，推理可忽略。
 - `--target-protocol objective_prev_stage`：MEMER-style target，监督 `current_objective/horizon_current_objective/keyframes/previous_stage_objective`，prompt 额外输入 `previous_stage_objective`。用于测试模型是否能维护比 full memory 更轻的阶段状态。
-- `--target-protocol keyframe_gated_memory`：单 pass keyframe-gated target，监督 `current_objective/horizon_current_objective/keyframe_candidate_positions/completed_objective`。runtime 只在 `completed_objective` 非空且有 keyframe candidate 时更新 completed-event log。
-- `--target-protocol keyframe_gated_memory_two_pass`：two-pass typed target。训练时每个 sample 展开成 Pass A / Pass B 两条 VLM examples；Pass A 看 historical keyframes + 完整 recent window，只监督 current/horizon/keyframe proposal；Pass B 看 historical keyframes + candidate frames，只监督 canonical completed event，非 candidate recent frames 不进入 processor。训练时会对 GT proposal 做确定性位置扰动，并在 negative sample 上注入 false proposal，缩小 train/inference proposal exposure gap。Pass B prompt 不包含 GT current/horizon 文本。推理时 Pass A 无 candidate 会直接跳过 Pass B。
+- `--target-protocol keyframe_gated_memory`：单 pass keyframe-gated target，监督 `current_objective/horizon_current_objective/keyframe_candidate_positions/completed_objective`。`completed_objective` 是兼容旧 runtime 的 alias，真值来自 sample 的 `new_completed_objective`，不再由 `keyframe_label` 直接派生。
+- `--target-protocol keyframe_gated_memory_two_pass`：two-pass typed target。训练时每个 sample 展开成 Pass A / Pass B 两条 VLM examples；Pass A 看 historical keyframes + 完整 recent window，只监督 current/horizon/keyframe proposal；Pass B 看 historical keyframes + candidate frames，监督 `new_completed_objective` 和更新后的累计 `task_progress`，非 candidate recent frames 不进入 processor。训练时会对 GT proposal 做确定性位置扰动，并在 negative sample 上注入 false proposal，缩小 train/inference proposal exposure gap。Pass B prompt 不包含 GT current/horizon 文本。推理时 Pass A 无 candidate 会直接跳过 Pass B。
 - `--target-protocol keyframe_gated_memory_typed_mask`：仅 Qwen2.5-VL。保持 JSON 字段顺序不变，但 4D mask 会阻止 horizon target rows attend teacher-forced `current_objective` target field，同时阻止 completed rows 直接 attend recent visual tokens。Horizon 仍可看完整 prompt、historical memory 和 recent visual source，因此该 setting 用于测试 horizon 是否真正从视觉和状态上下文预测，而不是学习 `GT current -> GT horizon` 映射。Qwen3.5 不支持这条 4D mask 路径；需要严格隔离时使用独立 pass/head。
 - `--target-protocol known_prior_tracker`：监督 `current_objective/subtask_progress/should_advance_objective/keyframes`，用于已知 step prior 的状态机式对比实验；不建议作为当前主线。
 
@@ -109,7 +109,7 @@ Keyframe candidate 默认使用 event-band 监督，而不是只在 coarse segme
 - `--two-pass-training-proposal-noise-probability 0.25`：canonical/event-band positive 的 Pass B candidate 位置扰动概率。Negative sample 始终给 Pass B 一个 deterministic false proposal 并监督空 completion，从而训练拒绝错误 Pass A proposal。
 - `--two-pass-predict-loss-weight 1.0 --two-pass-confirm-loss-weight 1.0`：先分别对每条 Pass A/Pass B target 的 token loss 求均值，再按 pass 权重聚合。这样较短的 completion JSON 不会被较长的 Pass A JSON 按 token 数稀释。
 
-`keyframe_label` 仍然是 canonical 单点，`keyframe_gated_memory.completed_objective` 也只在 canonical event 上非空；event band 只扩大 candidate proposal 的视觉监督，不会让 long-term memory 存入每个 band 帧。
+`keyframe_label` 仍然是 canonical 单点，只用于 keyframe/event proposal 监督；它不再等价于 completed task。`new_completed_objective` 表示当前 sample 视觉证据中新确认完成的任务，`task_progress` 表示已经包含该新增项的累计历史。event band 只扩大 candidate proposal 的视觉监督，不会让 long-term memory 存入每个 band 帧。
 
 ### Keyframe History Auxiliary Loss
 

@@ -19,9 +19,16 @@ HL_LOSS_FIELD_IDS_BY_NAME = {
     "current_objective": 1,
     "horizon_current_objective": 2,
     "keyframe_candidate_positions": 3,
+    "task_progress": 4,
+    "new_completed_objective": 4,
     "completed_objective": 4,
 }
-HL_LOSS_FIELD_NAMES_BY_ID = {value: key for key, value in HL_LOSS_FIELD_IDS_BY_NAME.items()}
+HL_LOSS_FIELD_NAMES_BY_ID = {
+    1: "current_objective",
+    2: "horizon_current_objective",
+    3: "keyframe_candidate_positions",
+    4: "completion_update",
+}
 
 
 def compute_hl_target_loss(
