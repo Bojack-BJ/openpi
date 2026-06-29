@@ -48,7 +48,7 @@ def compute_prediction_metrics(
     sample: ExportedHLMemorySample,
     *,
     target_protocol: str = "hl_v1",
-    keyframe_candidate_label_mode: str = "event_band",
+    keyframe_candidate_label_mode: str = "canonical",
 ) -> dict[str, float]:
     expected = sample.target_prediction(
         target_protocol=target_protocol,
@@ -90,6 +90,10 @@ def compute_prediction_metrics(
         "active_hand_accuracy": _optional_text_accuracy(prediction.active_hand, expected.active_hand),
         "target_query_accuracy": float(_normalize_text(prediction.target_query) == _normalize_text(expected.target_query)),
         "goal_query_accuracy": float(_normalize_text(prediction.goal_query) == _normalize_text(expected.goal_query)),
+        "target_object_accuracy": float(
+            _normalize_text(prediction.target_object) == _normalize_text(expected.target_object)
+        ),
+        "target_slot_accuracy": float(_normalize_text(prediction.target_slot) == _normalize_text(expected.target_slot)),
         "keyframe_precision": precision,
         "keyframe_recall": recall,
         "keyframe_f1": (2.0 * precision * recall / (precision + recall)) if (precision + recall) else 0.0,

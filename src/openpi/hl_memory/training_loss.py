@@ -22,12 +22,15 @@ HL_LOSS_FIELD_IDS_BY_NAME = {
     "task_progress": 4,
     "new_completed_objective": 4,
     "completed_objective": 4,
+    "target_object": 5,
+    "target_slot": 5,
 }
 HL_LOSS_FIELD_NAMES_BY_ID = {
     1: "current_objective",
     2: "horizon_current_objective",
     3: "keyframe_candidate_positions",
     4: "completion_update",
+    5: "target_grounding",
 }
 
 
@@ -367,6 +370,11 @@ def _apply_field_loss_weights(
     )
     weights = torch.where(
         (field_ids == HL_LOSS_FIELD_IDS_BY_NAME["current_objective"]) & field_value_mask,
+        torch.as_tensor(current_weight, device=token_losses.device, dtype=token_losses.dtype),
+        weights,
+    )
+    weights = torch.where(
+        (field_ids == HL_LOSS_FIELD_IDS_BY_NAME["target_object"]) & field_value_mask,
         torch.as_tensor(current_weight, device=token_losses.device, dtype=token_losses.dtype),
         weights,
     )

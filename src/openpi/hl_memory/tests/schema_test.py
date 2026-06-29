@@ -40,6 +40,18 @@ def test_prediction_drops_invalid_generated_positions():
     assert parsed.with_recent_position_limit(2).keyframe_candidate_positions == (2,)
 
 
+def test_prediction_accepts_stringified_keyframe_positions():
+    parsed = HLMemoryPrediction.from_json(
+        '{"current_objective":"place toast","keyframe_candidate_positions":"[1, 8]"}'
+    )
+    comma = HLMemoryPrediction.from_json(
+        '{"current_objective":"place toast","keyframe_candidate_positions":"1,8"}'
+    )
+
+    assert parsed.keyframe_candidate_positions == (1, 8)
+    assert comma.keyframe_candidate_positions == (1, 8)
+
+
 def test_prediction_defaults_missing_keyframe_positions_to_empty():
     parsed = HLMemoryPrediction.from_json(
         '{"task_progress":"m","current_objective":"s","relevant_objects":[],"notes":"n","phase":"p","target_query":"t","goal_query":"g"}'
@@ -70,6 +82,45 @@ def test_prediction_parses_new_completed_objective_when_present():
     assert parsed.completed_objective == "place toast"
     assert parsed.task_progress == "Completed subtasks: place toast."
     assert parsed.to_dict(include_legacy=False)["new_completed_objective"] == "place toast"
+
+
+def test_prediction_runtime_schema_omits_legacy_fields_and_keeps_empty_completion():
+    prediction = HLMemoryPrediction(
+        updated_language_memory="Task progress: Completed subtasks: grasp toast.\nCurrent objective: place toast",
+        current_subtask="place toast",
+        keyframe_candidate_positions=(2,),
+        phase="place toast",
+        target_query="toast",
+        goal_query="plate",
+        task_progress="Completed subtasks: grasp toast.",
+        current_objective="place toast",
+        horizon_current_objective="grasp steak",
+        relevant_objects=("toast", "plate"),
+        notes="none",
+    )
+
+    payload = prediction.to_runtime_schema_dict()
+
+    assert payload == {
+        "task_progress": "Completed subtasks: grasp toast.",
+        "current_objective": "place toast",
+        "horizon_current_objective": "grasp steak",
+        "keyframe_candidate_positions": [2],
+        "new_completed_objective": "",
+    }
+    assert "updated_language_memory" not in payload
+    assert "current_subtask" not in payload
+    assert "target_query" not in payload
+    assert "goal_query" not in payload
+
+
+def test_prediction_accepts_task_progress_list():
+    parsed = HLMemoryPrediction.from_json(
+        '{"current_objective":"place toast","new_completed_objective":"place toast",'
+        '"task_progress":["grasp toast","place toast"],"keyframe_candidate_positions":[2]}'
+    )
+
+    assert parsed.task_progress == "grasp toast; place toast."
 
 
 def test_prediction_parses_json_after_thinking_block():

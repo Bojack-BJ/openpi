@@ -24,11 +24,11 @@ class _FakeTokenizer:
             return [21]
         if text in {'"keyframe_candidate_positions"', "keyframe_candidate_positions"}:
             return [25]
-        if text == '"completed_objective"':
+        if text == '"new_completed_objective"':
             return [30, 31]
-        if text == "completed_objective":
+        if text == "new_completed_objective":
             return [31]
-        if text in {"Completed-event log:", "Completed-event log"}:
+        if text in {"Task progress:", "Task progress"}:
             return [60]
         return []
 
@@ -156,6 +156,23 @@ def test_generation_mask_activates_horizon_before_completed_field_is_generated()
     assert completed_mask[0, 0, -1, 5] == blocked
     assert completed_mask[0, 0, -1, len(prompt_ids)] == blocked
     assert completed_mask[0, 0, -1, len(prompt_ids) + 4] == 0
+
+
+def test_generation_mask_allows_prompt_only_target_start_at_sequence_end():
+    tokenizer = _FakeTokenizer()
+    prompt_ids = torch.tensor([[1, 10, 11, 12, 2, 10, 11, 12, 3, 60, 4]])
+    attention_mask = torch.ones_like(prompt_ids)
+
+    additive_mask, spans = build_qwen25_typed_attention_mask(
+        input_ids=prompt_ids,
+        attention_mask=attention_mask,
+        target_starts=torch.tensor([prompt_ids.shape[-1]]),
+        tokenizer=tokenizer,
+        dtype=torch.float32,
+    )
+
+    assert spans == (None,)
+    assert additive_mask.shape == (1, 1, prompt_ids.shape[-1], prompt_ids.shape[-1])
 
 
 def test_padding_queries_and_keys_remain_blocked():

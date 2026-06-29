@@ -1202,16 +1202,17 @@ class BaseHLVLMAdapter:
                 separators=(",", ":"),
             )
         if self.config.target_protocol in {"keyframe_gated_memory", _TYPED_MASK_PROTOCOL}:
-            return json.dumps(
-                {
-                    "current_objective": prediction.current_objective,
-                    "horizon_current_objective": prediction.horizon_current_objective,
-                    "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
-                    "completed_objective": prediction.completed_objective,
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
+            payload = {
+                "current_objective": prediction.current_objective,
+                "horizon_current_objective": prediction.horizon_current_objective,
+                "target_object": prediction.target_object,
+                "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+                "new_completed_objective": prediction.new_completed_objective,
+                "task_progress": prediction.task_progress,
+            }
+            if prediction.target_slot:
+                payload["target_slot"] = prediction.target_slot
+            return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if self.config.target_protocol in _TWO_PASS_PROTOCOLS:
             return self._build_two_pass_target_text(sample, stage="predict")
         if self.config.target_protocol in {
@@ -1232,24 +1233,24 @@ class BaseHLVLMAdapter:
                 payload["previous_stage_objective"] = prediction.previous_stage_objective
             return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if self.config.target_protocol == "memer_objective":
-            return json.dumps(
-                {
-                    "current_objective": prediction.current_objective,
-                    "horizon_current_objective": prediction.horizon_current_objective,
-                    "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
+            payload = {
+                "current_objective": prediction.current_objective,
+                "horizon_current_objective": prediction.horizon_current_objective,
+                "target_object": prediction.target_object,
+                "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+            }
+            if prediction.target_slot:
+                payload["target_slot"] = prediction.target_slot
+            return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if self.config.target_protocol == "subtask_keyframe":
-            return json.dumps(
-                {
-                    "current_objective": prediction.current_objective,
-                    "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
+            payload = {
+                "current_objective": prediction.current_objective,
+                "target_object": prediction.target_object,
+                "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+            }
+            if prediction.target_slot:
+                payload["target_slot"] = prediction.target_slot
+            return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if not prediction.sam_text_prompt and sample.target_query:
             prediction = dataclasses.replace(prediction, sam_text_prompt=sample.target_query)
         return prediction.to_json()
@@ -1271,6 +1272,9 @@ class BaseHLVLMAdapter:
             "You receive two ordered video clips.\n"
             "The first clip contains selected historical keyframes from earlier in the episode.\n"
             "The second clip contains the recent observation window, ordered oldest to newest.\n"
+            "Use the historical keyframes as long-term visual evidence for non-Markov progress, such as which object, "
+            "hole, slot, or repeated insertion/place step has already been completed; do not ignore them when the "
+            "recent window alone is ambiguous.\n"
             f"The historical memory clip has {clips.memory_valid_length} valid frames out of {self.config.memory_length}.\n"
             f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
             f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
@@ -1278,9 +1282,11 @@ class BaseHLVLMAdapter:
             "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
             f"{horizon_text}"
             "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, "
-            "and `keyframe_candidate_positions`.\n"
+            "`target_object`, optionally `target_slot`, and `keyframe_candidate_positions`.\n"
             "`current_objective` must be one short executable robot instruction.\n"
             "`horizon_current_objective` must be the short executable robot instruction expected a few frames later.\n"
+            "`target_object` must name the manipulated object or object part grounding the current objective.\n"
+            "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
             "These positions are relative to the recent observation clip, not absolute frame ids and not historical "
@@ -1298,7 +1304,7 @@ class BaseHLVLMAdapter:
             if self.config.enable_thinking
             else "Thinking is disabled. Do not reason step by step; output only the final JSON object. /no_think\n"
         )
-        completed_event_log = (
+        task_progress = (
             "No accepted completed event yet."
             if self.config.typed_mask_suppress_language_memory and self.config.target_protocol == _TYPED_MASK_PROTOCOL
             else sample.language_memory.strip() or "No accepted completed event yet."
@@ -1312,26 +1318,30 @@ class BaseHLVLMAdapter:
             f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
             "is the last/current valid frame.\n"
             "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
-            "The completed-event log below is the only accepted long-term task state. It may be empty, but it should "
-            "help identify global progress. Use the recent observation window as the primary evidence for current and "
+            "The task-progress log below is the accepted completed-task state. It may be empty, but it should only "
+            "provide global progress. Use the recent observation window as the primary evidence for current and "
             "short-horizon objectives.\n"
             "Predict the current executable objective at the last valid recent frame and the short-horizon objective "
             "a few frames after it.\n"
             "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, "
-            "`keyframe_candidate_positions`, and `completed_objective`.\n"
+            "`target_object`, optionally `target_slot`, `keyframe_candidate_positions`, `new_completed_objective`, and `task_progress`.\n"
             "`current_objective` must be one short executable robot instruction suitable for the low-level VLA.\n"
             "`horizon_current_objective` must be the short executable robot instruction expected a few frames later.\n"
+            "`target_object` must name the manipulated object or object part grounding the current objective.\n"
+            "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
             "These positions are relative to the recent observation clip, not absolute frame ids and not historical "
             "memory clip positions. The runtime maps each position to the corresponding recent frame for state updates.\n"
-            "`completed_objective` must be empty unless the recent window contains a visually confirmed event that should "
-            "be committed to long-term memory. When non-empty, it must describe the completed objective represented by "
-            "the nominated keyframe(s).\n"
-            "Do not include updated_language_memory, progress, notes, markdown, explanation text, or extra keys.\n"
+            "`new_completed_objective` must be empty unless the recent window contains a visually confirmed newly "
+            "completed task that should be committed to long-term memory. When non-empty, it must describe only that "
+            "newly completed task represented by the nominated keyframe(s).\n"
+            "`task_progress` must be the updated cumulative completed-task history after applying "
+            "`new_completed_objective`. If no new task is completed, keep the previous task-progress state unchanged.\n"
+            "Do not include updated_language_memory, completed_objective, notes, markdown, explanation text, or extra keys.\n"
             f"{thinking_instruction}"
             f"Task instruction: {sample.instruction.strip() or 'unspecified'}\n"
-            f"Completed-event log: {completed_event_log}\n"
+            f"Task progress: {task_progress}\n"
         )
 
     def _build_keyframe_gated_two_pass_predict_prompt(
@@ -1357,8 +1367,11 @@ class BaseHLVLMAdapter:
                 f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
                 f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
                 "is the last/current valid frame.\n"
-                "Return exactly one JSON object with keys `current_objective` and `keyframe_candidate_positions`.\n"
+                "Return exactly one JSON object with keys `current_objective`, `target_object`, optionally `target_slot`, "
+                "and `keyframe_candidate_positions`.\n"
                 "`current_objective` must be one short executable robot instruction suitable for the low-level VLA.\n"
+                "`target_object` must name the manipulated object or object part grounding the current objective.\n"
+                "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
                 "`keyframe_candidate_positions` is a high-recall proposal list for recent frames that may represent an event. "
                 f"Valid positions are integers from 1 to {clips.recent_valid_length} inclusive. Return [] if there is no event evidence.\n"
                 "Do not output `horizon_current_objective`, `completed_objective`, memory text, progress, notes, markdown, or extra keys.\n"
@@ -1375,8 +1388,10 @@ class BaseHLVLMAdapter:
             f"The recent observation clip has {clips.recent_valid_length} valid frames out of {self.config.recent_frames_length}.\n"
             f"In the recent observation clip, position 1 is the oldest valid recent frame and position {clips.recent_valid_length} "
             "is the last/current valid frame.\n"
-            "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, and "
-            "`keyframe_candidate_positions`.\n"
+            "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, `target_object`, "
+            "optionally `target_slot`, and `keyframe_candidate_positions`.\n"
+            "`target_object` must name the manipulated object or object part grounding the current objective.\n"
+            "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
             "`keyframe_candidate_positions` is a high-recall proposal list for recent frames that may represent an event. "
             f"Valid positions are integers from 1 to {clips.recent_valid_length} inclusive. Return [] if there is no event evidence.\n"
             "These positions are relative to the recent observation clip, not absolute frame ids and not historical "
@@ -1472,23 +1487,23 @@ class BaseHLVLMAdapter:
         )
         if stage == "predict":
             if self.config.target_protocol == _FILM_PROGRESS_TWO_PASS_PROTOCOL:
-                return json.dumps(
-                    {
-                        "current_objective": prediction.current_objective,
-                        "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
-                    },
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                )
-            return json.dumps(
-                {
+                payload = {
                     "current_objective": prediction.current_objective,
-                    "horizon_current_objective": prediction.horizon_current_objective,
+                    "target_object": prediction.target_object,
                     "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
-                },
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
+                }
+                if prediction.target_slot:
+                    payload["target_slot"] = prediction.target_slot
+                return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+            payload = {
+                "current_objective": prediction.current_objective,
+                "horizon_current_objective": prediction.horizon_current_objective,
+                "target_object": prediction.target_object,
+                "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+            }
+            if prediction.target_slot:
+                payload["target_slot"] = prediction.target_slot
+            return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if stage == "horizon":
             return json.dumps(
                 {"horizon_current_objective": prediction.horizon_current_objective},
@@ -1609,8 +1624,11 @@ class BaseHLVLMAdapter:
             f"{objective_text}"
             "Use visual evidence in the last valid recent frame as the primary signal. Language memory and step prior, "
             "if provided, may be stale and should only be used as weak context.\n"
-            "Return exactly one JSON object with keys `current_objective` and `keyframe_candidate_positions`.\n"
+            "Return exactly one JSON object with keys `current_objective`, `target_object`, optionally `target_slot`, "
+            "and `keyframe_candidate_positions`.\n"
             "`current_objective` must be one short executable robot instruction suitable for the low-level VLA.\n"
+            "`target_object` must name the manipulated object or object part grounding the current objective.\n"
+            "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
             "Select recent frames that should be kept as long-term visual memory for future decisions, especially completed "
@@ -2371,8 +2389,11 @@ def _parse_completion_update_text(text: str) -> tuple[str, str]:
         objective = ""
     if not isinstance(objective, str):
         raise ValueError("Pass B `new_completed_objective` must be a string.")
-    if not isinstance(task_progress, str):
-        raise ValueError("Pass B `task_progress` must be a string.")
+    if isinstance(task_progress, list):
+        items = [str(item).strip(" .") for item in task_progress if str(item).strip(" .")]
+        task_progress = "; ".join(items) + ("." if items else "")
+    elif not isinstance(task_progress, str):
+        raise ValueError("Pass B `task_progress` must be a string or list of strings.")
     return objective.strip(), task_progress.strip() or "No completed subtask yet."
 
 

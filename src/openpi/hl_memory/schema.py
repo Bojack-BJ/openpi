@@ -3,10 +3,13 @@ from __future__ import annotations
 from collections.abc import Iterator
 import dataclasses
 import json
+import re
 
 _NEW_PREDICTION_KEYS = {
     "task_progress",
     "current_objective",
+    "target_object",
+    "target_slot",
     "relevant_objects",
     "notes",
     "new_completed_objective",
@@ -26,6 +29,8 @@ class HLMemoryPrediction:
     phase: str
     target_query: str
     goal_query: str
+    target_object: str = ""
+    target_slot: str = ""
     task_progress: str = ""
     current_objective: str = ""
     relevant_objects: tuple[str, ...] = ()
@@ -47,13 +52,17 @@ class HLMemoryPrediction:
         current_objective = (self.current_objective or self.current_subtask or parsed_memory.get("current objective", "")).strip()
         if not current_objective:
             raise ValueError("current_objective must be non-empty.")
-        task_progress = (self.task_progress or parsed_memory.get("task progress", "") or "No completed subtask yet.").strip()
+        task_progress = _normalize_task_progress(
+            self.task_progress or parsed_memory.get("task progress", "") or "No completed subtask yet."
+        )
         notes = (self.notes or parsed_memory.get("notes", "") or "none").strip()
         relevant_objects = self.relevant_objects or _parse_relevant_objects(parsed_memory.get("relevant objects", ""))
+        target_object = (self.target_object or self.target_query).strip()
+        target_slot = (self.target_slot or self.goal_query).strip()
         if not relevant_objects:
             relevant_objects = tuple(
                 value
-                for value in (self.target_query.strip(), self.goal_query.strip())
+                for value in (target_object, target_slot, self.target_query.strip(), self.goal_query.strip())
                 if value and value.lower() != "none"
             )
         updated_language_memory = self.updated_language_memory.strip() or render_language_memory_fields(
@@ -71,6 +80,8 @@ class HLMemoryPrediction:
         object.__setattr__(self, "current_subtask", current_subtask)
         object.__setattr__(self, "phase", phase)
         object.__setattr__(self, "relevant_objects", tuple(str(item).strip() for item in relevant_objects if str(item).strip()))
+        object.__setattr__(self, "target_object", target_object)
+        object.__setattr__(self, "target_slot", target_slot)
         object.__setattr__(self, "notes", notes)
         object.__setattr__(self, "updated_language_memory", updated_language_memory)
         object.__setattr__(self, "new_completed_objective", new_completed_objective)
@@ -90,6 +101,10 @@ class HLMemoryPrediction:
             "target_query": self.target_query,
             "goal_query": self.goal_query,
         }
+        if self.target_object:
+            result["target_object"] = self.target_object
+        if self.target_slot:
+            result["target_slot"] = self.target_slot
         if include_legacy:
             result["updated_language_memory"] = self.updated_language_memory
             result["current_subtask"] = self.current_subtask
@@ -117,6 +132,27 @@ class HLMemoryPrediction:
             result["target_bbox_xyxy"] = [int(value) for value in self.target_bbox_xyxy]
         return result
 
+    def to_runtime_schema_dict(self) -> dict[str, object]:
+        """Returns the compact prediction schema used by eval and rollout logs.
+
+        This intentionally omits legacy compatibility fields such as
+        updated_language_memory/current_subtask and unused query fields. The
+        output is kept aligned with the current rollout contract:
+        task progress in, objective/keyframe/completion state out.
+        """
+        result: dict[str, object] = {
+            "task_progress": self.task_progress,
+            "current_objective": self.current_objective,
+            "horizon_current_objective": self.horizon_current_objective,
+            "keyframe_candidate_positions": list(self.keyframe_candidate_positions),
+            "new_completed_objective": self.new_completed_objective,
+        }
+        if self.target_object:
+            result["target_object"] = self.target_object
+        if self.target_slot:
+            result["target_slot"] = self.target_slot
+        return result
+
     def to_json(self) -> str:
         return json.dumps(self.to_dict(include_legacy=False), ensure_ascii=True, separators=(",", ":"))
 
@@ -135,6 +171,8 @@ class HLMemoryPrediction:
         raw_positions = data.get("keyframe_candidate_positions", data.get("keyframe_positions", []))
         if raw_positions is None:
             raw_positions = []
+        if isinstance(raw_positions, str):
+            raw_positions = _parse_keyframe_positions_text(raw_positions)
         if not isinstance(raw_positions, list):
             raise ValueError("keyframe_candidate_positions must be a list.")
         keyframe_candidate_positions: list[int] = []
@@ -155,12 +193,14 @@ class HLMemoryPrediction:
                 data.get("objective", data.get("current_subtask", parsed_memory.get("current objective", ""))),
             )
         ).strip()
-        task_progress = str(data.get("task_progress", parsed_memory.get("task progress", ""))).strip()
+        task_progress = _normalize_task_progress(data.get("task_progress", parsed_memory.get("task progress", "")))
         notes = str(data.get("notes", parsed_memory.get("notes", ""))).strip()
         if not current_objective and not updated_language_memory:
             raise ValueError("Prediction must include current_objective, current_subtask, or updated_language_memory.")
         target_query = str(data.get("target_query", "")).strip()
         goal_query = str(data.get("goal_query", "")).strip()
+        target_object = str(data.get("target_object", target_query)).strip()
+        target_slot = str(data.get("target_slot", goal_query)).strip()
         relevant_objects = _parse_relevant_objects(data.get("relevant_objects", parsed_memory.get("relevant objects", "")))
         return cls(
             updated_language_memory=updated_language_memory,
@@ -169,6 +209,8 @@ class HLMemoryPrediction:
             phase=str(data.get("phase", current_objective)).strip(),
             target_query=target_query,
             goal_query=goal_query,
+            target_object=target_object,
+            target_slot=target_slot,
             task_progress=task_progress,
             current_objective=current_objective,
             relevant_objects=relevant_objects,
@@ -212,6 +254,36 @@ def _extract_first_json_object(text: str) -> dict[str, object]:
         return fallback
 
     raise ValueError("Could not parse a JSON object from model output.")
+
+
+def _normalize_task_progress(value: object) -> str:
+    if isinstance(value, list):
+        items = [str(item).strip(" .") for item in value if str(item).strip(" .")]
+        return "; ".join(items) + ("." if items else "")
+    return str(value).strip()
+
+
+def _parse_keyframe_positions_text(text: str) -> list[int]:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, list):
+        return [int(value) for value in parsed if _is_int_like(value)]
+    if _is_int_like(parsed):
+        return [int(parsed)]
+    return [int(match) for match in re.findall(r"\d+", stripped)]
+
+
+def _is_int_like(value: object) -> bool:
+    try:
+        int(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _candidate_json_texts(text: str) -> list[str]:

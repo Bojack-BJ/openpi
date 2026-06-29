@@ -78,7 +78,7 @@ class ExportArgs:
     memory_render_mode: Literal["dashboard", "completed-subtasks"] = "dashboard"
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
-    keyframe_candidate_label_mode: Literal["canonical", "event_band"] = "event_band"
+    keyframe_candidate_label_mode: Literal["canonical", "event_band"] = "canonical"
     overwrite: bool = False
 
 

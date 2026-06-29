@@ -6,11 +6,11 @@ from typing import Any
 import torch
 
 
-COMPLETED_OBJECTIVE_FIELD = "completed_objective"
+COMPLETED_OBJECTIVE_FIELD = "new_completed_objective"
 CURRENT_OBJECTIVE_FIELD = "current_objective"
 HORIZON_OBJECTIVE_FIELD = "horizon_current_objective"
 KEYFRAME_POSITIONS_FIELD = "keyframe_candidate_positions"
-COMPLETED_EVENT_LOG_MARKER = "Completed-event log:"
+COMPLETED_EVENT_LOG_MARKER = "Task progress:"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -180,9 +180,9 @@ def _locate_typed_spans(
         raise ValueError("Typed attention received a fully padded sequence.")
     first_valid = int(valid_positions[0])
     last_valid_exclusive = int(valid_positions[-1]) + 1
-    if not first_valid <= target_start < last_valid_exclusive:
+    if not first_valid <= target_start <= last_valid_exclusive:
         raise ValueError(
-            f"Target start {target_start} is outside valid sequence range [{first_valid}, {last_valid_exclusive})."
+            f"Target start {target_start} is outside valid sequence range [{first_valid}, {last_valid_exclusive}]."
         )
 
     video_runs = _contiguous_token_runs(row_ids, row_valid, video_token_id, stop=target_start)

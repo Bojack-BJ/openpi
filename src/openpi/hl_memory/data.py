@@ -7,6 +7,7 @@ from collections.abc import Iterator
 import dataclasses
 import json
 import pathlib
+import re
 
 from PIL import Image
 from PIL import ImageOps
@@ -90,7 +91,16 @@ class ExportedHLMemorySample:
     recent_robot_state_masks: tuple[tuple[float, ...], ...] = ()
     robot_state_dim_names: tuple[str, ...] = ()
     object_name: str = ""
+    target_object: str = ""
+    target_slot: str = ""
     recent_object_center_points: tuple[tuple[float | None, float | None], ...] = ()
+
+    def __post_init__(self) -> None:
+        objective = self.current_objective or self.current_subtask
+        target_object = self.target_object or self.target_query or self.object_name or _infer_target_object(objective)
+        target_slot = self.target_slot or self.goal_query or _infer_target_slot(objective)
+        object.__setattr__(self, "target_object", target_object.strip())
+        object.__setattr__(self, "target_slot", target_slot.strip())
 
     @classmethod
     def from_dict(cls, data: dict[str, object]) -> "ExportedHLMemorySample":
@@ -141,6 +151,8 @@ class ExportedHLMemorySample:
             recent_robot_state_masks=_parse_float_matrix(data.get("recent_robot_state_masks", ())),
             robot_state_dim_names=tuple(str(value) for value in data.get("robot_state_dim_names", ())),
             object_name=str(data.get("object_name", "")).strip(),
+            target_object=str(data.get("target_object", "")).strip(),
+            target_slot=str(data.get("target_slot", "")).strip(),
             recent_object_center_points=_parse_optional_point_matrix(data.get("recent_object_center_points", ())),
         )
 
@@ -188,6 +200,8 @@ class ExportedHLMemorySample:
             "recent_robot_state_masks": [list(row) for row in self.recent_robot_state_masks],
             "robot_state_dim_names": list(self.robot_state_dim_names),
             "object_name": self.object_name,
+            "target_object": self.target_object,
+            "target_slot": self.target_slot,
             "recent_object_center_points": [list(row) for row in self.recent_object_center_points],
         }
 
@@ -195,7 +209,7 @@ class ExportedHLMemorySample:
         self,
         *,
         target_protocol: str = "hl_v1",
-        keyframe_candidate_label_mode: str = "event_band",
+        keyframe_candidate_label_mode: str = "canonical",
     ) -> HLMemoryPrediction:
         keyframe_candidate_positions = self.keyframe_candidate_positions
         if keyframe_candidate_label_mode not in {"canonical", "event_band"}:
@@ -211,6 +225,8 @@ class ExportedHLMemorySample:
                 phase=objective,
                 target_query="",
                 goal_query="",
+                target_object=self.target_object,
+                target_slot=self.target_slot,
                 task_progress=self.task_progress,
                 current_objective=objective,
                 subtask_progress=self.subtask_progress,
@@ -227,6 +243,8 @@ class ExportedHLMemorySample:
                 phase=objective,
                 target_query="",
                 goal_query="",
+                target_object=self.target_object,
+                target_slot=self.target_slot,
                 current_objective=objective,
                 horizon_current_objective=horizon_objective,
                 last_objective=self.last_objective if target_protocol == "objective_last_objective" else "",
@@ -249,6 +267,8 @@ class ExportedHLMemorySample:
                 phase=objective,
                 target_query="",
                 goal_query="",
+                target_object=self.target_object,
+                target_slot=self.target_slot,
                 current_objective=objective,
                 horizon_current_objective=horizon_objective,
                 task_progress=self.task_progress,
@@ -265,6 +285,8 @@ class ExportedHLMemorySample:
                 phase=objective,
                 target_query="",
                 goal_query="",
+                target_object=self.target_object,
+                target_slot=self.target_slot,
                 current_objective=objective,
                 horizon_current_objective=horizon_objective,
             )
@@ -277,6 +299,8 @@ class ExportedHLMemorySample:
                 phase=objective,
                 target_query="",
                 goal_query="",
+                target_object=self.target_object,
+                target_slot=self.target_slot,
                 current_objective=objective,
             )
         if target_protocol != "hl_v1":
@@ -288,6 +312,8 @@ class ExportedHLMemorySample:
             phase=self.phase,
             target_query=self.target_query,
             goal_query=self.goal_query,
+            target_object=self.target_object,
+            target_slot=self.target_slot,
             task_progress=self.task_progress,
             current_objective=self.current_objective or self.current_subtask,
             relevant_objects=self.relevant_objects,
@@ -411,6 +437,55 @@ def _canonical_keyframe_positions(sample: ExportedHLMemorySample) -> tuple[int, 
         if position is not None:
             positions.append(position)
     return tuple(positions)
+
+
+def _infer_target_object(objective: str) -> str:
+    """Best-effort manipulated-object extraction for old samples.
+
+    This is intentionally conservative: it covers the common objective grammar
+    in our annotations and leaves the field empty when the objective does not
+    name a manipulated object clearly.
+    """
+    text = _clean_objective_text(objective)
+    patterns = (
+        r"\b(?:grasp|grab|grip|pick up|pick|take|hold)\s+(?:the |a |an )?(.+?)(?:\s+from\b|\s+with\b|\s+using\b|\s+and\b|$)",
+        r"\b(?:insert|place|put|release)\s+(?:the |a |an )?(.+?)(?:\s+(?:into|in|onto|on|to|above|over)\b|$)",
+        r"\bmove\s+(?:the |a |an )?(.+?)\s+(?:to|into|in|onto|on|above|over)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _clean_target_phrase(match.group(1))
+    return ""
+
+
+def _infer_target_slot(objective: str) -> str:
+    """Best-effort destination/slot extraction for old samples."""
+    text = _clean_objective_text(objective)
+    patterns = (
+        r"\b(?:into|onto|on|in|above|over)\s+(?:the |a |an )?(.+?)$",
+        r"\bto\s+(?!and\b)(?:the |a |an )?(.+?)$",
+    )
+    for pattern in patterns:
+        matches = list(re.finditer(pattern, text))
+        if matches:
+            match = matches[-1]
+            phrase = _clean_target_phrase(match.group(1))
+            if phrase and phrase not in {"observation region", "observation space"}:
+                return phrase
+    return ""
+
+
+def _clean_objective_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _clean_target_phrase(text: str) -> str:
+    phrase = re.sub(r"\b(?:with|using|by)\b.*$", "", text.strip().lower()).strip(" .,:;")
+    phrase = re.sub(r"\s+", " ", phrase)
+    if phrase in {"it", "object", "target object", "hand", "left hand", "right hand"}:
+        return ""
+    return phrase
 
 
 def group_annotations_by_episode(

@@ -87,7 +87,7 @@ class HLMemoryConfig:
     proprio_noise_std: float = 0.0
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
-    keyframe_candidate_label_mode: HLKeyframeCandidateLabelMode = "event_band"
+    keyframe_candidate_label_mode: HLKeyframeCandidateLabelMode = "canonical"
     two_pass_training_proposal_noise_probability: float = 0.25
     keyframe_aux_enabled: bool = False
     keyframe_aux_hidden_dim: int = 512

@@ -32,6 +32,7 @@ def _gated_prediction(
     *,
     objective: str = "place toast",
     completed_objective: str = "",
+    task_progress: str = "",
     keyframe_positions: tuple[int, ...] = (),
 ) -> HLMemoryPrediction:
     return HLMemoryPrediction(
@@ -43,11 +44,12 @@ def _gated_prediction(
         phase=objective,
         target_query="",
         goal_query="",
+        task_progress=task_progress,
         completed_objective=completed_objective,
     )
 
 
-def test_keyframe_gated_state_rejects_empty_completed_objective():
+def test_keyframe_gated_state_accepts_keyframe_without_completed_objective():
     state, update = _update_keyframe_gated_rollout_state(
         KeyframeGatedRolloutState(),
         prediction=_gated_prediction(keyframe_positions=(1,)),
@@ -57,8 +59,9 @@ def test_keyframe_gated_state_rejects_empty_completed_objective():
     )
 
     assert state.completed_events == ()
-    assert update["accepted"] is False
-    assert update["reason"] == "empty_completed_objective"
+    assert state.accepted_keyframe_seconds == (1.0,)
+    assert update["accepted"] is True
+    assert update["reason"] == "accepted_keyframe_candidate_without_completed_objective"
 
 
 def test_keyframe_gated_state_rejects_missing_keyframes():
@@ -89,6 +92,40 @@ def test_keyframe_gated_state_accepts_completed_objective_with_keyframes():
     assert update["accepted"] is True
 
 
+def test_keyframe_gated_state_keeps_task_progress_for_next_prompt():
+    state, update = _update_keyframe_gated_rollout_state(
+        KeyframeGatedRolloutState(),
+        prediction=_gated_prediction(
+            completed_objective="place toast",
+            task_progress="grasp toast; place toast.",
+            keyframe_positions=(1,),
+        ),
+        candidate_seconds=(1.0,),
+        memory_length=8,
+        merge_distance_sec=2.0,
+    )
+
+    assert state.completed_event_log == "grasp toast; place toast."
+    assert update["task_progress_after"] == "grasp toast; place toast."
+
+
+def test_keyframe_gated_state_appends_non_cumulative_task_progress():
+    state, update = _update_keyframe_gated_rollout_state(
+        KeyframeGatedRolloutState(task_progress="grasp toast."),
+        prediction=_gated_prediction(
+            completed_objective="place toast",
+            task_progress="place toast.",
+            keyframe_positions=(1,),
+        ),
+        candidate_seconds=(3.0,),
+        memory_length=8,
+        merge_distance_sec=1.0,
+    )
+
+    assert state.completed_event_log == "grasp toast; place toast."
+    assert update["task_progress_after"] == "grasp toast; place toast."
+
+
 def test_keyframe_gated_state_rejects_near_duplicate_completed_objective():
     state = KeyframeGatedRolloutState(
         accepted_events=(AcceptedKeyframeEvent("place toast", 1.0),),
@@ -105,6 +142,24 @@ def test_keyframe_gated_state_rejects_near_duplicate_completed_objective():
     assert next_state == state
     assert update["accepted"] is False
     assert update["reason"] == "duplicate_completed_objective_near_existing_keyframe"
+
+
+def test_keyframe_gated_state_rejects_near_duplicate_unnamed_keyframe():
+    state = KeyframeGatedRolloutState(
+        accepted_events=(AcceptedKeyframeEvent("", 1.0),),
+    )
+
+    next_state, update = _update_keyframe_gated_rollout_state(
+        state,
+        prediction=_gated_prediction(keyframe_positions=(1,)),
+        candidate_seconds=(1.5,),
+        memory_length=8,
+        merge_distance_sec=2.0,
+    )
+
+    assert next_state == state
+    assert update["accepted"] is False
+    assert update["reason"] == "duplicate_keyframe_near_existing_keyframe"
 
 
 def test_keyframe_gated_state_accepts_far_duplicate_completed_objective():
@@ -357,9 +412,44 @@ def test_keyframe_gated_rollout_payload_contains_event_log_only():
         proprio_enabled=False,
     )
 
-    assert payload["completed_event_log"] == "Completed events: grasp toast."
+    assert payload["task_progress_input"] == "Completed events: grasp toast."
+    assert "completed_event_log" not in payload
     assert "completed_subtasks_memory" not in payload
     assert "previous_stage_objective" not in payload
+
+
+def test_film_progress_rollout_payload_names_condition_input():
+    sample = ExportedHLMemorySample(
+        sample_id="sample",
+        episode_index=0,
+        step_index=0,
+        frame_index=0,
+        instruction="make sandwich",
+        language_memory="grasp toast; place toast.",
+        updated_language_memory="must not be exposed",
+        current_subtask="place toast",
+        phase="place toast",
+        target_query="",
+        goal_query="",
+        keyframe_candidate_positions=(),
+        memory_frame_paths=(),
+        memory_frame_indices=(),
+        memory_valid_length=0,
+        recent_frame_paths=(),
+        recent_frame_indices=(),
+        recent_valid_length=0,
+    )
+
+    payload = _protocol_input_payload(
+        "memer_film_progress_two_pass",
+        sample=sample,
+        memory_seconds=(1.0,),
+        recent_seconds=(2.0, 3.0),
+        proprio_enabled=False,
+    )
+
+    assert payload["progress_condition_input"] == "grasp toast; place toast."
+    assert "completed_event_log" not in payload
 
 
 def test_keyframe_gated_memory_input_keeps_completed_event_log_verbatim():
@@ -416,6 +506,13 @@ def test_keyframe_gated_prediction_payload_is_protocol_specific():
         "current_objective": "place toast",
         "keyframe_candidate_positions": [2],
         "horizon_current_objective": "place toast",
-        "completed_objective": "place toast",
+        "new_completed_objective": "place toast",
+        "task_progress": "No completed subtask yet.",
     }
-    assert two_pass_payload == payload
+    assert two_pass_payload == {
+        "current_objective": "place toast",
+        "keyframe_candidate_positions": [2],
+        "horizon_current_objective": "place toast",
+        "new_completed_objective": "place toast",
+        "task_progress": "No completed subtask yet.",
+    }

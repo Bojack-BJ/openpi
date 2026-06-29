@@ -43,6 +43,12 @@ _KEYFRAME_GATED_PROTOCOLS = {
     "keyframe_gated_memory_two_pass",
     "memer_film_progress_two_pass",
 }
+_PROGRESS_UPDATE_PROTOCOLS = {
+    "keyframe_gated_memory",
+    "keyframe_gated_memory_typed_mask",
+    "keyframe_gated_memory_two_pass",
+    "memer_film_progress_two_pass",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,6 +60,7 @@ class AcceptedKeyframeEvent:
 @dataclasses.dataclass(frozen=True)
 class KeyframeGatedRolloutState:
     accepted_events: tuple[AcceptedKeyframeEvent, ...] = ()
+    task_progress: str = ""
 
     @property
     def completed_events(self) -> tuple[str, ...]:
@@ -62,6 +69,12 @@ class KeyframeGatedRolloutState:
     @property
     def accepted_keyframe_seconds(self) -> tuple[float, ...]:
         return tuple(event.keyframe_second for event in self.accepted_events)
+
+    @property
+    def completed_event_log(self) -> str:
+        if self.task_progress.strip():
+            return self.task_progress.strip()
+        return _render_completed_event_log(self.completed_events)
 
 
 @dataclasses.dataclass
@@ -172,7 +185,7 @@ class ZeroShotArgs:
     proprio_norm_stats_path: pathlib.Path | None = None
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
-    keyframe_candidate_label_mode: str = "event_band"
+    keyframe_candidate_label_mode: str = "canonical"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -575,7 +588,10 @@ def _run_rollout(
             len(parsed_completed_events),
             len(memory_seconds),
         )
-    keyframe_gated_state = KeyframeGatedRolloutState(accepted_events=paired_initial_events)
+    keyframe_gated_state = KeyframeGatedRolloutState(
+        accepted_events=paired_initial_events,
+        task_progress=args.language_memory.strip() if parsed_completed_events else "",
+    )
     known_prior_steps = _known_prior_steps(args)
     known_prior_index = _initial_known_prior_index(args, known_prior_steps)
     known_prior_stall_steps = 0
@@ -602,7 +618,7 @@ def _run_rollout(
         language_memory_before = language_memory
         language_memory_input = _protocol_language_memory_input(
             config.target_protocol,
-            _render_completed_event_log(keyframe_gated_state.completed_events)
+            keyframe_gated_state.completed_event_log
             if config.target_protocol in _KEYFRAME_GATED_PROTOCOLS
             else language_memory_before,
             args.memory_input_mode,
@@ -694,7 +710,7 @@ def _run_rollout(
                 merge_distance_sec=args.keyframe_merge_distance_sec,
             )
             memory_seconds = keyframe_gated_state.accepted_keyframe_seconds
-            language_memory = _render_completed_event_log(keyframe_gated_state.completed_events)
+            language_memory = keyframe_gated_state.completed_event_log
         else:
             keyframe_vote_seconds.extend(candidate_seconds)
             memory_seconds = update_rollout_memory_seconds(
@@ -967,6 +983,10 @@ def _protocol_input_payload(
         payload["completed_subtasks_memory"] = sample.language_memory
     elif protocol == "objective_prev_stage":
         payload["previous_stage_objective"] = sample.previous_stage_objective
+    elif protocol == "memer_film_progress_two_pass":
+        payload["progress_condition_input"] = sample.language_memory
+    elif protocol in {"keyframe_gated_memory", "keyframe_gated_memory_typed_mask"}:
+        payload["task_progress_input"] = sample.language_memory
     elif protocol in _KEYFRAME_GATED_PROTOCOLS:
         payload["completed_event_log"] = sample.language_memory
     if proprio_enabled:
@@ -981,6 +1001,9 @@ def _protocol_input_payload(
 
 
 def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]:
+    if protocol in _PROGRESS_UPDATE_PROTOCOLS:
+        return prediction.to_runtime_schema_dict()
+
     payload: dict[str, object] = {
         "current_objective": prediction.current_objective,
         "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
@@ -991,9 +1014,9 @@ def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]
         "objective_last_objective",
         "objective_prev_stage",
         "keyframe_gated_memory",
-        "keyframe_gated_memory_two_pass",
-        "memer_film_progress_two_pass",
     }:
+        payload["horizon_current_objective"] = prediction.horizon_current_objective
+    elif protocol in {"keyframe_gated_memory_typed_mask", "keyframe_gated_memory_two_pass", "memer_film_progress_two_pass"}:
         payload["horizon_current_objective"] = prediction.horizon_current_objective
     if protocol == "objective_memory_state":
         payload["updated_language_memory"] = prediction.updated_language_memory
@@ -1002,7 +1025,8 @@ def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]
     elif protocol == "objective_prev_stage":
         payload["previous_stage_objective"] = prediction.previous_stage_objective
     elif protocol in _KEYFRAME_GATED_PROTOCOLS:
-        payload["completed_objective"] = prediction.completed_objective
+        payload["new_completed_objective"] = prediction.new_completed_objective
+        payload["task_progress"] = prediction.task_progress
     elif protocol == "known_prior_tracker":
         payload["subtask_progress"] = prediction.subtask_progress
         payload["should_advance_objective"] = prediction.should_advance_objective
@@ -1035,21 +1059,14 @@ def _update_keyframe_gated_rollout_state(
     merge_distance_sec: float,
 ) -> tuple[KeyframeGatedRolloutState, dict[str, object]]:
     completed_objective = prediction.completed_objective.strip()
+    task_progress = prediction.task_progress.strip()
     candidate_seconds = tuple(float(second) for second in candidate_seconds)
-    if not completed_objective:
-        return state, {
-            "accepted": False,
-            "reason": "empty_completed_objective",
-            "completed_objective": "",
-            "candidate_seconds": list(candidate_seconds),
-            "completed_events_after": list(state.completed_events),
-            "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
-        }
     if not candidate_seconds:
         return state, {
             "accepted": False,
             "reason": "no_keyframe_candidates",
             "completed_objective": completed_objective,
+            "task_progress_after": state.completed_event_log,
             "candidate_seconds": [],
             "completed_events_after": list(state.completed_events),
             "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
@@ -1062,20 +1079,30 @@ def _update_keyframe_gated_rollout_state(
     duplicate_seconds = [
         event.keyframe_second
         for event in state.accepted_events
-        if _normalize_text(event.completed_objective) == normalized_completed
-        and abs(representative_second - event.keyframe_second) < merge_distance_sec
+        if abs(representative_second - event.keyframe_second) < merge_distance_sec
+        and (
+            not normalized_completed
+            or _normalize_text(event.completed_objective) == normalized_completed
+        )
     ]
     if duplicate_seconds:
+        reason = (
+            "duplicate_completed_objective_near_existing_keyframe"
+            if normalized_completed
+            else "duplicate_keyframe_near_existing_keyframe"
+        )
         return state, {
             "accepted": False,
-            "reason": "duplicate_completed_objective_near_existing_keyframe",
+            "reason": reason,
             "completed_objective": completed_objective,
+            "task_progress_after": state.completed_event_log,
             "candidate_seconds": list(candidate_seconds),
             "representative_keyframe_second": representative_second,
             "completed_events_after": list(state.completed_events),
             "accepted_keyframe_seconds_after": list(state.accepted_keyframe_seconds),
         }
 
+    next_task_progress = _merge_task_progress(state.task_progress, task_progress, completed_objective)
     accepted_events = (
         *state.accepted_events,
         AcceptedKeyframeEvent(
@@ -1084,11 +1111,17 @@ def _update_keyframe_gated_rollout_state(
         ),
     )
     accepted_events = accepted_events[-memory_length:] if memory_length > 0 else ()
-    new_state = KeyframeGatedRolloutState(accepted_events=accepted_events)
+    new_state = KeyframeGatedRolloutState(accepted_events=accepted_events, task_progress=next_task_progress)
+    reason = (
+        "accepted_completed_objective_with_keyframes"
+        if completed_objective
+        else "accepted_keyframe_candidate_without_completed_objective"
+    )
     return new_state, {
         "accepted": True,
-        "reason": "accepted_completed_objective_with_keyframes",
+        "reason": reason,
         "completed_objective": completed_objective,
+        "task_progress_after": new_state.completed_event_log,
         "candidate_seconds": list(candidate_seconds),
         "representative_keyframe_second": representative_second,
         "completed_events_after": list(new_state.completed_events),
@@ -1117,6 +1150,24 @@ def _parse_completed_event_log(memory: str) -> tuple[str, ...]:
         if line and line.lower() not in {"none", "no accepted completed event yet"}:
             events.append(line.strip(" ."))
     return tuple(event for event in events if event)
+
+
+def _merge_task_progress(previous: str, predicted: str, new_completed_objective: str = "") -> str:
+    previous = previous.strip()
+    predicted = predicted.strip()
+    new_completed_objective = new_completed_objective.strip()
+    if not previous:
+        return predicted or _render_completed_event_log((new_completed_objective,) if new_completed_objective else ())
+    if not predicted:
+        return previous
+    normalized_previous = _normalize_text(previous)
+    normalized_predicted = _normalize_text(predicted)
+    if normalized_previous and normalized_previous in normalized_predicted:
+        return predicted
+    normalized_completed = _normalize_text(new_completed_objective)
+    if normalized_completed and normalized_completed in normalized_previous:
+        return previous
+    return f"{previous.rstrip(' .')}; {predicted.strip(' .')}."
 
 
 def _render_completed_event_log(events: tuple[str, ...] | list[str], *, max_events: int = 8) -> str:

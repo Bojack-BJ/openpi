@@ -114,7 +114,7 @@ class TrainArgs:
     proprio_noise_std: float = 0.0
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
-    keyframe_candidate_label_mode: str = "event_band"
+    keyframe_candidate_label_mode: str = "canonical"
     keyframe_positive_sample_ratio: float = 0.0
     keyframe_confirm_positive_sample_ratio: float = 0.0
     two_pass_training_proposal_noise_probability: float = 0.25
@@ -1365,7 +1365,7 @@ def _sample_batch(
     keyframe_positive_sample_ratio: float = 0.0,
     keyframe_confirm_positive_sample_ratio: float = 0.0,
     target_protocol: str = "hl_v1",
-    keyframe_candidate_label_mode: str = "event_band",
+    keyframe_candidate_label_mode: str = "canonical",
 ):
     return sample_keyframe_stratified(
         samples,

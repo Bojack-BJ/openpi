@@ -126,9 +126,9 @@ def test_memer_objective_target_text_is_minimal_and_uses_current_and_horizon_lab
         memory_frame_paths=(),
         memory_frame_indices=(),
         memory_valid_length=0,
-        recent_frame_paths=("recent.png",),
-        recent_frame_indices=(0,),
-        recent_valid_length=1,
+        recent_frame_paths=("recent0.png", "recent1.png"),
+        recent_frame_indices=(0, 1),
+        recent_valid_length=2,
         current_objective="current objective",
         horizon_current_objective="horizon objective",
     )
@@ -231,9 +231,9 @@ def test_subtask_keyframe_target_text_is_minimal_and_uses_current_objective():
         memory_frame_paths=(),
         memory_frame_indices=(),
         memory_valid_length=0,
-        recent_frame_paths=("recent.png",),
-        recent_frame_indices=(0,),
-        recent_valid_length=1,
+        recent_frame_paths=("recent0.png", "recent1.png"),
+        recent_frame_indices=(0, 1),
+        recent_valid_length=2,
         current_objective="current objective",
         horizon_current_objective="horizon objective",
         horizon_current_subtask="horizon subtask",
@@ -247,7 +247,7 @@ def test_subtask_keyframe_target_text_is_minimal_and_uses_current_objective():
     }
 
 
-def test_keyframe_gated_memory_target_text_uses_completed_objective():
+def test_keyframe_gated_memory_target_text_uses_progress_update_schema():
     adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="keyframe_gated_memory"))
     sample = ExportedHLMemorySample(
         sample_id="sample",
@@ -265,12 +265,14 @@ def test_keyframe_gated_memory_target_text_uses_completed_objective():
         memory_frame_paths=(),
         memory_frame_indices=(),
         memory_valid_length=0,
-        recent_frame_paths=("recent.png",),
-        recent_frame_indices=(0,),
-        recent_valid_length=1,
+        recent_frame_paths=("recent0.png", "recent1.png"),
+        recent_frame_indices=(0, 1),
+        recent_valid_length=2,
         current_objective="place toast",
         horizon_current_objective="grasp steak",
         keyframe_label=True,
+        keyframe_event_frame_indices=(1,),
+        task_progress="Completed subtasks: grasp toast; place toast.",
         new_completed_objective="place toast",
     )
 
@@ -280,7 +282,8 @@ def test_keyframe_gated_memory_target_text_uses_completed_objective():
         "current_objective": "place toast",
         "horizon_current_objective": "grasp steak",
         "keyframe_candidate_positions": [2],
-        "completed_objective": "place toast",
+        "new_completed_objective": "place toast",
+        "task_progress": "Completed subtasks: grasp toast; place toast.",
     }
 
 
@@ -384,7 +387,7 @@ def test_two_pass_system_prompt_separates_proposal_and_confirmation():
     assert "only from the proposed candidate evidence" in prompt
 
 
-def test_keyframe_gated_memory_prompt_uses_completed_event_log_without_free_memory_target():
+def test_keyframe_gated_memory_prompt_uses_task_progress_without_free_memory_target():
     adapter = Qwen25HLAdapter(HLMemoryConfig(target_protocol="keyframe_gated_memory"))
     sample = ExportedHLMemorySample(
         sample_id="sample",
@@ -416,9 +419,11 @@ def test_keyframe_gated_memory_prompt_uses_completed_event_log_without_free_memo
 
     prompt = adapter.build_prompt(sample, clips)
 
-    assert "Completed-event log: Completed events: grasp toast." in prompt
-    assert "completed_objective" in prompt
+    assert "Task progress: Completed events: grasp toast." in prompt
+    assert "new_completed_objective" in prompt
+    assert "task_progress" in prompt
     assert "updated_language_memory" in prompt
+    assert "completed_objective" in prompt
     assert "must not be prompted as target" not in prompt
 
 
@@ -461,9 +466,9 @@ def test_typed_mask_can_suppress_language_memory_for_no_raw_memory_ablation():
         )
     ).build_prompt(sample, clips)
 
-    assert "Completed-event log: Completed events: shortcut text." in default_prompt
+    assert "Task progress: Completed events: shortcut text." in default_prompt
     assert "shortcut text" not in suppressed_prompt
-    assert "Completed-event log: No accepted completed event yet." in suppressed_prompt
+    assert "Task progress: No accepted completed event yet." in suppressed_prompt
 
 
 def test_keyframe_gated_two_pass_targets_are_typed():
@@ -687,6 +692,9 @@ def test_two_pass_completion_update_parser_accepts_new_and_legacy_payloads():
     assert _parse_completion_update_text(
         '{"new_completed_objective":"place toast","task_progress":"Completed subtasks: place toast."}'
     ) == ("place toast", "Completed subtasks: place toast.")
+    assert _parse_completion_update_text(
+        '{"new_completed_objective":"place toast","task_progress":["grasp toast","place toast"]}'
+    ) == ("place toast", "grasp toast; place toast.")
     assert _parse_completion_update_text('{"completed_objective":"place toast"}') == ("place toast", "")
     with pytest.raises(ValueError, match="exactly"):
         _parse_completion_update_text('{"new_completed_objective":"place toast"}')

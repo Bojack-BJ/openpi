@@ -76,7 +76,7 @@ class EvalArgs:
     state_condition_dropout: float = 0.0
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
-    keyframe_candidate_label_mode: str = "event_band"
+    keyframe_candidate_label_mode: str = "canonical"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     frame_cache_size: int = 512
     eval_modes: str = "sample_context"
@@ -369,7 +369,7 @@ def _prediction_row(
     metrics: dict[str, float],
     *,
     target_protocol: str = "hl_v1",
-    keyframe_candidate_label_mode: str = "event_band",
+    keyframe_candidate_label_mode: str = "canonical",
 ) -> dict[str, object]:
     sample = item.sample
     return {
@@ -382,8 +382,8 @@ def _prediction_row(
         "expected": sample.target_prediction(
             target_protocol=target_protocol,
             keyframe_candidate_label_mode=keyframe_candidate_label_mode,
-        ).to_dict(),
-        "prediction": prediction.to_dict(),
+        ).to_runtime_schema_dict(),
+        "prediction": prediction.to_runtime_schema_dict(),
         "metrics": metrics,
     }
 

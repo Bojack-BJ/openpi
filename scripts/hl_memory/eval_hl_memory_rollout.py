@@ -42,7 +42,7 @@ class EvalArgs:
     frame_width: int = 456
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
-    keyframe_candidate_label_mode: str = "event_band"
+    keyframe_candidate_label_mode: str = "canonical"
     parallel_mode: str = "none"
     device_map: str = "auto"
     tensor_parallel_plan: str = "auto"
@@ -380,8 +380,8 @@ class _PredictionJsonlWriter:
             "runtime_language_memory": runtime_sample.language_memory,
             "runtime_memory_frame_indices": list(runtime_sample.memory_frame_indices),
             "recent_frame_indices": list(source_sample.recent_frame_indices),
-            "expected": expected.to_dict(),
-            "prediction": prediction.to_dict(),
+            "expected": expected.to_runtime_schema_dict(),
+            "prediction": prediction.to_runtime_schema_dict(),
             "metrics": metrics,
         }
         self._handle.write(json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n")
