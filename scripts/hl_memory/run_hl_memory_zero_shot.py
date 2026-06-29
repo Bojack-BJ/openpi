@@ -1010,12 +1010,17 @@ def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]
     }
     if protocol in {
         "memer_objective",
+        "memer_objective_grounding",
         "objective_memory_state",
         "objective_last_objective",
         "objective_prev_stage",
         "keyframe_gated_memory",
     }:
         payload["horizon_current_objective"] = prediction.horizon_current_objective
+    if protocol == "memer_objective_grounding":
+        payload["target_object"] = prediction.target_object
+        if prediction.target_slot:
+            payload["target_slot"] = prediction.target_slot
     elif protocol in {"keyframe_gated_memory_typed_mask", "keyframe_gated_memory_two_pass", "memer_film_progress_two_pass"}:
         payload["horizon_current_objective"] = prediction.horizon_current_objective
     if protocol == "objective_memory_state":

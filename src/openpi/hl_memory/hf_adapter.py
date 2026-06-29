@@ -301,6 +301,7 @@ class BaseHLVLMAdapter:
             return
         if self.config.target_protocol not in {
             "memer_objective",
+            "memer_objective_grounding",
             "subtask_keyframe",
             "keyframe_gated_memory",
             "keyframe_gated_memory_typed_mask",
@@ -1023,7 +1024,7 @@ class BaseHLVLMAdapter:
             "objective_prev_stage",
         }:
             return proprio_prefix + object_context + self._build_state_context_objective_prompt(sample, clips)
-        if self.config.target_protocol == "memer_objective":
+        if self.config.target_protocol in {"memer_objective", "memer_objective_grounding"}:
             return proprio_prefix + object_context + self._build_memer_objective_prompt(sample, clips)
         if self.config.target_protocol == "subtask_keyframe":
             return proprio_prefix + object_context + self._build_subtask_keyframe_prompt(sample, clips)
@@ -1166,6 +1167,7 @@ class BaseHLVLMAdapter:
             )
         if self.config.target_protocol in {
             "memer_objective",
+            "memer_objective_grounding",
             "subtask_keyframe",
             "known_prior_tracker",
             "objective_memory_state",
@@ -1233,6 +1235,16 @@ class BaseHLVLMAdapter:
                 payload["previous_stage_objective"] = prediction.previous_stage_objective
             return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
         if self.config.target_protocol == "memer_objective":
+            return json.dumps(
+                {
+                    "current_objective": prediction.current_objective,
+                    "horizon_current_objective": prediction.horizon_current_objective,
+                    "keyframe_candidate_positions": list(prediction.keyframe_candidate_positions),
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+        if self.config.target_protocol == "memer_objective_grounding":
             payload = {
                 "current_objective": prediction.current_objective,
                 "horizon_current_objective": prediction.horizon_current_objective,
@@ -1268,6 +1280,18 @@ class BaseHLVLMAdapter:
             if sample.horizon_frame_index is not None
             else "Predict the current executable objective at the last valid recent frame.\n"
         )
+        if self.config.target_protocol == "memer_objective_grounding":
+            output_schema = (
+                "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, "
+                "`target_object`, optionally `target_slot`, and `keyframe_candidate_positions`.\n"
+                "`target_object` must name the manipulated object or object part grounding the current objective.\n"
+                "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
+            )
+        else:
+            output_schema = (
+                "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, "
+                "and `keyframe_candidate_positions`.\n"
+            )
         return (
             "You receive two ordered video clips.\n"
             "The first clip contains selected historical keyframes from earlier in the episode.\n"
@@ -1281,12 +1305,9 @@ class BaseHLVLMAdapter:
             "is the last/current valid frame.\n"
             "If each frame has two concatenated views, the left slot is the left hand and the right slot is the right hand.\n"
             f"{horizon_text}"
-            "Return exactly one JSON object with keys `current_objective`, `horizon_current_objective`, "
-            "`target_object`, optionally `target_slot`, and `keyframe_candidate_positions`.\n"
+            f"{output_schema}"
             "`current_objective` must be one short executable robot instruction.\n"
             "`horizon_current_objective` must be the short executable robot instruction expected a few frames later.\n"
-            "`target_object` must name the manipulated object or object part grounding the current objective.\n"
-            "`target_slot` is optional and should name the destination/slot only when it is visually or semantically clear.\n"
             "`keyframe_candidate_positions` must be a JSON list of 1-indexed positions inside the recent observation clip only.\n"
             f"Valid keyframe candidate positions are integers from 1 to {clips.recent_valid_length} inclusive.\n"
             "These positions are relative to the recent observation clip, not absolute frame ids and not historical "

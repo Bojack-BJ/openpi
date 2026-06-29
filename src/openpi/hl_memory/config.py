@@ -10,6 +10,7 @@ HLVLMParallelMode = Literal["none", "device_map", "tensor_parallel"]
 HLTargetProtocol = Literal[
     "hl_v1",
     "memer_objective",
+    "memer_objective_grounding",
     "subtask_keyframe",
     "known_prior_tracker",
     "objective_memory_state",
@@ -117,6 +118,7 @@ class HLMemoryConfig:
         if self.target_protocol not in {
             "hl_v1",
             "memer_objective",
+            "memer_objective_grounding",
             "subtask_keyframe",
             "known_prior_tracker",
             "objective_memory_state",
@@ -128,7 +130,8 @@ class HLMemoryConfig:
             "memer_film_progress_two_pass",
         }:
             raise ValueError(
-                "`target_protocol` must be one of `hl_v1`, `memer_objective`, `subtask_keyframe`, "
+                "`target_protocol` must be one of `hl_v1`, `memer_objective`, `memer_objective_grounding`, "
+                "`subtask_keyframe`, "
                 "`known_prior_tracker`, `objective_memory_state`, `objective_last_objective`, or "
                 "`objective_prev_stage`, `keyframe_gated_memory`, `keyframe_gated_memory_typed_mask`, or "
                 "`keyframe_gated_memory_two_pass`, or `memer_film_progress_two_pass`."

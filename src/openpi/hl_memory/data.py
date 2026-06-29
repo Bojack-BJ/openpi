@@ -275,7 +275,7 @@ class ExportedHLMemorySample:
                 new_completed_objective=self.new_completed_objective,
                 completed_objective=self.new_completed_objective,
             )
-        if target_protocol == "memer_objective":
+        if target_protocol in {"memer_objective", "memer_objective_grounding"}:
             objective = self.current_objective or self.current_subtask
             horizon_objective = self.horizon_current_objective or objective
             return HLMemoryPrediction(

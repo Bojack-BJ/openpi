@@ -185,6 +185,7 @@ class TrainArgs:
 def _keyframe_auxiliary_enabled(args: TrainArgs) -> bool:
     supported_protocols = {
         "memer_objective",
+        "memer_objective_grounding",
         "subtask_keyframe",
         "keyframe_gated_memory",
         "keyframe_gated_memory_typed_mask",
