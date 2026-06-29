@@ -1069,9 +1069,9 @@ def _log_fsdp_report(report: FSDPReport) -> None:
 
 
 def _fsdp_ignored_named_modules(model: torch.nn.Module) -> list[tuple[str, torch.nn.Module]]:
-    # PEFT/LoRA freezes embeddings and lm_head by default. Keeping those
-    # frozen modules out of root FSDP avoids tied/flat parameter shape issues
-    # such as lm_head.weight becoming a 1D flat parameter at F.linear().
+    # Keep embedding/lm_head modules out of root FSDP even when they are
+    # trainable. They are often tied or accessed directly by model.forward();
+    # flattening lm_head.weight makes F.linear() see a 1D flat parameter.
     ignored: list[tuple[str, torch.nn.Module]] = []
     seen: set[int] = set()
     module_names = {id(module): name for name, module in model.named_modules()}
@@ -1090,14 +1090,14 @@ def _fsdp_ignored_named_modules(model: torch.nn.Module) -> list[tuple[str, torch
         if module is None or id(module) in seen:
             continue
         parameters = list(module.parameters(recurse=True))
-        if parameters and not any(parameter.requires_grad for parameter in parameters):
+        if parameters:
             ignored.append((module_names.get(id(module), accessor_name), module))
             seen.add(id(module))
     for name, module in model.named_modules():
         if not name.endswith(("lm_head", "embed_tokens")) or id(module) in seen:
             continue
         parameters = list(module.parameters(recurse=True))
-        if parameters and not any(parameter.requires_grad for parameter in parameters):
+        if parameters:
             ignored.append((name, module))
             seen.add(id(module))
     return ignored
