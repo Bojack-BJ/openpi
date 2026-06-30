@@ -33,6 +33,7 @@ from openpi.hl_memory.keyframe_auxiliary import find_keyframe_auxiliary_model
 from openpi.hl_memory.keyframe_auxiliary import save_keyframe_auxiliary_state
 from openpi.hl_memory.proprio import proprio_base_embedding_modules
 from openpi.hl_memory.proprio import save_proprio_state_if_available
+from openpi.hl_memory.proprio import summarize_proprio_gradients
 from openpi.hl_memory.proprio import temporarily_unwrap_proprio_embeddings
 from openpi.hl_memory.sampling import sample_keyframe_stratified
 from openpi.hl_memory.training_loss import compute_hl_target_loss_with_metrics
@@ -112,6 +113,8 @@ class TrainArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    proprio_projector_mode: str = "joint"
+    proprio_debug_gradients: bool = False
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
     keyframe_candidate_label_mode: str = "canonical"
@@ -180,6 +183,8 @@ class TrainArgs:
     profile_start_step: int = 1
     profile_trace_dir: pathlib.Path | None = None
     profile_record_shapes: bool = False
+    debug_high_loss_jsonl: pathlib.Path | None = None
+    debug_high_loss_threshold: float = 0.25
 
 
 def _keyframe_auxiliary_enabled(args: TrainArgs) -> bool:
@@ -287,6 +292,8 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        proprio_projector_mode=args.proprio_projector_mode,
+        proprio_debug_gradients=args.proprio_debug_gradients,
         keyframe_event_band_before_sec=args.keyframe_event_band_before_sec,
         keyframe_event_band_after_sec=args.keyframe_event_band_after_sec,
         keyframe_candidate_label_mode=args.keyframe_candidate_label_mode,
@@ -385,6 +392,7 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
     frame_cache = FrameCache(args.frame_cache_size)
     rng = random.Random(args.seed + rank)
     val_rng = random.Random(args.val_seed + rank)
+    debug_high_loss_jsonl = _resolve_debug_high_loss_jsonl(args.debug_high_loss_jsonl, rank=rank, world_size=world_size)
     running_loss = 0.0
     running_data_time = 0.0
     running_step_time = 0.0
@@ -475,6 +483,19 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                         _maybe_cuda_synchronize(device, enabled=profile_step)
                         step_forward_time += time.perf_counter() - forward_start_time
                         loss_value = float(loss.detach().cpu())
+                        _maybe_log_high_loss_batch(
+                            debug_high_loss_jsonl,
+                            threshold=args.debug_high_loss_threshold,
+                            phase="train",
+                            step=step,
+                            rank=rank,
+                            loss_value=loss_value,
+                            loss_metrics=loss_metrics,
+                            batch_samples=batch_samples,
+                            supervised_tokens=supervised_tokens,
+                            target_protocol=hl_config.target_protocol,
+                            keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                        )
                         if not math.isfinite(loss_value):
                             sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
                             raise FloatingPointError(
@@ -491,6 +512,8 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     if torch_prof is not None:
                         torch_prof.step()
 
+                if args.proprio_debug_gradients:
+                    _accumulate_float_metrics(step_loss_metrics, summarize_proprio_gradients(loaded.model))
                 _maybe_cuda_synchronize(device, enabled=profile_step)
                 optim_start_time = time.perf_counter()
                 grad_scaler.unscale_(optimizer)
@@ -603,6 +626,10 @@ def _train(args: TrainArgs, *, distributed: bool) -> None:
                     field_keyframe_candidate_positions_loss_weight=args.field_keyframe_candidate_positions_loss_weight,
                     field_completed_objective_loss_weight=args.field_completed_objective_loss_weight,
                     field_template_loss_weight=args.field_template_loss_weight,
+                    debug_high_loss_jsonl=debug_high_loss_jsonl,
+                    debug_high_loss_threshold=args.debug_high_loss_threshold,
+                    rank=rank,
+                    step=step,
                 )
                 logged_val_metrics = (
                     _mean_metric_dict_across_ranks(val_metrics, device=device) if distributed else val_metrics
@@ -1177,6 +1204,10 @@ def _evaluate_loss(
     field_keyframe_candidate_positions_loss_weight: float,
     field_completed_objective_loss_weight: float,
     field_template_loss_weight: float,
+    debug_high_loss_jsonl: pathlib.Path | None,
+    debug_high_loss_threshold: float,
+    rank: int,
+    step: int,
 ) -> dict[str, float]:
     if num_batches <= 0:
         raise ValueError("--val-batches must be positive when validation is enabled.")
@@ -1218,6 +1249,19 @@ def _evaluate_loss(
                     field_template_weight=field_template_loss_weight,
                 )
                 loss_value = float(loss.detach().cpu())
+                _maybe_log_high_loss_batch(
+                    debug_high_loss_jsonl,
+                    threshold=debug_high_loss_threshold,
+                    phase="val",
+                    step=step,
+                    rank=rank,
+                    loss_value=loss_value,
+                    loss_metrics=loss_metrics,
+                    batch_samples=batch_samples,
+                    supervised_tokens=supervised_tokens,
+                    target_protocol=hl_config.target_protocol,
+                    keyframe_candidate_label_mode=hl_config.keyframe_candidate_label_mode,
+                )
                 if not math.isfinite(loss_value):
                     sample_ids = ",".join(sample.sample_id for sample in batch_samples[:4])
                     raise FloatingPointError(
@@ -1229,6 +1273,79 @@ def _evaluate_loss(
         if was_training:
             loaded.model.train()
     return {name: value / num_batches for name, value in sorted(total_metrics.items())}
+
+
+def _resolve_debug_high_loss_jsonl(path: pathlib.Path | None, *, rank: int, world_size: int) -> pathlib.Path | None:
+    if path is None:
+        return None
+    if world_size <= 1:
+        resolved = path
+    else:
+        resolved = path.with_name(f"{path.stem}.rank{rank}{path.suffix or '.jsonl'}")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _maybe_log_high_loss_batch(
+    path: pathlib.Path | None,
+    *,
+    threshold: float,
+    phase: str,
+    step: int,
+    rank: int,
+    loss_value: float,
+    loss_metrics: dict[str, float],
+    batch_samples: list,
+    supervised_tokens: list[int],
+    target_protocol: str,
+    keyframe_candidate_label_mode: str,
+) -> None:
+    if path is None or not math.isfinite(loss_value) or loss_value < threshold:
+        return
+    record = {
+        "phase": phase,
+        "step": int(step),
+        "rank": int(rank),
+        "loss": float(loss_value),
+        "loss_metrics": {name: float(value) for name, value in sorted(loss_metrics.items())},
+        "target_protocol": target_protocol,
+        "keyframe_candidate_label_mode": keyframe_candidate_label_mode,
+        "samples": [
+            _high_loss_sample_record(
+                sample,
+                supervised_tokens=int(supervised_tokens[index]) if index < len(supervised_tokens) else None,
+                target_protocol=target_protocol,
+                keyframe_candidate_label_mode=keyframe_candidate_label_mode,
+            )
+            for index, sample in enumerate(batch_samples)
+        ],
+    }
+    with path.open("a") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _high_loss_sample_record(
+    sample,
+    *,
+    supervised_tokens: int | None,
+    target_protocol: str,
+    keyframe_candidate_label_mode: str,
+) -> dict[str, object]:
+    target = sample.target_prediction(
+        target_protocol=target_protocol,
+        keyframe_candidate_label_mode=keyframe_candidate_label_mode,
+    )
+    return {
+        "sample_id": sample.sample_id,
+        "episode_index": sample.episode_index,
+        "step_index": sample.step_index,
+        "frame_index": sample.frame_index,
+        "supervised_tokens": supervised_tokens,
+        "recent_frame_indices": list(sample.recent_frame_indices),
+        "memory_frame_indices": list(sample.memory_frame_indices),
+        "language_memory": sample.language_memory,
+        "target": target.to_dict(),
+    }
 
 
 def _init_distributed(args: TrainArgs) -> bool:

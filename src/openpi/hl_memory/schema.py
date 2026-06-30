@@ -132,13 +132,15 @@ class HLMemoryPrediction:
             result["target_bbox_xyxy"] = [int(value) for value in self.target_bbox_xyxy]
         return result
 
-    def to_runtime_schema_dict(self) -> dict[str, object]:
+    def to_runtime_schema_dict(self, *, include_grounding: bool = False) -> dict[str, object]:
         """Returns the compact prediction schema used by eval and rollout logs.
 
         This intentionally omits legacy compatibility fields such as
         updated_language_memory/current_subtask and unused query fields. The
         output is kept aligned with the current rollout contract:
         task progress in, objective/keyframe/completion state out.
+        `include_grounding` keeps target fields present even when empty so
+        debug logs can distinguish "not predicted" from "not part of schema".
         """
         result: dict[str, object] = {
             "task_progress": self.task_progress,
@@ -147,9 +149,8 @@ class HLMemoryPrediction:
             "keyframe_candidate_positions": list(self.keyframe_candidate_positions),
             "new_completed_objective": self.new_completed_objective,
         }
-        if self.target_object:
+        if include_grounding:
             result["target_object"] = self.target_object
-        if self.target_slot:
             result["target_slot"] = self.target_slot
         return result
 

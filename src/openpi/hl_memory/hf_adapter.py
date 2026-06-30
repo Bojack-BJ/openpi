@@ -94,8 +94,22 @@ class BaseHLVLMAdapter:
             torch_dtype = torch.float16
         pretrained_path = model_path or self.config.resolved_model_id
         peft_adapter_path = _as_peft_adapter_path(pretrained_path)
-        logging.info("[stage] loading processor from %s", pretrained_path)
-        processor = transformers.AutoProcessor.from_pretrained(pretrained_path, trust_remote_code=True)
+        processor_path = pretrained_path
+        try:
+            logging.info("[stage] loading processor from %s", processor_path)
+            processor = transformers.AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
+        except ValueError as exc:
+            fallback_processor_path = self.config.resolved_model_id
+            if pathlib.Path(str(pretrained_path)).resolve() == pathlib.Path(str(fallback_processor_path)).resolve():
+                raise
+            logging.warning(
+                "Could not load processor from %s (%s); falling back to base model %s.",
+                processor_path,
+                exc,
+                fallback_processor_path,
+            )
+            processor_path = fallback_processor_path
+            processor = transformers.AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
         tokenizer = getattr(processor, "tokenizer", None)
         if tokenizer is not None:
             # Decoder-only generation must left-pad batched prompts so the last

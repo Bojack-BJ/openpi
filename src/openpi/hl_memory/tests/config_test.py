@@ -177,16 +177,35 @@ def test_target_protocol_rejects_unknown_value():
 
 
 def test_proprio_config_accepts_soft_token_modes():
-    config = HLMemoryConfig(proprio_enabled=True, proprio_token_mode="per_frame_plus_summary")
+    config = HLMemoryConfig(
+        proprio_enabled=True,
+        proprio_token_mode="per_frame_plus_summary",
+        proprio_projector_mode="split",
+        proprio_ablation_mode="gripper_only",
+        proprio_debug_gradients=True,
+    )
 
     assert config.proprio_enabled is True
     assert config.proprio_state_dim == 14
     assert config.proprio_hidden_dim == 512
+    assert config.proprio_projector_mode == "split"
+    assert config.proprio_ablation_mode == "gripper_only"
+    assert config.proprio_debug_gradients is True
 
 
 def test_proprio_config_rejects_unknown_token_mode():
     with pytest.raises(ValueError, match="proprio_token_mode"):
         HLMemoryConfig(proprio_enabled=True, proprio_token_mode="none")  # type: ignore[arg-type]
+
+
+def test_proprio_config_rejects_unknown_projector_mode():
+    with pytest.raises(ValueError, match="proprio_projector_mode"):
+        HLMemoryConfig(proprio_projector_mode="bad")  # type: ignore[arg-type]
+
+
+def test_proprio_config_rejects_unknown_ablation_mode():
+    with pytest.raises(ValueError, match="proprio_ablation_mode"):
+        HLMemoryConfig(proprio_ablation_mode="bad")  # type: ignore[arg-type]
 
 
 def test_keyframe_auxiliary_config_validates_dimensions_and_timing_sigma():

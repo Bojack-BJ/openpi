@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import json
@@ -17,23 +18,56 @@ PROPRIO_FRAME_TOKEN = "<|hl_proprio_frame|>"
 PROPRIO_SUMMARY_TOKEN = "<|hl_proprio_summary|>"
 PROPRIO_STATE_FILENAME = "hl_proprio_projector.pt"
 PROPRIO_CONFIG_FILENAME = "hl_proprio_config.json"
+_DEFAULT_TRANSLATION_DIMS = (0, 1, 2, 7, 8, 9)
+_DEFAULT_ROTATION_DIMS = (3, 4, 5, 10, 11, 12)
+_DEFAULT_GRIPPER_DIMS = (6, 13)
 
 
 class ProprioTokenProjector(torch.nn.Module):
-    def __init__(self, *, state_dim: int, hidden_dim: int, output_dim: int, dropout: float, noise_std: float):
+    def __init__(
+        self,
+        *,
+        state_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        dropout: float,
+        noise_std: float,
+        projector_mode: str = "joint",
+    ):
         super().__init__()
         self.state_dim = int(state_dim)
         self.hidden_dim = int(hidden_dim)
         self.output_dim = int(output_dim)
         self.dropout = float(dropout)
         self.noise_std = float(noise_std)
+        self.projector_mode = projector_mode
         input_dim = self.state_dim * 2
-        self.frame_mlp = torch.nn.Sequential(
-            torch.nn.LayerNorm(input_dim),
-            torch.nn.Linear(input_dim, self.hidden_dim),
-            torch.nn.SiLU(),
-            torch.nn.Linear(self.hidden_dim, self.output_dim),
+        self.frame_mlp = (
+            torch.nn.Sequential(
+                torch.nn.LayerNorm(input_dim),
+                torch.nn.Linear(input_dim, self.hidden_dim),
+                torch.nn.SiLU(),
+                torch.nn.Linear(self.hidden_dim, self.output_dim),
+            )
+            if projector_mode == "joint"
+            else None
         )
+        if projector_mode == "split":
+            translation_dim = len(_group_dims_for_state_dim(self.state_dim, group="translation")) * 2
+            rotation_dim = len(_group_dims_for_state_dim(self.state_dim, group="rotation")) * 2
+            gripper_dim = len(_group_dims_for_state_dim(self.state_dim, group="gripper")) * 2
+            self.translation_mlp = _make_split_branch(translation_dim, self.hidden_dim, self.output_dim)
+            self.rotation_mlp = _make_split_branch(rotation_dim, self.hidden_dim, self.output_dim)
+            self.gripper_mlp = _make_split_branch(gripper_dim, self.hidden_dim, self.output_dim)
+            self.split_out = torch.nn.Sequential(
+                torch.nn.LayerNorm(self.output_dim * 3),
+                torch.nn.Linear(self.output_dim * 3, self.output_dim),
+            )
+        else:
+            self.translation_mlp = None
+            self.rotation_mlp = None
+            self.gripper_mlp = None
+            self.split_out = None
         self.summary_query = torch.nn.Parameter(torch.zeros(self.output_dim))
         self.summary_key = torch.nn.Linear(self.output_dim, self.output_dim, bias=False)
         self.summary_value = torch.nn.Linear(self.output_dim, self.output_dim, bias=False)
@@ -56,8 +90,13 @@ class ProprioTokenProjector(torch.nn.Module):
             masks = masks * keep
 
         valid_time = masks.to(dtype=torch.bool).any(dim=-1)
-        inputs = torch.cat([states * masks, masks], dim=-1)
-        frame_tokens = self.frame_mlp(inputs)
+        if self.projector_mode == "joint":
+            if self.frame_mlp is None:
+                raise RuntimeError("Joint proprio projector is not initialized.")
+            inputs = torch.cat([states * masks, masks], dim=-1)
+            frame_tokens = self.frame_mlp(inputs)
+        else:
+            frame_tokens = self._split_frame_tokens(states, masks)
         frame_tokens = frame_tokens * valid_time.unsqueeze(-1).to(dtype=frame_tokens.dtype)
 
         keys = self.summary_key(frame_tokens)
@@ -74,6 +113,14 @@ class ProprioTokenProjector(torch.nn.Module):
         summary = torch.einsum("bt,bth->bh", attn, values)
         summary = self.summary_out(summary)
         return frame_tokens, summary
+
+    def _split_frame_tokens(self, states: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+        if self.translation_mlp is None or self.rotation_mlp is None or self.gripper_mlp is None or self.split_out is None:
+            raise RuntimeError("Split proprio projector is not initialized.")
+        translation = self.translation_mlp(_select_group_inputs(states, masks, group="translation"))
+        rotation = self.rotation_mlp(_select_group_inputs(states, masks, group="rotation"))
+        gripper = self.gripper_mlp(_select_group_inputs(states, masks, group="gripper"))
+        return self.split_out(torch.cat([translation, rotation, gripper], dim=-1))
 
 
 class ProprioEmbeddingWrapper(torch.nn.Module):
@@ -94,14 +141,46 @@ class ProprioEmbeddingWrapper(torch.nn.Module):
         self.token_mode = token_mode
         self._states: torch.Tensor | None = None
         self._masks: torch.Tensor | None = None
+        self._last_grad_summary: dict[str, float] = {}
 
     @property
     def weight(self) -> torch.nn.Parameter:
         return self.base_embedding.weight
 
-    def set_proprio_batch(self, states: torch.Tensor | None, masks: torch.Tensor | None) -> None:
+    def set_proprio_batch(
+        self,
+        states: torch.Tensor | None,
+        masks: torch.Tensor | None,
+        *,
+        track_gradients: bool = False,
+    ) -> None:
+        if states is not None and track_gradients:
+            states = states.detach().requires_grad_(True)
+            states.register_hook(self._capture_state_gradients)
+        else:
+            self._last_grad_summary = {}
         self._states = states
         self._masks = masks
+
+    def grad_summary(self) -> dict[str, float]:
+        return dict(self._last_grad_summary)
+
+    def _capture_state_gradients(self, grad: torch.Tensor) -> None:
+        grad = grad.detach()
+        total = float(grad.abs().mean().item())
+        translation = float(_group_grad_abs_mean(grad, group="translation"))
+        rotation = float(_group_grad_abs_mean(grad, group="rotation"))
+        gripper = float(_group_grad_abs_mean(grad, group="gripper"))
+        denom = max(translation + rotation + gripper, 1.0e-12)
+        self._last_grad_summary = {
+            "proprio_grad_abs_mean": total,
+            "proprio_grad_abs_mean_translation": translation,
+            "proprio_grad_abs_mean_rotation": rotation,
+            "proprio_grad_abs_mean_gripper": gripper,
+            "proprio_grad_share_translation": translation / denom,
+            "proprio_grad_share_rotation": rotation / denom,
+            "proprio_grad_share_gripper": gripper / denom,
+        }
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeddings = self.base_embedding(input_ids)
@@ -166,6 +245,7 @@ def configure_model_for_proprio(model: torch.nn.Module, processor: Any, config: 
         output_dim=output_dim,
         dropout=config.proprio_dropout,
         noise_std=config.proprio_noise_std,
+        projector_mode=config.proprio_projector_mode,
     )
     wrapper = ProprioEmbeddingWrapper(
         base_embedding=base_embedding,
@@ -203,6 +283,7 @@ def save_proprio_state_if_available(model: torch.nn.Module, output_dir: pathlib.
         "proprio_hidden_dim": config.proprio_hidden_dim,
         "proprio_dropout": config.proprio_dropout,
         "proprio_noise_std": config.proprio_noise_std,
+        "proprio_projector_mode": config.proprio_projector_mode,
         "frame_token": PROPRIO_FRAME_TOKEN,
         "summary_token": PROPRIO_SUMMARY_TOKEN,
     }
@@ -252,13 +333,18 @@ def set_model_proprio_batch(
     if wrapper is None:
         raise ValueError("Proprio is enabled but the model input embedding has not been configured.")
     states, masks = build_proprio_batch(samples, config, device=device)
-    wrapper.set_proprio_batch(states, masks)
+    wrapper.set_proprio_batch(states, masks, track_gradients=config.proprio_debug_gradients)
 
 
 def clear_model_proprio_batch(model: torch.nn.Module) -> None:
     wrapper = find_proprio_embedding_wrapper(model)
     if wrapper is not None:
         wrapper.set_proprio_batch(None, None)
+
+
+def summarize_proprio_gradients(model: torch.nn.Module) -> dict[str, float]:
+    wrapper = find_proprio_embedding_wrapper(model)
+    return {} if wrapper is None else wrapper.grad_summary()
 
 
 def build_proprio_batch(
@@ -313,6 +399,47 @@ def build_proprio_batch(
     return state_tensor, mask_tensor
 
 
+def apply_proprio_ablation(
+    sample: ExportedHLMemorySample,
+    *,
+    mode: str,
+) -> ExportedHLMemorySample:
+    if mode == "none":
+        return sample
+    if not sample.recent_robot_states:
+        return sample
+
+    states = torch.tensor(sample.recent_robot_states, dtype=torch.float32)
+    if sample.recent_robot_state_masks:
+        masks = torch.tensor(sample.recent_robot_state_masks, dtype=torch.float32)
+    else:
+        masks = torch.ones_like(states)
+
+    if mode == "zero":
+        states.zero_()
+        masks.zero_()
+    elif mode == "gripper_only":
+        states, masks = _keep_only_groups(states, masks, {"gripper"})
+    elif mode == "pose_only":
+        states, masks = _keep_only_groups(states, masks, {"translation", "rotation"})
+    elif mode == "translation_only":
+        states, masks = _keep_only_groups(states, masks, {"translation"})
+    elif mode == "rotation_only":
+        states, masks = _keep_only_groups(states, masks, {"rotation"})
+    elif mode == "time_shuffle":
+        states, masks = _permute_time(states, masks, reverse=False)
+    elif mode == "reverse_time":
+        states, masks = _permute_time(states, masks, reverse=True)
+    else:
+        raise ValueError(f"Unsupported proprio ablation mode: {mode}")
+
+    return dataclasses.replace(
+        sample,
+        recent_robot_states=states.tolist(),
+        recent_robot_state_masks=masks.tolist(),
+    )
+
+
 def render_proprio_token_text(sample: ExportedHLMemorySample, config: HLMemoryConfig) -> str:
     if not config.proprio_enabled:
         return ""
@@ -353,3 +480,76 @@ def _embedding_output_dim(embedding: torch.nn.Module) -> int:
     if embedding_dim is not None:
         return int(embedding_dim)
     raise ValueError(f"Cannot infer embedding dimension from {type(embedding).__name__}.")
+
+
+def _make_split_branch(input_dim: int, hidden_dim: int, output_dim: int) -> torch.nn.Module:
+    effective_input_dim = max(int(input_dim), 1)
+    return torch.nn.Sequential(
+        torch.nn.LayerNorm(effective_input_dim),
+        torch.nn.Linear(effective_input_dim, hidden_dim),
+        torch.nn.SiLU(),
+        torch.nn.Linear(hidden_dim, output_dim),
+    )
+
+
+def _group_dims_for_state_dim(state_dim: int, *, group: str) -> tuple[int, ...]:
+    if state_dim == 14:
+        if group == "translation":
+            return _DEFAULT_TRANSLATION_DIMS
+        if group == "rotation":
+            return _DEFAULT_ROTATION_DIMS
+        if group == "gripper":
+            return _DEFAULT_GRIPPER_DIMS
+    if group == "translation":
+        return tuple(range(state_dim))
+    return ()
+
+
+def _select_group_inputs(states: torch.Tensor, masks: torch.Tensor, *, group: str) -> torch.Tensor:
+    dims = _group_dims_for_state_dim(states.shape[-1], group=group)
+    if not dims:
+        zeros = torch.zeros((*states.shape[:-1], 1), dtype=states.dtype, device=states.device)
+        return torch.cat([zeros, zeros], dim=-1)
+    state_subset = states[..., list(dims)]
+    mask_subset = masks[..., list(dims)]
+    return torch.cat([state_subset * mask_subset, mask_subset], dim=-1)
+
+
+def _group_grad_abs_mean(grad: torch.Tensor, *, group: str) -> float:
+    dims = _group_dims_for_state_dim(grad.shape[-1], group=group)
+    if not dims:
+        return 0.0
+    return float(grad[..., list(dims)].abs().mean().item())
+
+
+def _keep_only_groups(
+    states: torch.Tensor,
+    masks: torch.Tensor,
+    groups: set[str],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keep_dims: set[int] = set()
+    for group in groups:
+        keep_dims.update(_group_dims_for_state_dim(states.shape[-1], group=group))
+    if len(keep_dims) == states.shape[-1]:
+        return states, masks
+    keep_mask = torch.zeros(states.shape[-1], dtype=torch.bool, device=states.device)
+    if keep_dims:
+        keep_mask[list(sorted(keep_dims))] = True
+    states = states * keep_mask.view(1, 1, -1).to(dtype=states.dtype)
+    masks = masks * keep_mask.view(1, 1, -1).to(dtype=masks.dtype)
+    return states, masks
+
+
+def _permute_time(
+    states: torch.Tensor,
+    masks: torch.Tensor,
+    *,
+    reverse: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if states.shape[0] <= 1:
+        return states, masks
+    if reverse:
+        order = torch.arange(states.shape[0] - 1, -1, -1, device=states.device)
+    else:
+        order = torch.randperm(states.shape[0], device=states.device)
+    return states[order], masks[order]

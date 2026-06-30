@@ -20,6 +20,7 @@ from openpi.hl_memory.eval import EvalRolloutOptions
 from openpi.hl_memory.eval import group_samples_by_episode
 from openpi.hl_memory.eval import run_offline_rollout_batched
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.proprio import apply_proprio_ablation
 
 
 @dataclasses.dataclass
@@ -54,6 +55,8 @@ class EvalArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    proprio_projector_mode: str = "joint"
+    proprio_ablation_mode: str = "none"
     progress_condition_enabled: bool = False
     progress_condition_input_mode: str = "completed_only"
     progress_condition_dim: int = 128
@@ -138,6 +141,8 @@ def main(args: EvalArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        proprio_projector_mode=args.proprio_projector_mode,
+        proprio_ablation_mode=args.proprio_ablation_mode,
         progress_condition_enabled=args.progress_condition_enabled,
         progress_condition_input_mode=args.progress_condition_input_mode,
         progress_condition_dim=args.progress_condition_dim,
@@ -160,6 +165,7 @@ def main(args: EvalArgs) -> None:
     frame_cache = FrameCache(args.frame_cache_size)
 
     def predict_batch(batch_samples):
+        batch_samples = [apply_proprio_ablation(sample, mode=hl_config.proprio_ablation_mode) for sample in batch_samples]
         batch_clips = [
             load_video_clips_for_sample(sample, args.dataset_dir, hl_config, frame_cache=frame_cache)
             for sample in batch_samples

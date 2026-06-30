@@ -22,6 +22,17 @@ HLTargetProtocol = Literal[
     "memer_film_progress_two_pass",
 ]
 HLProprioTokenMode = Literal["per_frame", "summary", "per_frame_plus_summary"]
+HLProprioProjectorMode = Literal["joint", "split"]
+HLProprioAblationMode = Literal[
+    "none",
+    "zero",
+    "gripper_only",
+    "pose_only",
+    "translation_only",
+    "rotation_only",
+    "time_shuffle",
+    "reverse_time",
+]
 HLKeyframeCandidateLabelMode = Literal["canonical", "event_band"]
 HLProgressConditionInputMode = Literal["completed_only", "structured", "full"]
 HLStateConditionMode = Literal["off", "film", "token", "both"]
@@ -82,10 +93,13 @@ class HLMemoryConfig:
     target_protocol: HLTargetProtocol = "hl_v1"
     proprio_enabled: bool = False
     proprio_token_mode: HLProprioTokenMode = "per_frame_plus_summary"
+    proprio_projector_mode: HLProprioProjectorMode = "joint"
     proprio_state_dim: int = 14
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    proprio_ablation_mode: HLProprioAblationMode = "none"
+    proprio_debug_gradients: bool = False
     keyframe_event_band_before_sec: float = 1.0
     keyframe_event_band_after_sec: float = 0.5
     keyframe_candidate_label_mode: HLKeyframeCandidateLabelMode = "canonical"
@@ -146,6 +160,22 @@ class HLMemoryConfig:
             )
         if self.proprio_token_mode not in {"per_frame", "summary", "per_frame_plus_summary"}:
             raise ValueError("`proprio_token_mode` must be one of `per_frame`, `summary`, or `per_frame_plus_summary`.")
+        if self.proprio_projector_mode not in {"joint", "split"}:
+            raise ValueError("`proprio_projector_mode` must be one of `joint` or `split`.")
+        if self.proprio_ablation_mode not in {
+            "none",
+            "zero",
+            "gripper_only",
+            "pose_only",
+            "translation_only",
+            "rotation_only",
+            "time_shuffle",
+            "reverse_time",
+        }:
+            raise ValueError(
+                "`proprio_ablation_mode` must be one of `none`, `zero`, `gripper_only`, `pose_only`, "
+                "`translation_only`, `rotation_only`, `time_shuffle`, or `reverse_time`."
+            )
         if self.keyframe_candidate_label_mode not in {"canonical", "event_band"}:
             raise ValueError("`keyframe_candidate_label_mode` must be one of `canonical` or `event_band`.")
         if self.keyframe_event_band_before_sec < 0.0:

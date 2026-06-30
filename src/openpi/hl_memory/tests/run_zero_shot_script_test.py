@@ -506,6 +506,8 @@ def test_keyframe_gated_prediction_payload_is_protocol_specific():
         "current_objective": "place toast",
         "keyframe_candidate_positions": [2],
         "horizon_current_objective": "place toast",
+        "target_object": "",
+        "target_slot": "",
         "new_completed_objective": "place toast",
         "task_progress": "No completed subtask yet.",
     }
@@ -513,6 +515,8 @@ def test_keyframe_gated_prediction_payload_is_protocol_specific():
         "current_objective": "place toast",
         "keyframe_candidate_positions": [2],
         "horizon_current_objective": "place toast",
+        "target_object": "",
+        "target_slot": "",
         "new_completed_objective": "place toast",
         "task_progress": "No completed subtask yet.",
     }

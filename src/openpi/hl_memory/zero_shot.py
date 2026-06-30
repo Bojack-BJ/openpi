@@ -490,6 +490,7 @@ def save_prediction_debug_panel(
     state_update: str = "",
     ground_truth_subtask: str | None = None,
     parse_error: str | None = None,
+    include_grounding: bool = False,
     title: str = "HL memory debug",
 ) -> pathlib.Path:
     output_path = pathlib.Path(output_path)
@@ -596,6 +597,7 @@ def save_prediction_debug_panel(
         state_update=state_update,
         ground_truth_subtask=ground_truth_subtask,
         parse_error=parse_error,
+        include_grounding=include_grounding,
     )
     _draw_debug_text_lines(
         draw,
@@ -672,6 +674,7 @@ def _build_debug_text_lines(
     state_update: str,
     ground_truth_subtask: str | None,
     parse_error: str | None,
+    include_grounding: bool = False,
 ) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = []
     step_label = "single" if step_index is None else str(step_index)
@@ -704,6 +707,9 @@ def _build_debug_text_lines(
             style="accent",
             max_lines=3,
         )
+    if include_grounding or _debug_protocol_outputs_grounding(target_protocol):
+        _append_wrapped_debug_line(lines, "Target object", prediction.target_object or "none", max_lines=2)
+        _append_wrapped_debug_line(lines, "Target slot", prediction.target_slot or "none", max_lines=2)
     state_output = _debug_state_output(target_protocol, prediction)
     if state_output is not None:
         label, value = state_output
@@ -782,6 +788,17 @@ def _debug_state_input_label(target_protocol: str) -> str | None:
         "keyframe_gated_memory_two_pass": "Completed event log",
         "memer_film_progress_two_pass": "Completed event log",
     }.get(target_protocol)
+
+
+def _debug_protocol_outputs_grounding(target_protocol: str) -> bool:
+    return target_protocol in {
+        "memer_objective_grounding",
+        "keyframe_gated_memory",
+        "keyframe_gated_memory_typed_mask",
+        "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
+        "subtask_keyframe",
+    }
 
 
 def _debug_state_output(

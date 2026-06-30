@@ -20,7 +20,7 @@ Usage: run_eval_hl_memory_multitask.sh --ckpt PATH [options]
 
 Options:
   --ckpt PATH            LoRA checkpoint directory, e.g. checkpoint-step-001500.
-  --backbone NAME        qwen2_5, qwen2_5_3b, qwen3_5_2b, qwen3_5_4b, qwen3_5_27b.
+  --backbone NAME        qwen2_5, qwen2_5_3b, qwen3_vl_4b, qwen3_5_2b, qwen3_5_4b, qwen3_5_27b.
   --dataset-root PATH    HL memory dataset root.
   --dataset-glob GLOB    Dataset glob, default */val.
   --gpu ID               Single GPU id for eval.
@@ -76,6 +76,11 @@ case "$BACKBONE" in
     VLM_BACKEND="qwen3_5_vl"
     VLM_VARIANT="qwen3_5_27b"
     BACKBONE_TAG="qwen3_5_27b"
+    ;;
+  qwen3_vl|qwen3_vl_4b|qwen3vl|qwen3vl_4b|qwen3_4b)
+    VLM_BACKEND="qwen3_vl"
+    VLM_VARIANT="qwen3_vl_4b"
+    BACKBONE_TAG="qwen3_vl_4b"
     ;;
   *)
     echo "Unsupported --backbone: $BACKBONE" >&2

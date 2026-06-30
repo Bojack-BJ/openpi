@@ -17,6 +17,7 @@ import tyro
 from openpi.hl_memory.config import HLMemoryConfig
 from openpi.hl_memory.config_io import resolve_cli_args_with_yaml
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.proprio import apply_proprio_ablation
 from openpi.hl_memory.proprio import PROPRIO_CONFIG_FILENAME
 from openpi.hl_memory.schema import HLMemoryPrediction
 from openpi.hl_memory.schema import render_language_memory_fields
@@ -110,6 +111,7 @@ class ZeroShotArgs:
     embedding_debug_dir: pathlib.Path | None = None
     embedding_debug_max_tokens: int = 160
     debug_video_fps: float = 1.0
+    output_schema: str = "auto"
 
     # Runtime memory and clip selection.
     language_memory: str = ""
@@ -169,6 +171,8 @@ class ZeroShotArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    proprio_projector_mode: str = "joint"
+    proprio_ablation_mode: str = "none"
     progress_condition_enabled: bool = False
     progress_condition_input_mode: str = "completed_only"
     progress_condition_dim: int = 128
@@ -216,6 +220,8 @@ def main(args: ZeroShotArgs) -> None:
         raise ValueError("`--object-mask-frame-fps` must be positive when set.")
     if args.memory_input_mode not in {"full", "completed_only", "empty"}:
         raise ValueError("`--memory-input-mode` must be one of `full`, `completed_only`, or `empty`.")
+    if args.output_schema not in {"auto", "base", "grounding"}:
+        raise ValueError("`--output-schema` must be one of `auto`, `base`, or `grounding`.")
     if args.target_protocol == "memer_objective" and args.known_prior_mode:
         raise ValueError(
             "`--target-protocol memer_objective` does not support `--known-prior-mode`; "
@@ -251,6 +257,8 @@ def main(args: ZeroShotArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        proprio_projector_mode=args.proprio_projector_mode,
+        proprio_ablation_mode=args.proprio_ablation_mode,
         progress_condition_enabled=args.progress_condition_enabled,
         progress_condition_input_mode=args.progress_condition_input_mode,
         progress_condition_dim=args.progress_condition_dim,
@@ -355,6 +363,14 @@ def _resolve_checkpoint_proprio_args(args: ZeroShotArgs) -> ZeroShotArgs:
         cli_names=("--proprio-noise-std",),
         cast=float,
     )
+    _maybe_set_checkpoint_arg(
+        args,
+        updates,
+        payload,
+        field_name="proprio_projector_mode",
+        cli_names=("--proprio-projector-mode",),
+        cast=str,
+    )
     if updates:
         logging.info("Loaded proprio runtime config from %s: %s", config_path, updates)
         return dataclasses.replace(args, **updates)
@@ -441,6 +457,7 @@ def _run_single_prediction(
         recent_seconds=selection.recent_seconds,
     )
     sample = _attach_runtime_proprio(sample, args=args, config=config, recent_seconds=selection.recent_seconds)
+    sample = apply_proprio_ablation(sample, mode=config.proprio_ablation_mode)
     sample = _attach_runtime_object_context(sample, args=args, recent_seconds=selection.recent_seconds)
     generation = adapter.generate_prediction(loaded, sample, clips, device=args.device)
     recent_end_sec = selection.recent_seconds[-1] if selection.recent_seconds else 0.0
@@ -495,7 +512,11 @@ def _run_single_prediction(
         "object_context_enabled": args.object_context_enabled,
         "object_name": sample.object_name,
         "recent_object_center_points": [list(point) for point in sample.recent_object_center_points],
-        "output": _protocol_prediction_payload(config.target_protocol, prediction),
+        "output": _protocol_prediction_payload(
+            config.target_protocol,
+            prediction,
+            output_schema=args.output_schema,
+        ),
         "ground_truth_subtask": ground_truth_subtask,
         "diagnostics": {
             "raw_model_output": generation.raw_output,
@@ -530,6 +551,7 @@ def _run_single_prediction(
             keyframe_candidate_seconds=candidate_seconds,
             ground_truth_subtask=ground_truth_subtask,
             parse_error=generation.parse_error,
+            include_grounding=_include_grounding_output(config.target_protocol, args.output_schema),
         )
         payload["debug_dir"] = str(args.debug_dir)
         payload["saved_keyframe_candidate_paths"] = [str(path) for path in saved_keyframes]
@@ -648,6 +670,7 @@ def _run_rollout(
             recent_seconds=selection.recent_seconds,
         )
         sample = _attach_runtime_proprio(sample, args=args, config=config, recent_seconds=selection.recent_seconds)
+        sample = apply_proprio_ablation(sample, mode=config.proprio_ablation_mode)
         sample = _attach_runtime_object_context(sample, args=args, recent_seconds=selection.recent_seconds)
         generation = adapter.generate_prediction(loaded, sample, clips, device=args.device)
         prediction, memory_rule_applied = _apply_protocol_runtime_prediction(
@@ -755,6 +778,7 @@ def _run_rollout(
                 state_update=_format_keyframe_gated_state_update(keyframe_gated_update),
                 ground_truth_subtask=ground_truth_subtask,
                 parse_error=generation.parse_error,
+                include_grounding=_include_grounding_output(config.target_protocol, args.output_schema),
             )
             debug_panel_paths.append(debug_panel_path)
         embedding_debug_payload = None
@@ -781,7 +805,11 @@ def _run_rollout(
                     recent_seconds=selection.recent_seconds,
                     proprio_enabled=config.proprio_enabled,
                 ),
-                "output": _protocol_prediction_payload(config.target_protocol, prediction),
+                "output": _protocol_prediction_payload(
+                    config.target_protocol,
+                    prediction,
+                    output_schema=args.output_schema,
+                ),
                 "ground_truth_subtask": ground_truth_subtask,
                 "diagnostics": {
                     "raw_model_output": generation.raw_output,
@@ -1000,9 +1028,9 @@ def _protocol_input_payload(
     return payload
 
 
-def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]:
+def _protocol_prediction_payload(protocol: str, prediction, *, output_schema: str = "auto") -> dict[str, object]:
     if protocol in _PROGRESS_UPDATE_PROTOCOLS:
-        return prediction.to_runtime_schema_dict()
+        return prediction.to_runtime_schema_dict(include_grounding=_include_grounding_output(protocol, output_schema))
 
     payload: dict[str, object] = {
         "current_objective": prediction.current_objective,
@@ -1038,6 +1066,21 @@ def _protocol_prediction_payload(protocol: str, prediction) -> dict[str, object]
     elif protocol == "hl_v1":
         return prediction.to_dict(include_legacy=False)
     return payload
+
+
+def _include_grounding_output(protocol: str, output_schema: str = "auto") -> bool:
+    if output_schema == "grounding":
+        return True
+    if output_schema == "base":
+        return False
+    return protocol in {
+        "memer_objective_grounding",
+        "keyframe_gated_memory",
+        "keyframe_gated_memory_typed_mask",
+        "keyframe_gated_memory_two_pass",
+        "memer_film_progress_two_pass",
+        "subtask_keyframe",
+    }
 
 
 def _protocol_final_state(

@@ -25,6 +25,7 @@ from openpi.hl_memory.labels import DEFAULT_LANGUAGE_MEMORY
 from openpi.hl_memory.memory import EpisodicKeyframeMemory
 from openpi.hl_memory.memory import map_relative_positions_to_absolute
 from openpi.hl_memory.hf_adapter import create_hf_adapter
+from openpi.hl_memory.proprio import apply_proprio_ablation
 
 
 class RuntimeSample(NamedTuple):
@@ -61,6 +62,8 @@ class EvalArgs:
     proprio_hidden_dim: int = 512
     proprio_dropout: float = 0.0
     proprio_noise_std: float = 0.0
+    proprio_projector_mode: str = "joint"
+    proprio_ablation_mode: str = "none"
     progress_condition_enabled: bool = False
     progress_condition_input_mode: str = "completed_only"
     progress_condition_dim: int = 128
@@ -117,6 +120,8 @@ def main(args: EvalArgs) -> None:
         proprio_hidden_dim=args.proprio_hidden_dim,
         proprio_dropout=args.proprio_dropout,
         proprio_noise_std=args.proprio_noise_std,
+        proprio_projector_mode=args.proprio_projector_mode,
+        proprio_ablation_mode=args.proprio_ablation_mode,
         progress_condition_enabled=args.progress_condition_enabled,
         progress_condition_input_mode=args.progress_condition_input_mode,
         progress_condition_dim=args.progress_condition_dim,
@@ -143,8 +148,9 @@ def main(args: EvalArgs) -> None:
     prediction_rows: list[dict[str, object]] = []
 
     def predict(item: RuntimeSample):
-        clips = load_video_clips_for_sample(item.sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
-        return adapter.predict(loaded, item.sample, clips, device=args.device)
+        sample = apply_proprio_ablation(item.sample, mode=hl_config.proprio_ablation_mode)
+        clips = load_video_clips_for_sample(sample, item.dataset_dir, hl_config, frame_cache=frame_cache)
+        return adapter.predict(loaded, sample, clips, device=args.device)
 
     metrics = {}
     for mode in modes:
