@@ -257,6 +257,7 @@ def configure_conditioning_model(
             load_conditioning_state_if_available(model, checkpoint_dir)
         return model
     wrapped = HLConditioningModel(model, config)
+    wrapped = _move_conditioning_modules_like_base_model(wrapped)
     if checkpoint_dir is not None:
         load_conditioning_state_if_available(wrapped, checkpoint_dir)
     return wrapped
@@ -329,6 +330,14 @@ def find_conditioning_model(model: torch.nn.Module) -> HLConditioningModel | Non
 def unwrap_conditioning_model(model: torch.nn.Module) -> torch.nn.Module:
     wrapped = find_conditioning_model(model)
     return wrapped.base_model if wrapped is not None else model
+
+
+def _move_conditioning_modules_like_base_model(model: HLConditioningModel) -> HLConditioningModel:
+    parameter = next(model.base_model.parameters(), None)
+    if parameter is None:
+        return model
+    model.to(device=parameter.device, dtype=parameter.dtype)
+    return model
 
 
 def build_conditioning_batch(
